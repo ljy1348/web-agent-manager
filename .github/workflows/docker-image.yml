@@ -26,7 +26,7 @@ jobs:
       - id: image
         name: 이미지 이름 정규화
         shell: bash
-        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/web-agent-manager-app" >> "$GITHUB_OUTPUT"
       - id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
