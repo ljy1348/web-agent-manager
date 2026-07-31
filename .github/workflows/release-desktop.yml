@@ -85,15 +85,28 @@ jobs:
           pattern: web-agent-manager-*
           path: release-assets
           merge-multiple: true
+      - name: 릴리즈 파일 평탄화 및 중복 검사
+        shell: bash
+        run: |
+          mkdir release-files
+          while IFS= read -r -d '' file; do
+            name="$(basename "$file")"
+            if [[ -e "release-files/$name" ]]; then
+              echo "중복된 릴리즈 파일 이름: $name" >&2
+              exit 1
+            fi
+            cp "$file" "release-files/$name"
+          done < <(find release-assets -type f -print0)
       - name: 전체 릴리즈 체크섬 생성
-        run: node scripts/create-release-checksums.mjs release-assets RELEASE-SHA256SUMS
+        run: node scripts/create-release-checksums.mjs release-files RELEASE-SHA256SUMS
       - name: GitHub Release 생성 또는 설치 파일 갱신
         shell: bash
         run: |
+          mapfile -d '' assets < <(find release-files -maxdepth 1 -type f -print0)
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" release-assets/* --clobber
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
           else
-            gh release create "$GITHUB_REF_NAME" release-assets/* --verify-tag --title "web-agent-manager $GITHUB_REF_NAME" --notes-file CHANGELOG.md
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" --verify-tag --title "web-agent-manager $GITHUB_REF_NAME" --notes-file CHANGELOG.md
           fi
         env:
           GH_TOKEN: ${{ github.token }}

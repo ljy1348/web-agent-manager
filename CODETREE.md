@@ -91,7 +91,7 @@
 | `scripts/check-public-build.mjs` | `checkPublicBuild` | 프로덕션 `dist`의 텍스트 산출물에 빌드 머신 절대 경로가 남으면 빌드를 실패 처리 |
 | `packaging/*` | 간단 설치·관리자 생성·실행 진입점 | Linux `setup.sh`, macOS `setup.command`, Windows `setup-windows.cmd` 단일 진입점과 단계별 설치·관리자 생성·실행 스크립트. Windows는 WSL2로 동일 Linux 런타임 사용 |
 | `.github/workflows/ci.yml`, `.github/dependabot.yml` | PR 검증·의존성 갱신 | 전체 npm 감사·타입·테스트·빌드를 강제하고 npm·Action·Docker 업데이트를 매주 제안 |
-| `.github/workflows/release-desktop.yml` | Electron 교차 플랫폼 빌드 | 고정 SHA Action으로 사전 검증 후 Linux·Windows와 네이티브 Intel·Apple Silicon runner별 macOS 설치 파일, 간단 설치 ZIP을 빌드하고 태그 Release에 SBOM·전체 체크섬과 함께 첨부 |
+| `.github/workflows/release-desktop.yml` | Electron 교차 플랫폼 빌드 | 고정 SHA Action으로 사전 검증 후 Linux·Windows와 네이티브 Intel·Apple Silicon runner별 macOS 설치 파일, 간단 설치 ZIP을 빌드하고 파일명 중복 검사 후 태그 Release에 SBOM·전체 체크섬과 함께 첨부 |
 | `Dockerfile`, `docker-compose.yml`, `docker/entrypoint.sh` | Docker 배포 | 전용 builder 경로에서 공개 산출물을 검사하고 Node.js 22·tmux·Git·gh·고정 버전 Codex·Claude와 production 앱을 비루트 UID 10001로 실행하며 데이터·프로젝트·CLI 홈 볼륨을 영속화 |
 | `.github/workflows/docker-image.yml` | GHCR 다중 아키텍처 이미지 | `main`·태그·수동 실행에서 linux/amd64·linux/arm64 이미지를 공개 `web-agent-manager-app` 패키지에 provenance·SBOM 증명과 함께 게시 |
 | `skills/web-agent-manager-session-context/SKILL.md` | 세션 조회 스킬 | “채팅 160 참고” 같은 번호·프로젝트 요청을 구조화 문맥 조회로 변환하고 MCP가 없으면 CLI 사용 |
