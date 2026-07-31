@@ -1,4 +1,4 @@
-FROM node:22-bookworm-slim AS builder
+FROM node:25-bookworm-slim AS builder
 
 WORKDIR /opt/web-agent-manager-build
 RUN apt-get update \
@@ -10,7 +10,7 @@ COPY . .
 RUN npm run build \
   && npm prune --omit=dev
 
-FROM node:22-bookworm-slim AS runtime
+FROM node:25-bookworm-slim AS runtime
 
 ARG CODEX_VERSION=0.146.0
 ARG CLAUDE_CODE_VERSION=2.1.220
