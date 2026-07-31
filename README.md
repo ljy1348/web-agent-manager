@@ -117,7 +117,7 @@ npm run desktop
 npm run desktop:package
 ```
 
-설치 파일은 `release/desktop/`에 생성된다. `.github/workflows/release-desktop.yml`은 태그 또는 수동 실행 시 Linux x64 AppImage·deb, macOS Intel x64·Apple Silicon arm64 dmg·zip, Windows x64 NSIS·portable을 각 운영체제 runner에서 빌드한다. macOS는 네이티브 모듈 아키텍처를 보장하기 위해 Intel과 Apple Silicon runner를 분리하며, 태그 빌드는 해당 GitHub Release에 산출물과 전체 체크섬을 자동 첨부한다. Windows Electron은 네이티브 tmux 백엔드를 포함하지 않으므로 `setup-windows.cmd`로 실행한 WSL2 서버 또는 `WEB_AGENT_MANAGER_SERVER_URL`로 지정한 기존 서버를 여는 데스크톱 셸이다. 현재 데스크톱 산출물에는 플랫폼 코드 서명을 적용하지 않으므로 운영체제의 미확인 게시자 경고가 표시될 수 있다.
+설치 파일은 `release/desktop/`에 생성된다. `.github/workflows/release-desktop.yml`은 태그 또는 수동 실행 시 Linux x64 AppImage·deb, macOS Intel x64·Apple Silicon arm64 dmg·zip, Windows x64 NSIS·portable을 각 운영체제 runner에서 빌드한다. macOS는 네이티브 모듈 아키텍처를 보장하기 위해 Intel과 Apple Silicon runner를 분리하며, 태그 빌드는 아티팩트 파일명의 중복을 검사한 뒤 해당 GitHub Release에 산출물과 전체 체크섬을 자동 첨부한다. Windows Electron은 네이티브 tmux 백엔드를 포함하지 않으므로 `setup-windows.cmd`로 실행한 WSL2 서버 또는 `WEB_AGENT_MANAGER_SERVER_URL`로 지정한 기존 서버를 여는 데스크톱 셸이다. 현재 데스크톱 산출물에는 플랫폼 코드 서명을 적용하지 않으므로 운영체제의 미확인 게시자 경고가 표시될 수 있다.
 
 ### 소스 설치
 
