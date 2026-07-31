@@ -93,7 +93,7 @@ docker compose up -d --build
 
 Compose는 WAM DB·로그를 `wam-data`, clone 프로젝트를 `wam-projects`, 세 CLI의 사용자 설정을 `wam-home` 볼륨에 보존한다. 호스트 프로젝트를 직접 노출하려면 `wam-projects:/workspace`를 `/호스트/경로:/workspace` bind mount로 바꾸되 컨테이너 서비스 UID `10001`의 읽기·쓰기 권한을 준비해야 한다. Docker socket과 `privileged` 권한은 사용하지 않는다. 외부 주소로 서비스할 때는 `WEB_AGENT_MANAGER_PUBLIC_URL`을 실제 HTTPS origin으로 지정한다.
 
-태그와 `main` push는 `.github/workflows/docker-image.yml`에서 linux/amd64·linux/arm64 이미지를 빌드해 `ghcr.io/<소유자>/<저장소>`에 게시한다.
+태그와 `main` push는 `.github/workflows/docker-image.yml`에서 linux/amd64·linux/arm64 이미지를 빌드해 `ghcr.io/<소유자>/<저장소>`에 게시한다. builder는 런타임 `/app`과 구분되는 전용 경로를 사용해 공개 산출물의 빌드 머신 절대 경로 검사를 유지한다.
 
 ### v0.2.0 압축 배포
 

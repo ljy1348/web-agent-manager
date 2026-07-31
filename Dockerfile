@@ -1,6 +1,6 @@
 FROM node:22-bookworm-slim AS builder
 
-WORKDIR /app
+WORKDIR /opt/web-agent-manager-build
 RUN apt-get update \
   && apt-get install -y --no-install-recommends python3 make g++ \
   && rm -rf /var/lib/apt/lists/*
@@ -24,10 +24,10 @@ RUN apt-get update \
   && useradd --uid 10001 --gid wam --create-home --shell /bin/bash wam
 
 WORKDIR /app
-COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/node_modules ./node_modules
-COPY --from=builder /app/skills ./skills
-COPY --from=builder /app/package.json ./package.json
+COPY --from=builder /opt/web-agent-manager-build/dist ./dist
+COPY --from=builder /opt/web-agent-manager-build/node_modules ./node_modules
+COPY --from=builder /opt/web-agent-manager-build/skills ./skills
+COPY --from=builder /opt/web-agent-manager-build/package.json ./package.json
 COPY docker/entrypoint.sh /usr/local/bin/web-agent-manager-entrypoint
 
 RUN chmod 0755 /usr/local/bin/web-agent-manager-entrypoint \
