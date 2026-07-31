@@ -91,6 +91,7 @@ jobs:
           mkdir release-files
           while IFS= read -r -d '' file; do
             name="$(basename "$file")"
+            name="${name// /.}"
             if [[ -e "release-files/$name" ]]; then
               echo "중복된 릴리즈 파일 이름: $name" >&2
               exit 1
