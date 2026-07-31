@@ -1,0 +1,14 @@
+.git
+.github
+node_modules
+dist
+release
+data
+coverage
+playwright-report
+test-results
+.env
+.env.*
+*.log
+.myagent-uploads
+.web-agent-manager-uploads

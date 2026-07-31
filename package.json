@@ -1,0 +1,135 @@
+{
+  "name": "web-agent-manager",
+  "productName": "web-agent-manager",
+  "desktopName": "web-agent-manager.desktop",
+  "description": "Claude와 Codex 세션을 함께 관리하는 로컬 에이전트 작업 공간",
+  "author": {
+    "name": "ljy1348",
+    "email": "ljy1348@users.noreply.github.com"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ljy1348/web-agent-manager.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ljy1348/web-agent-manager/issues"
+  },
+  "homepage": "https://github.com/ljy1348/web-agent-manager#readme",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "CHOKIDAR_USEPOLLING=true CHOKIDAR_INTERVAL=300 tsx watch src/server/index.ts",
+    "build": "cross-env NODE_ENV=production vite build && cross-env NODE_ENV=production tsup src/server/index.ts scripts/create-admin.ts scripts/claude-permission-bridge.ts scripts/install-agent-integrations.ts scripts/web-agent-manager-agent.ts scripts/myagent-agent.ts --format esm --out-dir dist/server --sourcemap --clean && node scripts/check-public-build.mjs",
+    "release:package": "npm run build && tsx scripts/package-release.ts",
+    "desktop": "electron .",
+    "desktop:package": "npm run build && electron-builder --publish never",
+    "start": "NODE_ENV=production node dist/server/src/server/index.js",
+    "admin:create": "node dist/server/scripts/create-admin.js",
+    "admin:create:dev": "tsx scripts/create-admin.ts",
+    "agent": "node dist/server/scripts/web-agent-manager-agent.js",
+    "agent:dev": "tsx scripts/web-agent-manager-agent.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "verify": "npm run typecheck && npm run test && npm run build",
+    "test:tui": "tsx scripts/check-usage-tui.ts",
+    "test:ui": "playwright test",
+    "test:resources": "tsx scripts/check-browser-resources.ts",
+    "test:lifecycle": "tsx scripts/check-session-lifecycle.ts"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "dependencies": {
+    "@tanstack/react-virtual": "^3.14.5",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/headless": "^6.0.0",
+    "@xterm/xterm": "^6.0.0",
+    "archiver": "^8.0.0",
+    "better-sqlite3": "^12.11.1",
+    "busboy": "^1.6.0",
+    "express": "^5.2.1",
+    "lucide-react": "^1.28.0",
+    "node-pty": "^1.1.0",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "systeminformation": "^5.31.13",
+    "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.58.2",
+    "@types/archiver": "^8.0.0",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/busboy": "^1.5.4",
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.1.0",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@types/ws": "^8.18.1",
+    "@vitejs/plugin-react": "^6.0.3",
+    "cross-env": "^10.1.0",
+    "electron": "^43.2.0",
+    "electron-builder": "^26.15.3",
+    "tsup": "^8.5.1",
+    "tsx": "^4.23.0",
+    "typescript": "^6.0.3",
+    "vite": "^8.1.3",
+    "vitest": "^4.1.9"
+  },
+  "overrides": {
+    "esbuild": "0.28.1",
+    "brace-expansion": "5.0.9"
+  },
+  "build": {
+    "appId": "com.webagentmanager.desktop",
+    "productName": "web-agent-manager",
+    "executableName": "web-agent-manager",
+    "asar": true,
+    "asarUnpack": [
+      "dist/**/*",
+      "skills/**/*",
+      "node_modules/**/*",
+      "package.json"
+    ],
+    "npmRebuild": false,
+    "files": [
+      "electron/**/*",
+      "dist/**/*",
+      "skills/**/*",
+      "package.json"
+    ],
+    "directories": {
+      "output": "release/desktop"
+    },
+    "linux": {
+      "syncDesktopName": true,
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "category": "Development"
+    },
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "category": "public.app-category.developer-tools"
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}

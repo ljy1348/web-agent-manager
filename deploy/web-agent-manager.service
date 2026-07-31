@@ -1,0 +1,28 @@
+[Unit]
+Description=Codex and Claude Web Agent Manager
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=web-agent-manager
+Group=web-agent-manager
+WorkingDirectory=/opt/web-agent-manager
+Environment=NODE_ENV=production
+EnvironmentFile=/etc/web-agent-manager/web-agent-manager.env
+ExecStart=/usr/bin/env node /opt/web-agent-manager/dist/server/src/server/index.js
+Restart=on-failure
+RestartSec=5
+KillMode=process
+TimeoutStopSec=20
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

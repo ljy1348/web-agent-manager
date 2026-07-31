@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>web-agent-manager 초기 설정</title>
+    <style>
+      * { box-sizing: border-box; }
+      body { margin: 0; min-width: 320px; min-height: 100vh; display: grid; place-items: center; background: #f3f5f2; color: #1f2723; font: 14px system-ui, sans-serif; }
+      main { width: min(420px, calc(100vw - 32px)); padding: 28px; border: 1px solid #d9dfd9; border-radius: 8px; background: #fff; box-shadow: 0 12px 32px rgba(21,32,26,.09); }
+      h1 { margin: 0 0 6px; font-size: 24px; }
+      p { margin: 0 0 22px; color: #68746d; }
+      label { display: grid; gap: 6px; margin: 12px 0; font-size: 12px; color: #526158; }
+      input { width: 100%; height: 42px; padding: 0 11px; border: 1px solid #c4cec6; border-radius: 7px; font: inherit; }
+      button { width: 100%; min-height: 42px; margin-top: 10px; border: 1px solid #23644c; border-radius: 7px; background: #23644c; color: #fff; font: 600 14px system-ui, sans-serif; cursor: pointer; }
+      button:disabled { opacity: .6; cursor: wait; }
+      #status { min-height: 20px; margin: 12px 0 0; color: #a7372f; font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>web-agent-manager</h1>
+      <p>첫 관리자 계정을 설정합니다.</p>
+      <form id="setup-form">
+        <label>관리자 아이디<input id="username" autocomplete="username" required autofocus /></label>
+        <label>비밀번호<input id="password" type="password" autocomplete="new-password" minlength="12" required /></label>
+        <label>비밀번호 확인<input id="confirm-password" type="password" autocomplete="new-password" minlength="12" required /></label>
+        <button id="submit" type="submit">설정 완료</button>
+        <div id="status" role="alert"></div>
+      </form>
+    </main>
+    <script>
+      const form = document.getElementById("setup-form");
+      const submit = document.getElementById("submit");
+      const status = document.getElementById("status");
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const username = document.getElementById("username").value.trim();
+        const password = document.getElementById("password").value;
+        const confirmPassword = document.getElementById("confirm-password").value;
+        if (password !== confirmPassword) {
+          status.textContent = "비밀번호 확인이 일치하지 않습니다.";
+          return;
+        }
+        submit.disabled = true;
+        status.textContent = "";
+        try {
+          await window.webAgentManagerSetup.createAdmin(username, password);
+        } catch (error) {
+          status.textContent = error?.message || "초기 설정에 실패했습니다.";
+          submit.disabled = false;
+        }
+      });
+    </script>
+  </body>
+</html>

@@ -1,0 +1,100 @@
+name: 데스크톱 설치 파일 빌드
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: 태그와 패키지 버전 일치 확인
+        if: startsWith(github.ref, 'refs/tags/')
+        run: node -e "const version=require('./package.json').version; if ('v'+version !== process.env.RELEASE_TAG) throw new Error('태그와 package.json 버전이 다릅니다.')"
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+      - run: npm audit --audit-level=high
+      - run: npm run verify
+
+  build:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            builder_args: --linux
+          - os: macos-15-intel
+            platform: mac-x64
+            builder_args: --mac --x64
+          - os: macos-latest
+            platform: mac-arm64
+            builder_args: --mac --arm64
+          - os: windows-latest
+            platform: win
+            builder_args: --win
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npx electron-builder ${{ matrix.builder_args }} --publish never
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      - if: matrix.platform == 'linux'
+        run: npm run release:package
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: web-agent-manager-${{ matrix.platform }}
+          path: |
+            release/desktop/*.AppImage
+            release/desktop/*.deb
+            release/desktop/*.dmg
+            release/desktop/*.zip
+            release/desktop/*.exe
+            release/archives/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: web-agent-manager-*
+          path: release-assets
+          merge-multiple: true
+      - name: 전체 릴리즈 체크섬 생성
+        run: node scripts/create-release-checksums.mjs release-assets RELEASE-SHA256SUMS
+      - name: GitHub Release 생성 또는 설치 파일 갱신
+        shell: bash
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release-assets/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" release-assets/* --verify-tag --title "web-agent-manager $GITHUB_REF_NAME" --notes-file CHANGELOG.md
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}

@@ -1,0 +1,20 @@
+services:
+  web-agent-manager:
+    build:
+      context: .
+    image: web-agent-manager:0.2.0
+    container_name: web-agent-manager
+    restart: unless-stopped
+    ports:
+      - "4317:4317"
+    environment:
+      WEB_AGENT_MANAGER_PUBLIC_URL: "${WEB_AGENT_MANAGER_PUBLIC_URL:-http://localhost:4317}"
+    volumes:
+      - wam-data:/data
+      - wam-projects:/workspace
+      - wam-home:/home/wam
+
+volumes:
+  wam-data:
+  wam-projects:
+  wam-home:
