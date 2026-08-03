@@ -4,14 +4,46 @@ updates:
     directory: /
     schedule:
       interval: weekly
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 5
+    groups:
+      production-minor-patch:
+        dependency-type: production
+        update-types:
+          - minor
+          - patch
+      development-minor-patch:
+        dependency-type: development
+        update-types:
+          - minor
+          - patch
+      major-updates:
+        patterns:
+          - "*"
+        update-types:
+          - major
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 3
+    groups:
+      docker-actions-minor-patch:
+        patterns:
+          - "docker/*"
+        update-types:
+          - minor
+          - patch
+      docker-actions-major:
+        patterns:
+          - "docker/*"
+        update-types:
+          - major
   - package-ecosystem: docker
     directory: /
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 2
+    ignore:
+      - dependency-name: node
+        update-types:
+          - version-update:semver-major
