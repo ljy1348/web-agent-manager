@@ -21,6 +21,13 @@ updates:
           - "*"
         update-types:
           - major
+    ignore:
+      - dependency-name: better-sqlite3
+        update-types:
+          - version-update:semver-major
+      - dependency-name: typescript
+        update-types:
+          - version-update:semver-major
   - package-ecosystem: github-actions
     directory: /
     schedule:
