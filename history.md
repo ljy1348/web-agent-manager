@@ -83,3 +83,7 @@
 - 자동화 결정: 같은 잠금 파일을 수정하는 개별 PR이 다시 누적되지 않도록 npm 운영·개발 의존성과 Docker Actions를 업데이트 유형별로 그룹화하고, Node Docker 이미지는 지원 기준인 22 계열의 주요 버전 이탈을 막는다.
 - 적용 완료: React·React DOM 19.2.8과 현재 호환 범위의 npm 운영·개발 패키지를 함께 갱신하고, 기존 개별 PR에서 검증된 Docker Action 고정 SHA 4개를 하나의 변경으로 합쳤다.
 - 검증 완료: 잠금 파일 기반 `npm ci`, 의존성 감사, 타입 검사, 단위 테스트 47개 파일 286개, Vite 8.2.0 프로덕션 빌드와 공개 경로 검사를 통과했다. 빌드의 기존 대형 청크 및 lightningcss 선택적 네이티브 파일 경고 외 새 오류는 없다.
+- 후속 정리 시작: 그룹 정책 적용 직후 기존 PR 제한 뒤에 대기하던 `ws`, 타입 정의·Vitest, docker/login-action 호환 업데이트가 3개 그룹 PR로 생성되고, 보류한 TypeScript·better-sqlite3 메이저도 한 그룹 PR로 다시 생성됐다.
+- 후속 결정: 호환 업데이트 3개는 한 PR로 다시 통합해 `main` Docker 빌드를 한 번만 실행하고, 보류한 두 패키지의 major 업데이트는 Dependabot 설정에 명시적으로 제외해 반복 생성을 막는다.
+- 후속 적용 완료: `ws` 8.21.1, 타입 정의 패치, Vitest 4.1.10과 docker/login-action 4.6.0을 통합하고 TypeScript·better-sqlite3 major ignore를 문서와 설정에 반영했다.
+- 후속 검증 완료: 잠금 파일 기반 `npm ci`, 의존성 감사, 타입 검사, 단위 테스트 47개 파일 286개, 프로덕션 빌드와 공개 경로 검사를 다시 통과했다.

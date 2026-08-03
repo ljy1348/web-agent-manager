@@ -67,7 +67,7 @@ Linux·macOS와 Windows WSL2에서 Codex CLI와 Claude Code의 실제 인터랙�
 
 공식 Codex/Claude CLI·데스크톱 앱 대비 남은 구현 후보는 `TODO_LIST.md`에 정리한다.
 
-의존성 업데이트는 Dependabot이 매주 npm 운영·개발 패키지와 Docker Actions를 호환 범위별 그룹 PR로 제안한다. Node Docker 이미지는 지원 기준인 22 계열을 유지하며, TypeScript·네이티브 모듈·Node 주요 버전 변경은 별도 호환성 및 배포 검증 후 반영한다.
+의존성 업데이트는 Dependabot이 매주 npm 운영·개발 패키지와 Docker Actions를 호환 범위별 그룹 PR로 제안한다. Node Docker 이미지는 지원 기준인 22 계열을 유지하고, TypeScript와 better-sqlite3 주요 버전 자동 PR은 제외한다. 이 세 가지 주요 버전 변경은 별도 호환성 및 배포 검증 후 직접 반영한다.
 
 ## 기준 환경
 
