@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import { FolderGit2, Globe2, LoaderCircle, LockKeyhole, RefreshCw, X } from "lucide-react";
 import { api } from "../api";
 import type { Json } from "../types";
+import { useDialogHistory } from "../lib/dialog-history";
 
 // GitHub 저장소 목록에서 기존 프로젝트 이동 또는 새 clone 프로젝트 생성을 제공한다.
 export function GithubRepositoryList({ onProject }: { onProject: (project: Json) => void }): React.ReactElement {
@@ -15,6 +16,7 @@ export function GithubRepositoryList({ onProject }: { onProject: (project: Json)
   const [error, setError] = useState("");
   const [pendingRepository, setPendingRepository] = useState<Json | null>(null);
   const [destination, setDestination] = useState("");
+  const dismissPending = useDialogHistory(!!pendingRepository, () => setPendingRepository(null), "github-project-create");
   const filtered = useMemo(() => repositories.filter((repository) => {
     const repositoryOwner = String(repository.nameWithOwner).split("/", 1)[0].toLowerCase();
     return (!owner || repositoryOwner === owner.toLowerCase())
@@ -57,8 +59,7 @@ export function GithubRepositoryList({ onProject }: { onProject: (project: Json)
     setError("");
     try {
       const data = await api("/github/projects", { method: "POST", body: JSON.stringify({ repository: pendingRepository.nameWithOwner, destination }) });
-      setPendingRepository(null);
-      onProject(data.project);
+      dismissPending(() => onProject(data.project));
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "프로젝트 생성에 실패했습니다.");
     } finally {
@@ -85,14 +86,14 @@ export function GithubRepositoryList({ onProject }: { onProject: (project: Json)
         </button>
       </div>) : <p className="resource-empty">표시할 저장소가 없습니다.</p>}
     </div>}
-    {pendingRepository && createPortal(<div className="modal-backdrop repository-project-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !working) setPendingRepository(null); }}>
+    {pendingRepository && createPortal(<div className="modal-backdrop repository-project-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !working) dismissPending(); }}>
       <section className="repository-project-dialog" role="dialog" aria-modal="true" aria-label="GitHub 프로젝트 생성">
-        <header><div><span className="eyebrow">GitHub 저장소</span><h2>새 프로젝트</h2></div><button type="button" className="icon-button" title="닫기" onClick={() => setPendingRepository(null)} disabled={!!working}><X size={18} /></button></header>
+        <header><div><span className="eyebrow">GitHub 저장소</span><h2>새 프로젝트</h2></div><button type="button" className="icon-button" title="닫기" aria-label="닫기" onClick={() => dismissPending()} disabled={!!working}><X size={18} /></button></header>
         <form className="project-form" onSubmit={createProject}>
           <div className="repository-project-name"><strong>{pendingRepository.nameWithOwner}</strong><span>{pendingRepository.description || "설명 없음"}</span></div>
           <label>프로젝트 경로<input value={destination} onChange={(event) => setDestination(event.target.value)} required autoFocus /></label>
           {error && <div className="error">{error}</div>}
-          <div className="dialog-actions"><button type="button" onClick={() => setPendingRepository(null)} disabled={!!working}>취소</button><button className="primary" disabled={!!working}>{working ? <><LoaderCircle className="spin" size={15} /> 생성 중</> : "프로젝트 생성"}</button></div>
+          <div className="dialog-actions"><button type="button" onClick={() => dismissPending()} disabled={!!working}>취소</button><button className="primary" disabled={!!working}>{working ? <><LoaderCircle className="spin" size={15} /> 생성 중</> : "프로젝트 생성"}</button></div>
         </form>
       </section>
     </div>, document.body)}

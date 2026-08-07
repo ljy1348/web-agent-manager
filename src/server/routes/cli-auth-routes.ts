@@ -16,12 +16,15 @@ export function createCliAuthRouter(database: AppDatabase, manager: CliAuthManag
       next(error);
     }
   });
+  // accountId를 주면 그 계정 슬롯의 설정 디렉터리로 로그인한다. 생략하면 기본 계정이다(GitHub은 항상 무시).
+  const readAccountId = (value: unknown): number | null => (value == null || value === "" ? null : Number(value));
   router.post("/cli-auth/:provider/start", requireAdmin, (request: AuthenticatedRequest, response, next) => {
     try {
       const provider = String(request.params.provider) as CliAuthProvider;
       if (!PROVIDERS.has(provider)) throw new Error("지원하지 않는 인증 공급자입니다.");
-      manager.start(provider);
-      writeAudit(database, request.authUser!.id, "cli_auth.start", "provider", provider);
+      const accountId = readAccountId(request.body?.accountId);
+      manager.start(provider, accountId);
+      writeAudit(database, request.authUser!.id, "cli_auth.start", "provider", provider, { accountId });
       response.status(202).json({ accepted: true });
     } catch (error) {
       next(error);
@@ -31,8 +34,9 @@ export function createCliAuthRouter(database: AppDatabase, manager: CliAuthManag
     try {
       const provider = String(request.params.provider) as CliAuthProvider;
       if (!PROVIDERS.has(provider)) throw new Error("지원하지 않는 인증 공급자입니다.");
-      manager.stop(provider);
-      writeAudit(database, request.authUser!.id, "cli_auth.stop", "provider", provider);
+      const accountId = readAccountId(request.body?.accountId);
+      manager.stop(provider, accountId);
+      writeAudit(database, request.authUser!.id, "cli_auth.stop", "provider", provider, { accountId });
       response.status(204).end();
     } catch (error) {
       next(error);

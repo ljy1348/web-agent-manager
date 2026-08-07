@@ -4,6 +4,7 @@ import { FolderGit2, FolderPlus, X } from "lucide-react";
 import { api } from "../api";
 import type { Json } from "../types";
 import { GithubRepositoryList } from "./GithubRepositoryList";
+import { useDialogHistory } from "../lib/dialog-history";
 
 type ProjectMode = "local" | "github";
 
@@ -18,6 +19,7 @@ export function ProjectDialog({ open, defaultPath, onClose, onProject }: { open:
   const [description, setDescription] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const dismiss = useDialogHistory(open, onClose, "project-create");
 
   useEffect(() => { if (open) setProjectPath(defaultPath); }, [open, defaultPath]);
   if (!open) return null;
@@ -32,8 +34,7 @@ export function ProjectDialog({ open, defaultPath, onClose, onProject }: { open:
         method: "POST",
         body: JSON.stringify({ path: projectPath, name, createGithub, repository, visibility, description }),
       });
-      onProject(data.project);
-      onClose();
+      dismiss(() => onProject(data.project));
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "프로젝트 등록에 실패했습니다.");
     } finally {
@@ -41,9 +42,9 @@ export function ProjectDialog({ open, defaultPath, onClose, onProject }: { open:
     }
   }
 
-  return createPortal(<div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+  return createPortal(<div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) dismiss(); }}>
     <section className="project-dialog" role="dialog" aria-modal="true" aria-label="프로젝트 생성">
-      <header><div><span className="eyebrow">작업공간</span><h2>프로젝트 생성</h2></div><button type="button" className="icon-button" title="닫기" onClick={onClose}><X size={18} /></button></header>
+      <header><div><span className="eyebrow">작업공간</span><h2>프로젝트 생성</h2></div><button type="button" className="icon-button" title="닫기" aria-label="닫기" onClick={() => dismiss()}><X size={18} /></button></header>
       <div className="segmented project-source-tabs">
         <button type="button" className={mode === "local" ? "active" : ""} onClick={() => setMode("local")}><FolderPlus size={16} />로컬 경로</button>
         <button type="button" className={mode === "github" ? "active" : ""} onClick={() => setMode("github")}><FolderGit2 size={16} />GitHub 저장소</button>
@@ -58,8 +59,8 @@ export function ProjectDialog({ open, defaultPath, onClose, onProject }: { open:
           <label className="full">설명<input value={description} onChange={(event) => setDescription(event.target.value)} maxLength={350} /></label>
         </div>}
         {error && <div className="error">{error}</div>}
-        <div className="dialog-actions"><button type="button" onClick={onClose}>취소</button><button className="primary" disabled={busy}>{busy ? "생성 중" : "프로젝트 생성"}</button></div>
-      </form> : <GithubRepositoryList onProject={(project) => { onProject(project); onClose(); }} />}
+        <div className="dialog-actions"><button type="button" onClick={() => dismiss()}>취소</button><button className="primary" disabled={busy}>{busy ? "생성 중" : "프로젝트 생성"}</button></div>
+      </form> : <GithubRepositoryList onProject={(project) => dismiss(() => onProject(project))} />}
     </section>
   </div>, document.body);
 }

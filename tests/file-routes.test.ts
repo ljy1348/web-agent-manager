@@ -92,7 +92,7 @@ describe("파일 API", () => {
     fs.rmSync(outside, { recursive: true, force: true });
   });
 
-  it("외부망에서는 점 파일을 숨기고 내부망에서도 민감 설정은 숨긴다", async () => {
+  it("외부망에서는 점 파일과 민감 설정을 숨기고 내부망에서는 모두 보여준다", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "web-agent-manager-files-"));
     fs.mkdirSync(path.join(root, ".vscode"));
     fs.writeFileSync(path.join(root, ".vscode", "settings.json"), "{}");
@@ -107,13 +107,17 @@ describe("파일 API", () => {
     expect(external.hiddenFilesVisible).toBe(false);
     expect(external.entries.map((entry: { name: string }) => entry.name)).toEqual(["visible.txt"]);
     expect((await fetch(`${externalUrl}/projects/1/files?path=.vscode`)).status).toBe(400);
+    expect((await fetch(`${externalUrl}/projects/1/files/download?path=.env`)).status).toBe(400);
     await closeServer?.();
     closeServer = undefined;
 
     const internalUrl = await startFileApi(database, true);
     const internal = await (await fetch(`${internalUrl}/projects/1/files`)).json();
     expect(internal.hiddenFilesVisible).toBe(true);
-    expect(internal.entries.map((entry: { name: string }) => entry.name)).toEqual([".vscode", "visible.txt"]);
+    expect(internal.entries.map((entry: { name: string }) => entry.name)).toEqual([".vscode", ".env", "visible.txt"]);
+    const preview = await (await fetch(`${internalUrl}/projects/1/files/preview?path=.env`)).json();
+    expect(preview).toMatchObject({ previewable: true, content: "TOKEN=secret" });
+    expect((await fetch(`${internalUrl}/projects/1/files/download?path=.env`)).status).toBe(200);
     fs.rmSync(root, { recursive: true, force: true });
   });
 
@@ -293,14 +297,67 @@ describe("파일 API", () => {
     fs.rmSync(root, { recursive: true, force: true });
   });
 
-  it("symlink가 가리키는 실제 민감 파일 다운로드를 거부한다", async () => {
+  it("텍스트 파일만 편집 저장을 허용하고 권한과 원본 내용을 보존한다", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "web-agent-manager-files-"));
+    fs.writeFileSync(path.join(root, "note.txt"), "이전 내용", { mode: 0o644 });
+    fs.writeFileSync(path.join(root, ".env"), "TOKEN=old");
+    fs.writeFileSync(path.join(root, "icon.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+    fs.mkdirSync(path.join(root, "sub"));
+    const database = {
+      prepare: () => ({ get: () => ({ path: root }), run: () => undefined }),
+    } as unknown as AppDatabase;
+    const baseUrl = await startFileApi(database);
+    const save = (body: unknown) => fetch(`${baseUrl}/projects/1/files/content`, {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+
+    const text = await save({ path: "note.txt", content: "새 내용" });
+    expect(text.status).toBe(200);
+    expect(fs.readFileSync(path.join(root, "note.txt"), "utf8")).toBe("새 내용");
+    expect(fs.statSync(path.join(root, "note.txt")).mode & 0o777).toBe(0o644);
+
+    // 내부망에서는 민감 경로도 편집 대상이지만, 이진 파일과 디렉터리는 형식 판정에서 걸러야 한다.
+    expect((await save({ path: ".env", content: "TOKEN=new" })).status).toBe(200);
+    expect(fs.readFileSync(path.join(root, ".env"), "utf8")).toBe("TOKEN=new");
+    const image = await save({ path: "icon.png", content: "덮어쓰기 시도" });
+    expect(image.status).toBe(400);
+    await expect(image.json()).resolves.toMatchObject({ error: "텍스트 형식이 아닌 파일은 편집할 수 없습니다." });
+    expect(fs.readFileSync(path.join(root, "icon.png")).length).toBe(8);
+    expect((await save({ path: "sub", content: "폴더 저장 시도" })).status).toBe(400);
+    expect((await save({ path: "note.txt" })).status).toBe(400);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it("외부망에서는 민감 경로 편집을 거부하고 크기 초과 파일도 저장하지 않는다", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "web-agent-manager-files-"));
+    fs.writeFileSync(path.join(root, ".env"), "TOKEN=old");
+    fs.writeFileSync(path.join(root, "huge.txt"), "가".repeat(200_000));
+    const database = {
+      prepare: () => ({ get: () => ({ path: root }), run: () => undefined }),
+    } as unknown as AppDatabase;
+    const baseUrl = await startFileApi(database, false);
+    const save = (body: unknown) => fetch(`${baseUrl}/projects/1/files/content`, {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+
+    expect((await save({ path: ".env", content: "TOKEN=new" })).status).toBe(400);
+    expect(fs.readFileSync(path.join(root, ".env"), "utf8")).toBe("TOKEN=old");
+    // 미리보기가 잘리는 크기의 파일은 편집 화면 내용이 원본 전체가 아니라 저장을 막아야 한다.
+    const huge = await save({ path: "huge.txt", content: "짧게 줄임" });
+    expect(huge.status).toBe(400);
+    await expect(huge.json()).resolves.toMatchObject({ error: "미리보기에서 일부만 읽은 파일은 편집할 수 없습니다." });
+    expect(fs.statSync(path.join(root, "huge.txt")).size).toBeGreaterThan(256 * 1024);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it("외부망에서는 symlink가 가리키는 실제 민감 파일 다운로드를 거부한다", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "web-agent-manager-files-"));
     fs.writeFileSync(path.join(root, ".env"), "TOKEN=secret", "utf8");
     fs.symlinkSync(path.join(root, ".env"), path.join(root, "public-link"));
     const database = {
       prepare: () => ({ get: () => ({ path: root }), run: () => undefined }),
     } as unknown as AppDatabase;
-    const baseUrl = await startFileApi(database);
+    const baseUrl = await startFileApi(database, false);
 
     const response = await fetch(`${baseUrl}/projects/1/files/download?path=public-link`);
 

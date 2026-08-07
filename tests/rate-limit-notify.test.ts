@@ -25,7 +25,7 @@ describe("한도 도달 알림 event_id 안정성", () => {
     const notifications: Notifier = { notify: async (eventId) => { notified.push(eventId); } };
     const realtime = { setTerminalHandlers: () => undefined } as any;
     const approvals = { setTerminalDecisionHandler: () => undefined, setTerminalLiveCheckHandler: () => undefined } as any;
-    const manager = new SessionManager(stubDatabase(), [stubAdapter()], realtime, approvals, notifications);
+    const manager = new SessionManager(stubDatabase(), [stubAdapter()], realtime, approvals, notifications, { resolveForChat: () => ({ id: 1, config_dir: null }), environment: () => ({}) } as never);
     const chat = { id: 121, provider: "codex" } as any;
     const summary = "You've hit your session limit · resets 7:10pm (Asia/Seoul)";
 
@@ -42,7 +42,7 @@ describe("한도 도달 알림 event_id 안정성", () => {
     const notifications: Notifier = { notify: async (eventId) => { notified.push(eventId); } };
     const realtime = { setTerminalHandlers: () => undefined } as any;
     const approvals = { setTerminalDecisionHandler: () => undefined, setTerminalLiveCheckHandler: () => undefined } as any;
-    const manager = new SessionManager(stubDatabase(), [stubAdapter()], realtime, approvals, notifications);
+    const manager = new SessionManager(stubDatabase(), [stubAdapter()], realtime, approvals, notifications, { resolveForChat: () => ({ id: 1, config_dir: null }), environment: () => ({}) } as never);
     const chat = { id: 121, provider: "codex" } as any;
 
     (manager as any).registerRateLimitWait(chat, "You've hit your session limit · resets 7:10pm (Asia/Seoul)");

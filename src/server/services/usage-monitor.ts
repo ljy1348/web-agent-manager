@@ -2,11 +2,13 @@ import * as pty from "node-pty";
 import type { IPty } from "node-pty";
 import type { AppDatabase } from "../core/database";
 import type { ModelOptions, ProviderAdapter } from "../providers/provider";
-import type { Provider, UsageRecord, UsageWindow } from "../../shared/types";
+import type { AgentAccountRecord, Provider, UsageRecord, UsageWindow } from "../../shared/types";
 import type { RealtimeHub } from "./realtime";
+import type { AgentAccountService } from "./agent-accounts";
 import { TerminalScreen } from "./terminal-screen";
 import { todayResetTime } from "../providers/usage-utils";
 import { createLogger } from "../core/logger";
+import type { UsageResetNotifier } from "./usage-reset-notifier";
 
 const usageLog = createLogger("usage-check");
 
@@ -89,6 +91,8 @@ export function reconcileStaleClaudeSessionWindow(parsed: Partial<UsageRecord>, 
 
 interface MonitorState {
   adapter: ProviderAdapter;
+  // 이 조회 PTY가 어느 계정 슬롯의 한도를 보는지. 계정마다 설정 디렉터리가 달라 한도도 따로 계산된다.
+  account: AgentAccountRecord;
   terminal?: IPty;
   screen: TerminalScreen;
   busy: boolean;
@@ -105,6 +109,11 @@ interface MonitorState {
 
 function wait(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+// 공급자와 계정 슬롯을 합쳐 조회 대상을 유일하게 식별한다.
+function monitorKey(provider: Provider, accountId: number): string {
+  return `${provider}:${accountId}`;
 }
 
 // 리셋 문구에서 날짜 부분("Jul 11")과 하루 기준 분 단위 시각을 뽑아 창 식별에 쓴다.
@@ -159,56 +168,106 @@ export function detectUsageRegression(previousDetailsJson: string | null, parsed
   });
 }
 
-// 공급자별 전용 PTY에서 실제 슬래시 명령을 1분마다 실행한다.
+// 공급자별 경량 전용 PTY에서 실제 슬래시 명령을 1분마다 실행한다.
 export class UsageMonitor {
-  private readonly monitors = new Map<Provider, MonitorState>();
+  // 계정마다 조회 PTY가 하나씩이라 "공급자:계정ID"를 키로 쓴다.
+  private readonly monitors = new Map<string, MonitorState>();
+  private readonly adapters: ProviderAdapter[];
   private stopping = false;
 
-  constructor(private readonly database: AppDatabase, adapters: ProviderAdapter[], private readonly realtime: RealtimeHub) {
-    for (const adapter of adapters) {
-      this.monitors.set(adapter.id, { adapter, screen: new TerminalScreen(), busy: false, commandIndex: 0, failureCount: 0 });
+  constructor(
+    private readonly database: AppDatabase,
+    adapters: ProviderAdapter[],
+    private readonly realtime: RealtimeHub,
+    private readonly accounts: AgentAccountService,
+    private readonly resetNotifier?: UsageResetNotifier,
+  ) {
+    this.adapters = adapters;
+  }
+
+  // 설정된 범위(기본 계정만 / 전 계정)에 맞는 조회 대상을 만든다.
+  private buildMonitors(): void {
+    for (const adapter of this.adapters) {
+      for (const account of this.accounts.monitorTargets(adapter.id)) {
+        const key = monitorKey(adapter.id, account.id);
+        if (this.monitors.has(key)) continue;
+        this.monitors.set(key, { adapter, account, screen: new TerminalScreen(), busy: false, commandIndex: 0, failureCount: 0 });
+      }
     }
   }
 
-  // 모든 공급자의 상태 조회 PTY를 시작한다.
+  // 조회 대상 계정의 상태 조회 PTY를 시작한다.
   start(): void {
     this.stopping = false;
-    for (const monitor of this.monitors.values()) this.startProvider(monitor);
+    this.buildMonitors();
+    for (const monitor of this.monitors.values()) if (!monitor.terminal) this.startProvider(monitor);
+  }
+
+  // 사용량 조회 범위 설정이 바뀌면 대상 목록을 다시 계산해, 빠진 계정의 PTY는 정리하고 새 계정은 띄운다.
+  applyScopeChange(): void {
+    const wanted = new Set<string>();
+    for (const adapter of this.adapters) {
+      for (const account of this.accounts.monitorTargets(adapter.id)) wanted.add(monitorKey(adapter.id, account.id));
+    }
+    for (const [key, monitor] of [...this.monitors]) {
+      if (wanted.has(key)) continue;
+      this.disposeMonitor(monitor);
+      this.monitors.delete(key);
+      this.database.prepare("DELETE FROM usage_status WHERE provider = ? AND account_id = ?").run(monitor.adapter.id, monitor.account.id);
+    }
+    this.start();
+    this.realtime.broadcast("usage_updated", { provider: null });
+  }
+
+  // 한 모니터의 PTY와 예약 작업을 정리한다.
+  private disposeMonitor(monitor: MonitorState): void {
+    if (monitor.timer) clearInterval(monitor.timer);
+    if (monitor.parseTimer) clearTimeout(monitor.parseTimer);
+    if (monitor.retryTimer) clearTimeout(monitor.retryTimer);
+    monitor.terminal?.kill();
+    monitor.terminal = undefined;
+    monitor.screen.dispose();
   }
 
   // 모든 상태 조회 PTY와 예약 작업을 종료한다.
   stop(): void {
     this.stopping = true;
     for (const monitor of this.monitors.values()) {
-      if (monitor.timer) clearInterval(monitor.timer);
-      if (monitor.parseTimer) clearTimeout(monitor.parseTimer);
-      if (monitor.retryTimer) clearTimeout(monitor.retryTimer);
-      monitor.terminal?.kill();
-      monitor.screen.dispose();
-      this.update(monitor.adapter.id, { monitor_status: "stopped" });
+      this.disposeMonitor(monitor);
+      this.update(monitor, { monitor_status: "stopped" });
     }
   }
 
-  // 현재 저장된 공급자별 사용량 상태를 반환한다.
+  // 현재 저장된 계정별 사용량 상태를 반환한다.
   list(): UsageRecord[] {
-    return this.database.prepare("SELECT * FROM usage_status ORDER BY provider").all() as UsageRecord[];
+    return this.database.prepare("SELECT * FROM usage_status ORDER BY provider, account_id").all() as UsageRecord[];
   }
 
   // 가장 최근 사용량 조회 때 파서에 실제로 넘어간 원본 화면 텍스트를 반환한다(터미널 스냅샷 보기용).
-  snapshot(provider: Provider): { text: string; capturedAt: string } | null {
-    return this.monitors.get(provider)?.lastSnapshot ?? null;
+  // 계정을 지정하지 않으면 그 공급자에서 조회 중인 첫 계정(보통 기본 계정) 것을 보여준다.
+  snapshot(provider: Provider, accountId?: number): { text: string; capturedAt: string } | null {
+    return this.findMonitor(provider, accountId)?.lastSnapshot ?? null;
   }
 
-  // 지정 공급자의 사용량을 즉시 다시 조회한다.
-  refresh(provider: Provider): void {
-    const monitor = this.monitors.get(provider);
-    if (!monitor) throw new Error("지원하지 않는 공급자입니다.");
-    this.requestUsage(monitor);
+  // 지정 공급자의 사용량을 즉시 다시 조회한다. 계정을 지정하지 않으면 그 공급자의 모든 조회 대상을 갱신한다.
+  refresh(provider: Provider, accountId?: number): void {
+    const targets = accountId != null
+      ? [this.findMonitor(provider, accountId)].filter((monitor): monitor is MonitorState => !!monitor)
+      : [...this.monitors.values()].filter((monitor) => monitor.adapter.id === provider);
+    if (!targets.length) throw new Error("지원하지 않는 공급자입니다.");
+    for (const monitor of targets) this.requestUsage(monitor);
+  }
+
+  // 공급자의 조회 대상 하나를 찾는다. 모델 목록처럼 계정과 무관한 조회는 첫 대상을 그대로 쓴다.
+  private findMonitor(provider: Provider, accountId?: number): MonitorState | undefined {
+    if (accountId != null) return this.monitors.get(monitorKey(provider, accountId));
+    return [...this.monitors.values()].find((monitor) => monitor.adapter.id === provider);
   }
 
   // 실제 CLI 조회 없이, 마지막으로 캐시된 모델·effort 목록만 반환한다(채팅 화면 진입마다 부르는 용도).
+  // 선택 가능한 모델은 계정이 아니라 CLI 버전에 달린 값이라 계정별로 나누지 않는다.
   cachedModelOptions(provider: Provider): ModelOptions | null {
-    return this.monitors.get(provider)?.modelOptions ?? null;
+    return this.findMonitor(provider)?.modelOptions ?? null;
   }
 
   // 서버 시작 직후 딱 한 번 모델 옵션을 조회해 캐시를 채운다. 조회 전용 PTY가 마침 사용량 조회로
@@ -226,7 +285,7 @@ export class UsageMonitor {
 
   // 상태 조회 전용 PTY에서 /model 메뉴를 열어 현재 선택 가능한 모델·추론 강도 목록을 읽는다.
   async modelOptions(provider: Provider): Promise<ModelOptions> {
-    const monitor = this.monitors.get(provider);
+    const monitor = this.findMonitor(provider);
     if (!monitor?.terminal) throw new Error("상태 조회 터미널이 준비되지 않았습니다.");
     if (!monitor.adapter.parseModelOptions) throw new Error("이 공급자는 모델 목록 조회를 지원하지 않습니다.");
     if (monitor.busy) {
@@ -284,15 +343,16 @@ export class UsageMonitor {
 
   // 공급자 인터랙티브 CLI를 상태 조회 전용 PTY로 실행한다.
   private startProvider(monitor: MonitorState): void {
-    const launch = monitor.adapter.createLaunch(process.cwd());
-    this.update(monitor.adapter.id, { monitor_status: "starting", data_status: "unavailable", error_code: null });
+    const launch = monitor.adapter.createMonitorLaunch?.(process.cwd()) ?? monitor.adapter.createLaunch(process.cwd());
+    this.update(monitor, { monitor_status: "starting", data_status: "unavailable", error_code: null });
     try {
       const terminal = pty.spawn(launch.command, launch.args, {
         name: "xterm-256color",
         cols: 120,
         rows: 40,
         cwd: process.cwd(),
-        env: { ...process.env, ...launch.env, TERM: "xterm-256color" } as Record<string, string>,
+        // 계정 슬롯의 설정 디렉터리를 지정해야 그 계정의 한도를 조회한다(지정하지 않으면 기본 계정 한도가 나온다).
+        env: { ...process.env, ...launch.env, ...this.accounts.environment(monitor.account), TERM: "xterm-256color" } as Record<string, string>,
       });
       monitor.terminal = terminal;
       terminal.onData((data) => monitor.screen.write(data));
@@ -302,7 +362,7 @@ export class UsageMonitor {
         if (monitor.timer) clearInterval(monitor.timer);
         if (monitor.parseTimer) clearTimeout(monitor.parseTimer);
         if (this.stopping) return;
-        this.update(monitor.adapter.id, { monitor_status: "error", data_status: "stale", error_code: "cli_exited" });
+        this.update(monitor, { monitor_status: "error", data_status: "stale", error_code: "cli_exited" });
         this.scheduleRestart(monitor);
       });
       const initial = setTimeout(() => this.requestUsage(monitor), 3_000);
@@ -312,12 +372,14 @@ export class UsageMonitor {
       // 모델·effort 목록은 서버가 뜰 때 딱 한 번만 조회해 캐시해두고, 그 뒤로는 사용자가 "새로고침"을
       // 눌렀을 때만 다시 조회한다(매 채팅 진입마다 CLI에 /model을 보내지 않기 위함). CLI가 막 떠서
       // 아직 준비 안 됐을 때 바로 보내지 않도록 최초 사용량 조회와 같은 지연을 둔다.
-      if (monitor.adapter.parseModelOptions) {
+      // 모델 목록은 계정이 아니라 CLI 버전에 달린 값이라, 같은 공급자의 조회 대상이 여럿이어도
+      // 대표 하나에서만 읽는다(계정 수만큼 /model 메뉴를 여는 낭비와 조회 충돌을 막는다).
+      if (monitor.adapter.parseModelOptions && this.findMonitor(monitor.adapter.id) === monitor) {
         const initialModelFetch = setTimeout(() => this.fetchModelOptionsOnce(monitor), 4_000);
         initialModelFetch.unref();
       }
     } catch {
-      this.update(monitor.adapter.id, { monitor_status: "error", data_status: "unavailable", error_code: "cli_exited" });
+      this.update(monitor, { monitor_status: "error", data_status: "unavailable", error_code: "cli_exited" });
       this.scheduleRestart(monitor);
     }
   }
@@ -340,7 +402,7 @@ export class UsageMonitor {
     monitor.busy = true;
     monitor.commandIndex = 0;
     monitor.screen.reset();
-    this.update(monitor.adapter.id, { monitor_status: "refreshing", last_checked_at: new Date().toISOString() });
+    this.update(monitor, { monitor_status: "refreshing", last_checked_at: new Date().toISOString() });
     this.runNextCommand(monitor);
   }
 
@@ -376,29 +438,31 @@ export class UsageMonitor {
     // 같은 리셋 시각의 창에서 사용량이 줄었다면 CLI가 돌려준 옛 스냅샷이므로, 이 값으로 마지막
     // 정상값을 덮어쓰지 않고 stale 표시만 남긴다(detectUsageRegression 참고). 다음 주기에 CLI가
     // 다시 최신 값을 주면 퍼센트가 증가 방향이라 그대로 통과돼 자동 복구된다.
-    const previous = this.database.prepare("SELECT details_json FROM usage_status WHERE provider = ?").get(monitor.adapter.id) as { details_json: string | null } | undefined;
+    const previous = this.database.prepare("SELECT details_json FROM usage_status WHERE provider = ? AND account_id = ?")
+      .get(monitor.adapter.id, monitor.account.id) as { details_json: string | null } | undefined;
     // 세션 리셋 시각이 물리적으로 불가능할 만큼 먼 값(5시간짜리 롤링 윈도우인데 8시간 넘게 남음 등)도
     // 옛 스냅샷과 같은 종류의 오검출이라 같은 방식(stale만 남기고 마지막 정상값 유지)으로 처리한다.
     const implausibleSessionReset = monitor.adapter.id === "claude" && success && isImplausibleClaudeSessionReset(parsed.details_json, new Date());
     if (success && (detectUsageRegression(previous?.details_json ?? null, parsed.details_json) || implausibleSessionReset)) {
-      this.update(monitor.adapter.id, { monitor_status: "ready", data_status: "stale" });
+      this.update(monitor, { monitor_status: "ready", data_status: "stale" });
     } else {
-      this.update(monitor.adapter.id, {
+      this.update(monitor, {
         ...parsed,
         monitor_status: success ? "ready" : "error",
         last_success_at: success ? new Date().toISOString() : undefined,
       });
+      if (success) this.resetNotifier?.observe(monitor.adapter.id, parsed.details_json);
     }
     monitor.busy = false;
     monitor.terminal?.write("\u001b");
   }
 
   // 사용량 상태의 변경 필드만 upsert하고 웹에 알린다.
-  private update(provider: Provider, patch: Partial<UsageRecord>): void {
+  private update(monitor: MonitorState, patch: Partial<UsageRecord>): void {
     this.database.prepare(`
-      INSERT INTO usage_status(provider, monitor_status, data_status, error_code, summary, used_percent, remaining_percent, reset_at, details_json, last_checked_at, last_success_at)
-      VALUES (@provider, COALESCE(@monitor_status, 'starting'), COALESCE(@data_status, 'unavailable'), @error_code, @summary, @used_percent, @remaining_percent, @reset_at, @details_json, @last_checked_at, @last_success_at)
-      ON CONFLICT(provider) DO UPDATE SET
+      INSERT INTO usage_status(provider, account_id, monitor_status, data_status, error_code, summary, used_percent, remaining_percent, reset_at, details_json, last_checked_at, last_success_at)
+      VALUES (@provider, @account_id, COALESCE(@monitor_status, 'starting'), COALESCE(@data_status, 'unavailable'), @error_code, @summary, @used_percent, @remaining_percent, @reset_at, @details_json, @last_checked_at, @last_success_at)
+      ON CONFLICT(provider, account_id) DO UPDATE SET
         monitor_status = COALESCE(@monitor_status, monitor_status),
         data_status = COALESCE(@data_status, data_status),
         error_code = CASE WHEN @clear_error = 1 THEN NULL ELSE COALESCE(@error_code, error_code) END,
@@ -410,7 +474,8 @@ export class UsageMonitor {
         last_checked_at = COALESCE(@last_checked_at, last_checked_at),
         last_success_at = COALESCE(@last_success_at, last_success_at)
     `).run({
-      provider,
+      provider: monitor.adapter.id,
+      account_id: monitor.account.id,
       monitor_status: patch.monitor_status ?? null,
       data_status: patch.data_status ?? null,
       error_code: patch.error_code ?? null,
@@ -423,6 +488,6 @@ export class UsageMonitor {
       last_checked_at: patch.last_checked_at ?? null,
       last_success_at: patch.last_success_at ?? null,
     });
-    this.realtime.broadcast("usage_updated", { provider });
+    this.realtime.broadcast("usage_updated", { provider: monitor.adapter.id, accountId: monitor.account.id });
   }
 }

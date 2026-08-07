@@ -2,6 +2,7 @@ import React, { useEffect, useState } from "react";
 import { Bot, ExternalLink, LoaderCircle, Pause, Play, Plus, Send, Square, X } from "lucide-react";
 import { api } from "../api";
 import type { Json } from "../types";
+import { useDialogHistory } from "../lib/dialog-history";
 
 interface SubagentManagerProps {
   project: Json;
@@ -52,6 +53,7 @@ export function SubagentManager({
   startChat,
   onClose,
 }: SubagentManagerProps): React.ReactElement {
+  const dismiss = useDialogHistory(true, onClose, "subagent-manager");
   const availableProviders = providers.filter((item) => ["codex", "claude"].includes(item.id));
   const [provider, setProvider] = useState(() => availableProviders.some((item) => item.id === selectedChat.provider) ? selectedChat.provider : availableProviders[0]?.id || "codex");
   const [prompt, setPrompt] = useState("");
@@ -150,14 +152,14 @@ export function SubagentManager({
   const attentionCount = delegations.filter((item) => delegationActivity(item).className === "error").length;
 
   return <>
-    <button type="button" className="subagent-backdrop" aria-label="서브 에이전트 관리 닫기" onClick={onClose} />
+    <button type="button" className="subagent-backdrop" aria-label="서브 에이전트 관리 닫기" onClick={() => dismiss()} />
     <aside className="subagent-manager" role="dialog" aria-modal="true" aria-labelledby="subagent-manager-title">
       <div className="subagent-manager-head">
         <div className="subagent-manager-title">
           <span className="subagent-manager-icon"><Bot size={18} aria-hidden="true" /></span>
           <div><h2 id="subagent-manager-title">서브 에이전트</h2><span>{project.name}</span></div>
         </div>
-        <button type="button" className="icon-button" aria-label="서브 에이전트 관리 닫기" title="닫기" onClick={onClose}><X size={18} aria-hidden="true" /></button>
+        <button type="button" className="icon-button" aria-label="서브 에이전트 관리 닫기" title="닫기" onClick={() => dismiss()}><X size={18} aria-hidden="true" /></button>
       </div>
       <div className="subagent-overview">
         <div className="subagent-overview-copy">

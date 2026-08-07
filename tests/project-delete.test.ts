@@ -1,3 +1,4 @@
+import type { AgentAccountService } from "../src/server/services/agent-accounts";
 import { once } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
@@ -46,11 +47,12 @@ async function startServer(): Promise<{ base: string; database: AppDatabase; pro
 
   const app = express();
   app.use(express.json());
-  app.use((request: Request & { authUser?: unknown }, _response, next) => {
+  app.use((request: Request & { authUser?: unknown; trustedNetwork?: boolean }, _response, next) => {
     request.authUser = { id: 1, username: "admin", role: "admin" };
+    request.trustedNetwork = request.headers["x-test-external"] !== "1";
     next();
   });
-  app.use(createProjectRouter(database, config, {} as SessionManager, [], new HistoryCache()));
+  app.use(createProjectRouter(database, config, {} as SessionManager, [], {} as AgentAccountService, new HistoryCache()));
   app.use((error: unknown, request: Request, response: Response, _next: NextFunction) => {
     response.status(400).json({ error: error instanceof Error ? error.message : String(error) });
   });
@@ -125,5 +127,15 @@ describe("프로젝트 삭제 API", () => {
 
     const afterReadd = await (await fetch(`${base}/projects`)).json();
     expect(afterReadd.projects.map((item: { id: number }) => item.id)).toContain(projectId);
+  });
+
+  it("외부 네트워크에서는 프로젝트 삭제를 거부한다", async () => {
+    const { base, database } = await startServer();
+    const projectId = Number(database.prepare("INSERT INTO projects(name, path) VALUES ('삭제 제한', '/tmp/deny')").run().lastInsertRowid);
+
+    const response = await fetch(`${base}/projects/${projectId}`, { method: "DELETE", headers: { "x-test-external": "1" } });
+
+    expect(response.status).toBe(403);
+    expect((database.prepare("SELECT active FROM projects WHERE id = ?").get(projectId) as { active: number }).active).toBe(1);
   });
 });

@@ -34,6 +34,37 @@ function SlackSettingsCard(): React.ReactElement {
   </article>;
 }
 
+// 관리자 전용 유휴 채팅 자동 종료 정책 카드를 표시한다.
+function IdleChatSettingsCard(): React.ReactElement {
+  const [enabled, setEnabled] = useState(true);
+  const [timeoutHours, setTimeoutHours] = useState(24);
+  const [status, setStatus] = useState("");
+  useEffect(() => {
+    void api("/admin/idle-chat-settings")
+      .then((data) => { setEnabled(!!data.enabled); setTimeoutHours(Number(data.timeoutHours) || 24); })
+      .catch(() => undefined);
+  }, []);
+  async function save(event: React.FormEvent): Promise<void> {
+    event.preventDefault();
+    setStatus("저장 중…");
+    try {
+      const data = await api("/admin/idle-chat-settings", { method: "PUT", body: JSON.stringify({ enabled, timeoutHours }) });
+      setEnabled(!!data.enabled); setTimeoutHours(Number(data.timeoutHours)); setStatus("저장했습니다.");
+    } catch (error: any) {
+      setStatus(error?.message || "저장에 실패했습니다.");
+    }
+  }
+  return <article className="card"><div className="card-top">유휴 채팅 자동 종료</div>
+    <form className="slack-settings-form" onSubmit={save}>
+      <label className="idle-toggle"><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} />설정한 시간 동안 아무 활동이 없는 터미널을 자동 종료</label>
+      <label>기준 시간(시간)<input type="number" min={1} max={720} value={timeoutHours} onChange={(event) => setTimeoutHours(Number(event.target.value))} /></label>
+      <p className="muted idle-note">작업 중이거나 리밋 재개를 기다리거나 승인 응답을 기다리는 채팅은 종료하지 않습니다. 10분마다 검사합니다.</p>
+      <div className="slack-settings-actions"><button className="primary">저장</button></div>
+      {status && <span className="attachment-status">{status}</span>}
+    </form>
+  </article>;
+}
+
 // 관리자 전용 ntfy topic·서버 URL 설정 카드를 표시한다.
 function NtfySettingsCard(): React.ReactElement {
   const [settings, setSettings] = useState<Json | null>(null);
@@ -70,6 +101,48 @@ function processSortValue(process: Json, key: string): string | number {
   if (key === "chat") return process.chat ? `${process.chat.projectName} ${process.chat.title}` : "";
   if (key === "name") return process.name;
   return process[key] ?? 0;
+}
+
+interface ProcessGroupRow {
+  key: string;
+  kind: string;
+  label: string;
+  processes: Json[];
+  cpu: number;
+  memory: number;
+}
+
+const GROUP_KIND_ORDER: Record<string, number> = { chat: 0, system: 1, other: 2 };
+const GROUP_KIND_LABEL: Record<string, string> = { chat: "채팅", system: "시스템", other: "기타" };
+
+// 같은 채팅에 딸린 tmux·node·claude를 한 줄로 묶고 시스템·기타 묶음도 따로 만든다.
+function groupProcesses(processes: Json[], sortKey: string, sortDir: "asc" | "desc"): ProcessGroupRow[] {
+  const groups = new Map<string, ProcessGroupRow>();
+  for (const process of processes) {
+    const group = process.group ?? { kind: "other", key: "other", label: "기타 프로세스" };
+    const row: ProcessGroupRow = groups.get(group.key) ?? { key: group.key, kind: group.kind, label: group.label, processes: [], cpu: 0, memory: 0 };
+    row.processes.push(process);
+    row.cpu += process.cpu ?? 0;
+    row.memory += process.memory ?? 0;
+    groups.set(group.key, row);
+  }
+  const dir = sortDir === "asc" ? 1 : -1;
+  const rows = [...groups.values()];
+  for (const row of rows) {
+    row.processes.sort((a, b) => {
+      const av = processSortValue(a, sortKey); const bv = processSortValue(b, sortKey);
+      if (typeof av === "string" || typeof bv === "string") return dir * String(av).localeCompare(String(bv));
+      return dir * (av - bv);
+    });
+  }
+  // 묶음 자체는 종류(채팅 → 시스템 → 기타) 순으로 두고, 그 안에서만 선택한 정렬 기준을 쓴다.
+  rows.sort((a, b) => {
+    const kindDiff = (GROUP_KIND_ORDER[a.kind] ?? 9) - (GROUP_KIND_ORDER[b.kind] ?? 9);
+    if (kindDiff) return kindDiff;
+    if (sortKey === "memory" || sortKey === "cpu") return dir * ((a[sortKey] as number) - (b[sortKey] as number));
+    return a.label.localeCompare(b.label);
+  });
+  return rows;
 }
 
 // ISO 문자열 타임스탬프를 사람이 읽기 쉬운 로컬 시각으로 바꾼다.
@@ -124,17 +197,14 @@ export function Overview({ user, providers, usage, system, runtime, slack, ntfy,
   function sortIndicator(key: string): string {
     return sortKey === key ? (sortDir === "asc" ? " ▲" : " ▼") : "";
   }
-  const sortedProcesses = useMemo(() => {
-    const list = [...(latest?.processes ?? [])];
-    const dir = sortDir === "asc" ? 1 : -1;
-    list.sort((a, b) => {
-      const av = processSortValue(a, sortKey); const bv = processSortValue(b, sortKey);
-      if (typeof av === "string" || typeof bv === "string") return dir * String(av).localeCompare(String(bv));
-      return dir * (av - bv);
-    });
-    return list;
-  }, [latest?.processes, sortKey, sortDir]);
+  const processGroups = useMemo(() => groupProcesses(latest?.processes ?? [], sortKey, sortDir), [latest?.processes, sortKey, sortDir]);
+  // 묶음은 기본적으로 접어두고 필요한 것만 펼쳐 본다(채팅 하나에 프로세스가 3개씩 붙어 표가 길어지던 문제).
+  const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({});
+  function toggleGroup(key: string): void {
+    setExpandedGroups((current) => ({ ...current, [key]: !current[key] }));
+  }
   const [killingPid, setKillingPid] = useState<number | null>(null);
+  const [killingGroup, setKillingGroup] = useState<string | null>(null);
   // 종료·강제 종료 모두 되돌릴 수 없는 조작이라 실행 전 확인을 받는다.
   async function killProcess(pid: number, force: boolean): Promise<void> {
     const label = force ? "강제 종료(SIGKILL)" : "종료(SIGTERM)";
@@ -147,6 +217,24 @@ export function Overview({ user, providers, usage, system, runtime, slack, ntfy,
     } finally {
       setKillingPid(null);
     }
+  }
+  // 묶음에 속한 프로세스를 한 번에 종료한다. 부모를 죽여도 자식은 고아로 살아남는 것을 실측해서(2026-08-06)
+  // 부모만 보내지 않고 전부 보낸다. 자식(나중에 생긴 pid)부터 보내 부모가 되살리는 경우를 줄인다.
+  async function killGroup(group: ProcessGroupRow, force: boolean): Promise<void> {
+    const label = force ? "강제 종료(SIGKILL)" : "종료(SIGTERM)";
+    const preview = group.processes.map((process: Json) => `${process.name}(${process.pid})`).join(", ");
+    if (!window.confirm(`"${group.label}" 묶음의 프로세스 ${group.processes.length}개를 ${label}할까요?\n\n${preview}\n\n되돌릴 수 없습니다.`)) return;
+    setKillingGroup(group.key);
+    const failures: string[] = [];
+    for (const process of [...group.processes].sort((a: Json, b: Json) => b.pid - a.pid)) {
+      try {
+        await api(`/system/processes/${process.pid}/kill`, { method: "POST", body: JSON.stringify({ force }) });
+      } catch (error: any) {
+        failures.push(`${process.name}(${process.pid}): ${error?.message || "실패"}`);
+      }
+    }
+    setKillingGroup(null);
+    if (failures.length) window.alert(`일부 프로세스를 종료하지 못했습니다.\n\n${failures.join("\n")}`);
   }
   return <section className="content-grid">
     <div className="section-head"><div><span className="eyebrow">실시간 현황</span><h2>운영 대시보드</h2></div><button onClick={refresh}>새로고침</button></div>
@@ -183,23 +271,48 @@ export function Overview({ user, providers, usage, system, runtime, slack, ntfy,
       </div></article>
       {user?.role === "admin" && <SlackSettingsCard />}
       {user?.role === "admin" && <NtfySettingsCard />}
+      {user?.role === "admin" && <IdleChatSettingsCard />}
     </div>
     <article className="card process-card"><h3>에이전트 프로세스</h3><div className="table-wrap"><table><thead><tr>
+      <th className="sortable" onClick={() => toggleSort("name")}>묶음 / 프로세스{sortIndicator("name")}</th>
       <th className="sortable" onClick={() => toggleSort("pid")}>PID{sortIndicator("pid")}</th>
-      <th className="sortable" onClick={() => toggleSort("name")}>프로세스{sortIndicator("name")}</th>
       <th className="sortable" onClick={() => toggleSort("cpu")}>CPU{sortIndicator("cpu")}</th>
       <th className="sortable" onClick={() => toggleSort("memory")}>메모리{sortIndicator("memory")}</th>
-      <th className="sortable" onClick={() => toggleSort("chat")}>프로젝트/세션{sortIndicator("chat")}</th>
       {user?.role === "admin" && <th>작업</th>}
     </tr></thead><tbody>
-      {sortedProcesses.map((process: Json) => <tr key={process.pid}>
-        <td>{process.pid}</td><td>{process.name}</td><td>{process.cpu.toFixed(1)}%</td><td>{bytes(process.memory)}</td>
-        <td>{process.chat ? `${process.chat.projectName} · ${process.chat.title}` : "-"}</td>
-        {user?.role === "admin" && <td className="process-actions">
-          <button disabled={killingPid === process.pid} onClick={() => void killProcess(process.pid, false)}>종료</button>
-          <button className="danger" disabled={killingPid === process.pid} onClick={() => void killProcess(process.pid, true)}>강제종료</button>
-        </td>}
-      </tr>)}
+      {processGroups.map((group) => <React.Fragment key={group.key}>
+        <tr className={`process-group-row process-group-${group.kind}`}>
+          <td>
+            <button type="button" className="process-group-toggle" aria-expanded={!!expandedGroups[group.key]} onClick={() => toggleGroup(group.key)}>
+              <span className="process-group-caret">{expandedGroups[group.key] ? "▾" : "▸"}</span>
+              <span className={`process-group-badge kind-${group.kind}`}>{GROUP_KIND_LABEL[group.kind] ?? group.kind}</span>
+              <b>{group.label}</b>
+              <span className="process-group-count">{group.processes.length}개</span>
+            </button>
+          </td>
+          <td className="muted" data-label="PID">-</td>
+          <td data-label="CPU">{group.cpu.toFixed(1)}%</td>
+          <td data-label="메모리">{bytes(group.memory)}</td>
+          {user?.role === "admin" && <td className="process-actions">
+            {/* 시스템 묶음에는 서버 본체와 이를 띄운 watch 프로세스가 들어 있어 종료하면 앱이 내려간다. */}
+            {group.kind === "system" ? <span className="muted process-protected">앱 구동에 필요</span> : <>
+              <button disabled={killingGroup === group.key} onClick={() => void killGroup(group, false)}>{killingGroup === group.key ? "종료 중…" : "묶음 종료"}</button>
+              <button className="danger" disabled={killingGroup === group.key} onClick={() => void killGroup(group, true)}>강제</button>
+            </>}
+          </td>}
+        </tr>
+        {expandedGroups[group.key] && group.processes.map((process: Json) => <tr key={process.pid} className="process-child-row">
+          <td className="process-child-name">{process.name}</td>
+          <td data-label="PID">{process.pid}</td><td data-label="CPU">{process.cpu.toFixed(1)}%</td><td data-label="메모리">{bytes(process.memory)}</td>
+          {user?.role === "admin" && <td className="process-actions">
+            {group.kind === "system" ? <span className="muted process-protected">앱 구동에 필요</span> : <>
+              <button disabled={killingPid === process.pid} onClick={() => void killProcess(process.pid, false)}>종료</button>
+              <button className="danger" disabled={killingPid === process.pid} onClick={() => void killProcess(process.pid, true)}>강제종료</button>
+            </>}
+          </td>}
+        </tr>)}
+      </React.Fragment>)}
+      {!processGroups.length && <tr><td colSpan={user?.role === "admin" ? 5 : 4} className="muted">표시할 프로세스가 없습니다.</td></tr>}
     </tbody></table></div></article>
   </section>;
 }

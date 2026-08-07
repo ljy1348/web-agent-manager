@@ -8,7 +8,9 @@ import { Login } from "./components/Login";
 import { AgentIntegrationNotice } from "./components/AgentIntegrationNotice";
 import { CliAuthPanel } from "./components/CliAuthPanel";
 import { ProjectDialog } from "./components/ProjectDialog";
-import { FolderPlus, KeyRound, Trash2 } from "lucide-react";
+import {
+  Files, FolderPlus, Gauge, GitPullRequest, KeyRound, MessageSquareText, ScrollText, Trash2, Wrench,
+} from "lucide-react";
 import { Overview } from "./features/overview/Overview";
 import { ChatView } from "./features/chat/ChatView";
 import { FilesView } from "./features/files/FilesView";
@@ -25,6 +27,14 @@ initClientLogging();
 // 데스크톱 상단 nav와 모바일 하단 탭바가 같은 탭 목록·라벨을 공유한다.
 const TABS: Tab[] = ["overview", "chat", "files", "instructions", "git", "tools"];
 const TAB_LABELS: Record<Tab, string> = { overview: "대시보드", chat: "채팅", files: "파일", instructions: "지침", git: "GitHub", tools: "도구" };
+const TAB_ICONS: Record<Tab, typeof Gauge> = {
+  overview: Gauge,
+  chat: MessageSquareText,
+  files: Files,
+  instructions: ScrollText,
+  git: GitPullRequest,
+  tools: Wrench,
+};
 
 interface NavigationLocation {
   tab: Tab;
@@ -87,11 +97,12 @@ function writeNavigation(location: NavigationLocation, mode: "push" | "replace")
 function App(): React.ReactElement {
   const initialNavigation = useRef<NavigationLocation>(navigationFromLocation());
   const [user, setUser] = useState<Json | null>(null); const [loading, setLoading] = useState(true); const [tab, setTab] = useState<Tab>(initialNavigation.current.tab);
-  const [projects, setProjects] = useState<Json[]>([]); const [project, setProject] = useState<Json | null>(null); const [defaultProjectPath, setDefaultProjectPath] = useState(""); const [providers, setProviders] = useState<Json[]>([]); const [chats, setChats] = useState<Json[]>([]); const [chat, setChat] = useState<Json | null>(null); const [messages, setMessages] = useState<Json[]>([]); const [hasMoreMessages, setHasMoreMessages] = useState(false);
+  const [projects, setProjects] = useState<Json[]>([]); const [project, setProject] = useState<Json | null>(null); const [defaultProjectPath, setDefaultProjectPath] = useState(""); const [providers, setProviders] = useState<Json[]>([]); const [accounts, setAccounts] = useState<Json[]>([]); const [chats, setChats] = useState<Json[]>([]); const [chat, setChat] = useState<Json | null>(null); const [messages, setMessages] = useState<Json[]>([]); const [hasMoreMessages, setHasMoreMessages] = useState(false);
   const [targetChatId, setTargetChatId] = useState<number | null>(initialNavigation.current.chatId);
   const [usage, setUsage] = useState<Json[]>([]); const [system, setSystem] = useState<Json>({}); const [runtime, setRuntime] = useState<Json>({}); const [slack, setSlack] = useState<Json>({}); const [ntfy, setNtfy] = useState<Json>({}); const [approvals, setApprovals] = useState<Json[]>([]); const [sessionBackups, setSessionBackups] = useState<Json[]>([]); const [socket, setSocket] = useState<WebSocket | null>(null); const [error, setError] = useState("");
   const [showProjectDialog, setShowProjectDialog] = useState(false);
   const [showCliAuth, setShowCliAuth] = useState(false);
+  const [cliAuthPending, setCliAuthPending] = useState(false);
   const [fileTarget, setFileTarget] = useState<{ projectId: number; path: string; requestId: number } | null>(
     initialNavigation.current.projectId && initialNavigation.current.filePath !== null
       ? { projectId: initialNavigation.current.projectId, path: initialNavigation.current.filePath, requestId: Date.now() }
@@ -171,6 +182,8 @@ function App(): React.ReactElement {
     const preferredProjectId = (preferredChatData?.chat?.project_id ?? Number(userRef.current?.last_project_id || 0)) || null;
     const preferredProject = projectList.find((item: Json) => item.id === preferredProjectId) || null;
     setProviders(providerData.providers || []);
+    // 계정 목록은 관리자 전용 API라 일반 사용자에게는 비워둔다(계정 선택 UI 자체가 나타나지 않는다).
+    if (userRef.current?.role === "admin") void api("/agent-accounts").then((data) => setAccounts(data.accounts || [])).catch(() => undefined);
     setProjects(projectList);
     setProject((current) => {
       const switchedWhileLoading = projectSwitchRef.current !== projectSwitchVersion || selectionVersionRef.current !== selectionVersion;
@@ -243,6 +256,18 @@ function App(): React.ReactElement {
       logChatTrace("lastSession:save:done", { projectId: data.lastProjectId, chatId: data.lastChatId, version });
       setUser((current) => current ? { ...current, last_project_id: data.lastProjectId, last_chat_id: data.lastChatId } : current);
     }).catch((error) => logChatTrace("lastSession:save:error", { message: error instanceof Error ? error.message : "저장 실패", version }));
+  }
+  // 현재 웹 계정의 채팅 화면 모드를 즉시 반영하고 서버에 영속화한다.
+  async function changeChatViewMode(chatViewMode: "chat" | "terminal"): Promise<void> {
+    const previous = userRef.current?.chat_view_mode === "terminal" ? "terminal" : "chat";
+    setUser((current) => current ? { ...current, chat_view_mode: chatViewMode } : current);
+    try {
+      const data = await api("/auth/chat-view-mode", { method: "PUT", body: JSON.stringify({ chatViewMode }) });
+      setUser((current) => current ? { ...current, chat_view_mode: data.chatViewMode } : current);
+    } catch (error) {
+      setUser((current) => current?.chat_view_mode === chatViewMode ? { ...current, chat_view_mode: previous } : current);
+      throw error;
+    }
   }
   // 채팅 선택은 URL과 계정별 마지막 세션 저장을 함께 처리한다.
   function selectChat(next: Json | null): void {
@@ -351,6 +376,7 @@ function App(): React.ReactElement {
         // 알림 트리거로 쓴다. rate_limit_reset은 계정 단위라 어느 채팅인지 특정하지 않는다.
         if (message.type === "task_completed") showNotification("작업이 완료됐습니다", message.payload?.title || "채팅을 확인해보세요.");
         if (message.type === "rate_limit_reset") showNotification("사용량 한도가 초기화됐습니다", "대기 중이던 작업을 이어갑니다.");
+        if (message.type === "usage_session_reset") showNotification(`${message.payload?.windowLabel || "세션"} 사용량이 초기화됐습니다`, `${message.payload?.label || message.payload?.provider || "AI"} 사용량을 확인해보세요.`);
         if (["usage_updated", "history_updated", "chat_status", "approval_requested", "approval_resolved"].includes(message.type)) void loadCore();
       };
       ws.onclose = () => {
@@ -482,7 +508,8 @@ function App(): React.ReactElement {
     return added;
   }
   const activeChats = useMemo(() => chats.filter((item) => ["running", "starting", "resuming"].includes(item.status)).length, [chats]);
-  async function createChat(provider: string): Promise<void> { if (!project) return; const data = await api("/chats", { method: "POST", body: JSON.stringify({ projectId: project.id, provider }) }); setChats((items) => [data.chat, ...items]); selectChat(data.chat); }
+  // accountId를 주면 그 인증 계정으로 채팅을 만든다(생략하면 공급자의 기본 계정).
+  async function createChat(provider: string, accountId?: number | null): Promise<void> { if (!project) return; const data = await api("/chats", { method: "POST", body: JSON.stringify({ projectId: project.id, provider, accountId: accountId ?? null }) }); setChats((items) => [data.chat, ...items]); selectChat(data.chat); }
   // 실제 응답 도착은 history_updated 웹소켓 알림으로 반영되므로 여기서는 전송만 담당한다.
   // JSONL에 실제로 기록되기까지는 시간차가 있어, 보내는 즉시 화면에 사용자 메시지를 먼저 띄워두고
   // history_updated가 오면(위 핸들러에서) 실제 메시지로 교체되며 사라진다. 전송 자체가 실패하면 바로 걷어낸다.
@@ -507,8 +534,8 @@ function App(): React.ReactElement {
   }
   async function backupChat(id: number): Promise<void> { await api(`/chats/${id}/backup`, { method: "POST" }); await loadSessionBackups(); }
   // 선택한 채팅을 삭제하고, 필요하면 삭제 전에 서버에서 백업을 생성한다.
-  async function deleteChat(id: number, backup = true): Promise<void> {
-    await api(`/chats/${id}${backup ? "" : "?backup=0"}`, { method: "DELETE" });
+  async function deleteChat(id: number, backup = true): Promise<Json> {
+    const result = await api(`/chats/${id}${backup ? "" : "?backup=0"}`, { method: "DELETE" });
     setChats((items: Json[]) => {
       const next = items.filter((item) => item.id !== id);
       setChat((current) => {
@@ -520,6 +547,7 @@ function App(): React.ReactElement {
     });
     if (chat?.id === id) { setMessages([]); setHasMoreMessages(false); }
     await loadSessionBackups();
+    return result;
   }
   async function restoreBackup(id: string): Promise<void> {
     const data = await api(`/session-backups/${id}/restore`, { method: "POST" });
@@ -582,17 +610,16 @@ function App(): React.ReactElement {
   }
   if (loading) return <div className="splash">web-agent-manager</div>;
   if (!user) return <Login onLogin={(data) => { setCsrfToken(data.csrfToken); setUser(data.user); }} />;
-  return <div className="app-shell"><header><div className="brand"><span>W</span><b>web-agent-manager</b></div><nav>{TABS.map((item) => <button key={item} className={tab === item ? "active" : ""} onClick={() => selectTab(item)}>{TAB_LABELS[item]}</button>)}</nav><div className="header-meta"><span className="live">● {activeChats} 실행 중</span>{typeof Notification !== "undefined" && notifPermission !== "granted" && <button type="button" className="notif-toggle" disabled={notifPermission === "denied"} title={notifPermission === "denied" ? "브라우저 설정에서 알림을 허용해야 합니다." : "작업 완료·사용량 한도 초기화 시 브라우저 알림을 받습니다."} onClick={() => void enableNotifications()}>🔔 알림 켜기</button>}{user.role === "admin" && <button type="button" className="header-icon-button" title="CLI 인증 관리" aria-label="CLI 인증 관리" onClick={() => setShowCliAuth(true)}><KeyRound size={16} /></button>}<span>{user.username}</span></div></header>
-    <div className="project-bar"><select value={project?.id || ""} onChange={(event) => selectProject(projects.find((item) => item.id === Number(event.target.value)) || null)}><option value="">프로젝트 없음</option>{projects.map((item) => <option value={item.id} key={item.id}>{item.name} · {shortProjectPath(item.path, defaultProjectPath)}</option>)}</select><button onClick={addProject}><FolderPlus size={16} />프로젝트</button>{project && <button type="button" className="project-delete" title="목록에서 프로젝트 삭제" aria-label="목록에서 프로젝트 삭제" onClick={() => void deleteProject(project)}><Trash2 size={16} /></button>}</div>
+  return <div className={`app-shell tab-${tab}`}><header><div className="brand"><span>W</span><div><b>web-agent-manager</b><small>Agent workspace</small></div></div><nav>{TABS.map((item) => <button key={item} className={tab === item ? "active" : ""} onClick={() => selectTab(item)}>{React.createElement(TAB_ICONS[item], { size: 16, "aria-hidden": true })}<span>{TAB_LABELS[item]}</span></button>)}</nav><div className="header-meta"><span className="live"><i />{activeChats} 실행 중</span>{typeof Notification !== "undefined" && notifPermission !== "granted" && <button type="button" className="notif-toggle" disabled={notifPermission === "denied"} title={notifPermission === "denied" ? "브라우저 설정에서 알림을 허용해야 합니다." : "작업 완료·사용량 한도 초기화 시 브라우저 알림을 받습니다."} onClick={() => void enableNotifications()}>🔔 알림 켜기</button>}{user.role === "admin" && <button type="button" className="header-icon-button" title="CLI 인증 관리" aria-label="CLI 인증 관리" onClick={() => setShowCliAuth(true)}><KeyRound size={16} /></button>}<span className="header-user">{user.username}</span></div></header>
+    <div className="project-bar"><span className="project-bar-label">작업 프로젝트</span><select aria-label="작업 프로젝트" value={project?.id || ""} onChange={(event) => selectProject(projects.find((item) => item.id === Number(event.target.value)) || null)}><option value="">프로젝트 없음</option>{projects.map((item) => <option value={item.id} key={item.id}>{item.name} · {shortProjectPath(item.path, defaultProjectPath)}</option>)}</select><button className="project-add" aria-label="프로젝트" onClick={addProject}><FolderPlus size={16} /><span>프로젝트 추가</span></button>{project && <button type="button" className="project-delete" title="목록에서 프로젝트 삭제" aria-label="목록에서 프로젝트 삭제" onClick={() => void deleteProject(project)}><Trash2 size={16} /></button>}</div>
     <AgentIntegrationNotice user={user} />
     {error && <div className="global-error" onClick={() => setError("")}>{error}</div>}
-    <main className={`main${tab === "chat" ? " main-chat" : ""}`}>{tab === "overview" && <Overview user={user} providers={providers} usage={usage} system={system} runtime={runtime} slack={slack} ntfy={ntfy} refresh={loadCore} />}{tab === "chat" && <ChatView user={user} providers={providers} project={project} projects={projects} setProject={selectProject} addProject={addProject} deleteProject={deleteProject} chats={chats} selectedChat={chat} setSelectedChat={selectChat} refreshChats={refetchChats} createChat={createChat} send={send} stop={stop} interrupt={interrupt} cycleMode={cycleMode} startChat={startChat} messages={messages} hasMoreMessages={hasMoreMessages} loadMoreMessages={loadMoreMessages} usage={usage} busy={!!chat?.busy} socket={socket} approvals={approvals} decide={decide} scrollState={chatScrollStateRef.current} sessionBackups={sessionBackups} backupChat={backupChat} deleteChat={deleteChat} restoreBackup={restoreBackup} deleteBackup={deleteBackup} onOpenProjectFile={openProjectFile} />}{tab === "files" && <FilesView project={project} target={fileTarget} onNavigate={navigateFile} />}{tab === "instructions" && <InstructionsView project={project} />}{tab === "git" && <GitView project={project} onOpenProject={(next) => void openProject(next)} />}{tab === "tools" && <ToolsView project={project} />}</main>
+    <main className={`main${tab === "chat" ? " main-chat" : ""}`}>{tab === "overview" && <Overview user={user} providers={providers} usage={usage} system={system} runtime={runtime} slack={slack} ntfy={ntfy} refresh={loadCore} />}{tab === "chat" && <ChatView user={user} chatViewMode={user.chat_view_mode === "terminal" ? "terminal" : "chat"} changeChatViewMode={changeChatViewMode} providers={providers} accounts={accounts} project={project} projects={projects} setProject={selectProject} addProject={addProject} deleteProject={deleteProject} chats={chats} selectedChat={chat} setSelectedChat={selectChat} refreshChats={refetchChats} createChat={createChat} send={send} stop={stop} interrupt={interrupt} cycleMode={cycleMode} startChat={startChat} messages={messages} hasMoreMessages={hasMoreMessages} loadMoreMessages={loadMoreMessages} usage={usage} busy={!!chat?.busy} socket={socket} approvals={approvals} decide={decide} scrollState={chatScrollStateRef.current} sessionBackups={sessionBackups} backupChat={backupChat} deleteChat={deleteChat} restoreBackup={restoreBackup} deleteBackup={deleteBackup} onOpenProjectFile={openProjectFile} />}{tab === "files" && <FilesView project={project} chat={chat} target={fileTarget} onNavigate={navigateFile} />}{tab === "instructions" && <InstructionsView project={project} chat={chat} />}{tab === "git" && <GitView project={project} user={user} chat={chat} providers={providers} refreshChats={refetchChats} onOpenProject={(next) => void openProject(next)} onOpenChat={(next) => { selectChat(next); setTab("chat"); }} />}{tab === "tools" && <ToolsView project={project} />}</main>
     <ProjectDialog open={showProjectDialog} defaultPath={defaultProjectPath} onClose={() => setShowProjectDialog(false)} onProject={(next) => void openProject(next)} />
-    <CliAuthPanel open={showCliAuth} user={user} socket={socket} onClose={() => setShowCliAuth(false)} onRequireOpen={() => setShowCliAuth(true)} />
-    {user.role === "admin" && <button type="button" className="mobile-auth-button" title="CLI 인증 관리" aria-label="CLI 인증 관리" onClick={() => setShowCliAuth(true)}><KeyRound size={18} /></button>}
+    <CliAuthPanel open={showCliAuth} user={user} socket={socket} onClose={() => setShowCliAuth(false)} onRequireOpen={() => setShowCliAuth(true)} onPendingChange={setCliAuthPending} />
     {/* 데스크톱 상단 header/nav는 모바일에서 전부 display:none이라, 채팅 탭 말고는 갈 방법이 없었다.
         모바일 전용 하단 탭바를 따로 둔다(styles.css에서 데스크톱은 숨기고 모바일에서만 보여줌). */}
-    <nav className="mobile-tabbar" aria-label="탭 전환">{TABS.map((item) => <button key={item} className={tab === item ? "active" : ""} onClick={() => selectTab(item)}>{TAB_LABELS[item]}</button>)}</nav>
+    <nav className={`mobile-tabbar${cliAuthPending ? " has-auth" : ""}`} aria-label="탭 전환">{TABS.map((item) => <button key={item} className={tab === item ? "active" : ""} onClick={() => selectTab(item)}>{React.createElement(TAB_ICONS[item], { size: 18, "aria-hidden": true })}<span>{TAB_LABELS[item]}</span></button>)}{user.role === "admin" && cliAuthPending && <button type="button" className="mobile-auth-button" title="CLI 인증 관리" aria-label="CLI 인증 관리" onClick={() => setShowCliAuth(true)}><KeyRound size={16} aria-hidden="true" /><span>인증</span></button>}</nav>
   </div>;
 }
 

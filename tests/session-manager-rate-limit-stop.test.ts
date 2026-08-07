@@ -17,7 +17,7 @@ function buildManager(): { dataDir: string; database: ReturnType<typeof openData
   const realtime = { setTerminalHandlers: () => undefined, broadcast: () => undefined };
   const approvals = { setTerminalDecisionHandler: () => undefined, setTerminalLiveCheckHandler: () => undefined };
   const notifications = { notify: async () => undefined };
-  const manager = new SessionManager(database, [], realtime as never, approvals as never, notifications);
+  const manager = new SessionManager(database, [], realtime as never, approvals as never, notifications, { resolveForChat: () => ({ id: 1, config_dir: null }), environment: () => ({}) } as never);
   return { dataDir, database, manager, chatId };
 }
 

@@ -37,24 +37,35 @@ describe("프로젝트 파일 경계", () => {
     expect(() => assertNonSensitiveRelativePath(".claude/settings.json")).toThrow();
     expect(() => assertNonSensitiveRelativePath("AGENTS.md")).toThrow();
     expect(() => assertNonSensitiveRelativePath(".env.local")).toThrow();
-    expect(() => assertNonSensitiveRelativePath(".env-production", { allowHidden: true })).toThrow();
-    expect(() => assertNonSensitiveRelativePath(".web-agent-manager-uploads/1/file.png", { allowHidden: true })).toThrow();
+    expect(() => assertNonSensitiveRelativePath(".env-production")).toThrow();
+    expect(() => assertNonSensitiveRelativePath(".web-agent-manager-uploads/1/file.png")).toThrow();
     expect(() => assertNonSensitiveRelativePath("src/index.ts")).not.toThrow();
   });
 
-  it("점 파일은 내부망에서만 허용하되 민감 경로는 내부망에서도 차단한다", () => {
+  it("내부망에서는 점 파일과 민감 경로를 모두 허용한다", () => {
     expect(() => assertNonSensitiveRelativePath(".vscode/settings.json")).toThrow();
     expect(() => assertNonSensitiveRelativePath(".vscode/settings.json", { allowHidden: true })).not.toThrow();
-    expect(() => assertNonSensitiveRelativePath(".env", { allowHidden: true })).toThrow();
-    expect(() => assertNonSensitiveRelativePath(".claude/settings.json", { allowHidden: true })).toThrow();
+    expect(() => assertNonSensitiveRelativePath(".env", { allowHidden: true })).not.toThrow();
+    expect(() => assertNonSensitiveRelativePath(".env.local", { allowHidden: true })).not.toThrow();
+    expect(() => assertNonSensitiveRelativePath(".claude/settings.json", { allowHidden: true })).not.toThrow();
+    expect(() => assertNonSensitiveRelativePath(".git/config", { allowHidden: true })).not.toThrow();
   });
 
-  it("일반 파일 API에서 symlink가 가리키는 실제 민감 경로도 차단한다", () => {
+  it("외부망에서는 symlink가 가리키는 실제 민감 경로도 차단한다", () => {
     const root = createRoot();
     fs.writeFileSync(path.join(root, ".env"), "TOKEN=secret", "utf8");
     fs.symlinkSync(path.join(root, ".env"), path.join(root, "public-name"));
 
     expect(() => resolveNonSensitiveProjectPath(root, "public-name")).toThrow("일반 파일 기능으로 접근할 수 없는 경로입니다.");
+  });
+
+  it("내부망이어도 symlink가 프로젝트 밖을 가리키면 차단한다", () => {
+    const root = createRoot();
+    const outside = createRoot();
+    fs.writeFileSync(path.join(outside, "secret.txt"), "값", "utf8");
+    fs.symlinkSync(path.join(outside, "secret.txt"), path.join(root, "outside-link"));
+
+    expect(() => resolveNonSensitiveProjectPath(root, "outside-link", true, { allowHidden: true })).toThrow("프로젝트 경로");
   });
 
   it("허용 루트가 \"/\"면 서로 다른 상위 디렉터리의 경로도 등록을 허용한다", () => {

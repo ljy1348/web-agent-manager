@@ -10,6 +10,7 @@ import type { SlackNotifier } from "../src/server/services/slack";
 import type { NtfyNotifier } from "../src/server/services/ntfy";
 import { createOperationsRouter } from "../src/server/routes/operations-routes";
 import { CodexAdapter } from "../src/server/providers/codex";
+import type { IdleChatReaper } from "../src/server/services/idle-chat-reaper";
 
 let closeServer: (() => Promise<void>) | undefined;
 
@@ -24,18 +25,25 @@ function stubDatabase(): AppDatabase {
 }
 
 // 지정 역할로 운영 API를 호출하는 테스트 앱을 만든다.
-function buildApp(role: "admin" | "user" = "admin") {
+function buildApp(
+  role: "admin" | "user" = "admin",
+  readVersion: (command: string, args: string[]) => Promise<string | null> = async (command) => `${command} 1.0.0`,
+  metricsSnapshot: unknown = { latest: null, recent: [] },
+  trustedNetwork = true,
+) {
   const app = express();
   app.use(express.json());
-  app.use((request: any, _response, next) => { request.authUser = { id: 1, username: role, role }; next(); });
+  app.use((request: any, _response, next) => { request.authUser = { id: 1, username: role, role }; request.trustedNetwork = trustedNetwork; next(); });
   app.use(createOperationsRouter(
     stubDatabase(),
     {} as ApprovalService,
     { list: () => [] } as unknown as UsageMonitor,
-    { snapshot: () => ({ latest: null, recent: [] }) } as unknown as SystemMetricsService,
+    { snapshot: () => metricsSnapshot } as unknown as SystemMetricsService,
     { status: () => ({}) } as unknown as SlackNotifier,
     { status: () => ({}) } as unknown as NtfyNotifier,
     [new CodexAdapter()],
+    { settings: () => ({ enabled: true, timeoutHours: 24 }) } as unknown as IdleChatReaper,
+    readVersion,
   ));
   // 실제 서버(index.ts)와 같은 오류 처리 규약: 던져진 Error 메시지를 400으로 변환한다.
   app.use((error: unknown, _request: express.Request, response: express.Response, _next: express.NextFunction) => {
@@ -59,6 +67,20 @@ describe("프로세스 종료 API 안전장치", () => {
     await expect(response.json()).resolves.toEqual({
       providers: [{ id: "codex", label: "Codex", usageWindowId: "weekly", supportsPermissionMode: false }],
     });
+  });
+
+  it("런타임 버전은 서버 시작 시 한 번만 조회하고 반복 요청에서 재사용한다", async () => {
+    const calls: Array<{ command: string; args: string[] }> = [];
+    const port = await listen(buildApp("admin", async (command, args) => {
+      calls.push({ command, args });
+      return `${command} 1.0.0`;
+    }));
+
+    const first = await fetch(`http://127.0.0.1:${port}/runtime`);
+    const second = await fetch(`http://127.0.0.1:${port}/runtime`);
+
+    expect([first.status, second.status]).toEqual([200, 200]);
+    expect(calls.map((call) => call.command).sort()).toEqual(["codex", "gh", "git", "tmux"]);
   });
 
   it("일반 사용자의 Slack·ntfy 테스트 전송을 거부한다", async () => {
@@ -86,6 +108,49 @@ describe("프로세스 종료 API 안전장치", () => {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ force: false }),
     });
     expect(response.status).toBe(400);
+  });
+
+  it("시스템 묶음으로 분류된 프로세스는 종료를 거부한다", async () => {
+    // 화면에서 버튼을 숨겨도 API를 직접 부르는 경로가 남아 서버에서도 막는다.
+    const snapshot = {
+      latest: { processes: [{ pid: 424242, name: "node", cpu: 0, memory: 0, chat: null, group: { kind: "system", key: "system", label: "web-agent-manager 시스템" } }] },
+      recent: [],
+    };
+    const port = await listen(buildApp("admin", undefined, snapshot));
+
+    const response = await fetch(`http://127.0.0.1:${port}/system/processes/424242/kill`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ force: false }),
+    });
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({ error: "web-agent-manager 시스템 프로세스는 대시보드에서 종료할 수 없습니다." });
+  });
+
+  it("채팅 묶음 프로세스는 시스템 보호에 걸리지 않는다", async () => {
+    const snapshot = {
+      latest: { processes: [{ pid: 999999999, name: "claude", cpu: 0, memory: 0, chat: null, group: { kind: "chat", key: "chat:1", label: "프로젝트 · 채팅" } }] },
+      recent: [],
+    };
+    const port = await listen(buildApp("admin", undefined, snapshot));
+
+    const response = await fetch(`http://127.0.0.1:${port}/system/processes/999999999/kill`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ force: false }),
+    });
+
+    // 보호에 막히지 않고 실제 종료 시도까지 가서 "이미 종료된 프로세스" 안내가 나와야 한다.
+    await expect(response.json()).resolves.toMatchObject({ error: "이미 종료된 프로세스입니다." });
+  });
+
+  it("외부 네트워크에서는 프로세스 종료를 거부한다", async () => {
+    // 되돌릴 수 없는 작업이라 내부망에서만 허용한다(파일 탭의 민감 경로 정책과 같은 기준).
+    const port = await listen(buildApp("admin", undefined, { latest: null, recent: [] }, false));
+
+    const response = await fetch(`http://127.0.0.1:${port}/system/processes/999999999/kill`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ force: false }),
+    });
+
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toMatchObject({ error: "되돌릴 수 없는 작업은 내부망에서만 할 수 있습니다." });
   });
 
   it("존재하지 않는 프로세스는 이미 종료된 것으로 안내한다", async () => {

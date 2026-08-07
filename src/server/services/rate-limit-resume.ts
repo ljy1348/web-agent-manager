@@ -117,10 +117,15 @@ export class RateLimitResumeService {
   }
 
   private async tick(): Promise<void> {
-    const waits = this.database.prepare("SELECT chat_id AS chatId, provider, resume_after AS resumeAfter FROM rate_limit_waits").all() as { chatId: number; provider: Provider; resumeAfter: string | null }[];
+    // 한도는 계정마다 따로 차오르므로, 대기 중인 채팅이 실제로 쓰는 계정의 사용량과 맞춰봐야 한다.
+    const waits = this.database.prepare(`
+      SELECT w.chat_id AS chatId, w.provider, w.resume_after AS resumeAfter,
+        COALESCE(c.account_id, (SELECT id FROM agent_accounts a WHERE a.provider = w.provider AND a.is_default = 1)) AS accountId
+      FROM rate_limit_waits w JOIN chats c ON c.id = w.chat_id
+    `).all() as { chatId: number; provider: Provider; resumeAfter: string | null; accountId: number | null }[];
     if (!waits.length) return;
-    const usageRows = this.database.prepare("SELECT provider, reset_at AS resetAt, remaining_percent AS remainingPercent FROM usage_status").all() as { provider: Provider; resetAt: string | null; remainingPercent: number | null }[];
-    const usageByProvider = new Map(usageRows.map((row) => [row.provider, row]));
+    const usageRows = this.database.prepare("SELECT provider, account_id AS accountId, reset_at AS resetAt, remaining_percent AS remainingPercent FROM usage_status").all() as { provider: Provider; accountId: number; resetAt: string | null; remainingPercent: number | null }[];
+    const usageByAccount = new Map(usageRows.map((row) => [`${row.provider}:${row.accountId}`, row]));
     const now = new Date();
     for (const wait of waits) {
       if (!wait.resumeAfter || new Date(wait.resumeAfter) > now) continue;
@@ -129,7 +134,7 @@ export class RateLimitResumeService {
       // "03:02"를 예고했는데 그 시각이 된 순간 다시 조회해도 remaining 0%였고, 이 검사 없이는
       // "한도 해제됐다"고 알린 뒤 곧바로 다시 한도에 걸리는 일이 반복됐다. usage_status의 최신
       // reset_at으로 대기 시각을 다시 맞춰 다음 폴링(60초 뒤)에 재시도한다.
-      const usage = usageByProvider.get(wait.provider);
+      const usage = usageByAccount.get(`${wait.provider}:${wait.accountId}`);
       if (usage && !isRateLimitRecovered(usage.resetAt, usage.remainingPercent, now)) {
         const nextResumeAfter = parseResetTime(usage.resetAt, now);
         if (nextResumeAfter && nextResumeAfter.toISOString() !== wait.resumeAfter) {
@@ -140,7 +145,7 @@ export class RateLimitResumeService {
       if (await this.resumeChat(wait.chatId)) void this.notifyReset(wait.provider, new Date(wait.resumeAfter));
     }
     for (const usage of usageRows) {
-      const affected = waits.filter((wait) => wait.provider === usage.provider && !(wait.resumeAfter && new Date(wait.resumeAfter) <= now));
+      const affected = waits.filter((wait) => wait.provider === usage.provider && wait.accountId === usage.accountId && !(wait.resumeAfter && new Date(wait.resumeAfter) <= now));
       if (!affected.length) continue;
       if (!isRateLimitRecovered(usage.resetAt, usage.remainingPercent, now)) continue;
       let resumed = false;

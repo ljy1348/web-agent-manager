@@ -11,4 +11,14 @@ describe("headless 터미널 화면", () => {
     expect(screen.visibleText()).toContain("교체 줄");
     screen.dispose();
   });
+
+  it("새 클라이언트용 화면 초기화와 실제 커서 위치를 함께 반환한다", async () => {
+    const screen = new TerminalScreen({ cols: 20, rows: 3, scrollback: 0 });
+    await new Promise<void>((resolve) => screen.write("현재 화면\u001b[2;4H", resolve));
+
+    const snapshot = screen.ansiSnapshot();
+    expect(snapshot).toContain("\u001b[2J\u001b[H현재 화면");
+    expect(snapshot).toMatch(/\u001b\[2;4H$/);
+    screen.dispose();
+  });
 });

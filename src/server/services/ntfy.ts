@@ -14,6 +14,7 @@ function presentationFor(eventType: string): { title: string; tags: string[]; pr
   if (eventType === "approval_requested") return { title: "권한 요청", tags: ["warning"], priority: 4 };
   if (eventType === "rate_limit_hit") return { title: "사용량 한도 도달", tags: ["hourglass"], priority: 4 };
   if (eventType === "rate_limit_reset") return { title: "사용량 한도 초기화", tags: ["large_green_circle"], priority: 3 };
+  if (eventType === "usage_session_reset") return { title: "사용량 세션 초기화", tags: ["large_green_circle"], priority: 3 };
   if (eventType === "terminal_exited") return { title: "터미널 종료", tags: ["octagonal_sign"], priority: 4 };
   if (eventType === "test") return { title: "알림 테스트", tags: ["bell"], priority: 3 };
   return { title: "웹 에이전트 관리자", tags: [], priority: 3 };

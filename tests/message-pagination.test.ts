@@ -1,3 +1,4 @@
+import type { AgentAccountService } from "../src/server/services/agent-accounts";
 import { once } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
@@ -48,7 +49,7 @@ describe("메시지 커서 페이지네이션 API", () => {
     const historyFile = writeFixture();
     const app = express();
     app.use((request: any, _response, next) => { request.authUser = { id: 1, username: "tester", role: "admin" }; next(); });
-    app.use(createProjectRouter(stubDatabase(historyFile), {} as AppConfig, {} as SessionManager, [new ClaudeAdapter("", {})], new HistoryCache()));
+    app.use(createProjectRouter(stubDatabase(historyFile), {} as AppConfig, {} as SessionManager, [new ClaudeAdapter("", {})], {} as AgentAccountService, new HistoryCache()));
     const server = app.listen(0, "127.0.0.1");
     await once(server, "listening");
     closeServer = () => new Promise((resolve, reject) => {

@@ -58,11 +58,33 @@ export function isTrustedNetworkAddress(address: string | undefined, cidrs: stri
   return checkBlockList(address, createBlockList(cidrs));
 }
 
+// reverse proxy가 원 클라이언트를 알리려고 붙이는 헤더들. 하나라도 있으면 프록시를 거친 요청으로 본다.
+const FORWARDED_HEADERS = ["x-forwarded-for", "forwarded", "x-real-ip", "cf-connecting-ip", "true-client-ip"];
+
+// 신뢰 프록시를 지정하지 않은 상태에서 프록시를 거쳐 들어왔는지 판정한다.
+// 이때 request.ip는 방문자가 아니라 프록시 주소라 내부망 대역과 무조건 일치해버리므로,
+// 실제 출처를 알 수 없다고 보고 내부망 판정을 포기해야 외부 접속이 내부망으로 새지 않는다.
+function isUnverifiedProxyRequest(request: AuthenticatedRequest, trustProxyConfigured: boolean): boolean {
+  if (trustProxyConfigured) return false;
+  return FORWARDED_HEADERS.some((header) => Boolean(request.headers[header]));
+}
+
+// 되돌릴 수 없는 작업(삭제·강제 종료 등)을 내부망 요청으로만 제한한다.
+// 파일 탭의 민감 경로 정책과 같은 기준을 쓰되, 여기서는 조회가 아니라 파괴적 동작 자체를 막는다.
+export function requireTrustedNetwork(request: AuthenticatedRequest, response: Response, next: NextFunction): void {
+  if (request.trustedNetwork !== true) {
+    response.status(403).json({ error: "되돌릴 수 없는 작업은 내부망에서만 할 수 있습니다." });
+    return;
+  }
+  next();
+}
+
 // 현재 요청 IP의 내부망 capability를 다음 인증·파일 라우터가 사용하도록 주입한다.
-export function createNetworkCapability(trustedNetworks: string[]) {
+export function createNetworkCapability(trustedNetworks: string[], trustProxyConfigured = false) {
   const blockList = createBlockList(trustedNetworks);
   return (request: AuthenticatedRequest, _response: Response, next: NextFunction): void => {
-    request.trustedNetwork = checkBlockList(request.ip || request.socket.remoteAddress, blockList);
+    request.trustedNetwork = !isUnverifiedProxyRequest(request, trustProxyConfigured)
+      && checkBlockList(request.ip || request.socket.remoteAddress, blockList);
     next();
   };
 }

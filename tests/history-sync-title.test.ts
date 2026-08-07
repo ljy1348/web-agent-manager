@@ -4,8 +4,10 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { openDatabase } from "../src/server/core/database";
 import type { AppConfig } from "../src/server/core/config";
+import { AgentAccountService } from "../src/server/services/agent-accounts";
 import { HistorySynchronizer } from "../src/server/services/history-sync";
 import { HistoryCache } from "../src/server/services/history-cache";
+import { ApprovalService } from "../src/server/services/approval";
 import { ClaudeAdapter } from "../src/server/providers/claude";
 import type { RealtimeHub } from "../src/server/services/realtime";
 import type { Notifier } from "../src/server/services/notifier";
@@ -32,6 +34,7 @@ function writeSessionFixture(sessionId: string, aiTitle: string | null): string 
   return file;
 }
 
+// 임시 기록 루트와 실제 승인 서비스를 연결한 기록 동기화 테스트 구성을 만든다.
 function buildSynchronizer(config: AppConfig) {
   const database = openDatabase(config);
   const realtime = { broadcast: () => undefined } as unknown as RealtimeHub;
@@ -40,8 +43,10 @@ function buildSynchronizer(config: AppConfig) {
   // historyRoot는 보통 ~/.claude/projects 고정이라, 테스트에서는 실제 홈 디렉터리를 건드리지 않도록
   // 임시 프로젝트 디렉터리로 바꿔치기한다(런타임엔 TS readonly가 강제되지 않아 그대로 대입 가능).
   (adapter as { historyRoot: string }).historyRoot = projectDir;
-  const sync = new HistorySynchronizer(config, database, [adapter], realtime, notifications, new HistoryCache());
-  return { database, sync };
+  const approvals = new ApprovalService(config, database, realtime, notifications);
+  const accounts = new AgentAccountService(config, database);
+  const sync = new HistorySynchronizer(config, database, [adapter], realtime, notifications, new HistoryCache(), approvals, accounts);
+  return { database, sync, approvals };
 }
 
 afterEach(() => {
@@ -132,6 +137,37 @@ describe("history-sync 제목 자동 업그레이드와 수동 잠금", () => {
     sync.syncAll(false);
     const chat = database.prepare("SELECT status, busy FROM chats WHERE provider_session_id = ?").get(sessionId) as any;
     expect(chat).toEqual({ status: "stopped", busy: 0 });
+    fs.rmSync(projectDir, { recursive: true, force: true });
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  it("Claude 최종 응답이 기록되면 남은 PermissionRequest 훅을 자동 정리한다", async () => {
+    cwdDir = fs.mkdtempSync(path.join(os.tmpdir(), "web-agent-manager-approval-cwd-"));
+    projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "web-agent-manager-approval-proj-"));
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "web-agent-manager-approval-data-"));
+    const config = { dataDir, allowedRoots: [cwdDir] } as unknown as AppConfig;
+    const sessionId = "completed-approval";
+    const file = writeSessionFixture(sessionId, null);
+    const { database, sync, approvals } = buildSynchronizer(config);
+    sync.syncAll(false);
+    const hookResult = approvals.handleClaudeHook({ session_id: sessionId, tool_name: "AskUserQuestion", tool_input: { question: "선택" } });
+
+    fs.appendFileSync(file, `\n${JSON.stringify({
+      type: "assistant",
+      sessionId,
+      cwd: cwdDir,
+      message: { content: [{ type: "text", text: "완료" }], stop_reason: "end_turn" },
+      timestamp: "2026-07-06T00:00:04.000Z",
+    })}`);
+    sync.syncAll(false);
+
+    await expect(hookResult).resolves.toEqual({
+      hookSpecificOutput: {
+        hookEventName: "PermissionRequest",
+        decision: { behavior: "deny", message: "Claude 응답이 완료되어 자동으로 정리되었습니다.", interrupt: false },
+      },
+    });
+    expect(database.prepare("SELECT status FROM approvals").get()).toEqual({ status: "declined" });
     fs.rmSync(projectDir, { recursive: true, force: true });
     fs.rmSync(dataDir, { recursive: true, force: true });
   });
