@@ -8,6 +8,7 @@ import { safeBasename } from "../core/security";
 import { processMultipartFiles, streamToFile } from "../core/uploads";
 import { writeAudit } from "../core/audit";
 import { requireAdmin, type AuthenticatedRequest } from "../core/auth";
+import { requireTrustedNetwork } from "../core/network";
 import { resolveProjectPath } from "./helpers";
 import type { Provider } from "../../shared/types";
 import type { SessionManager } from "../services/session-manager";
@@ -16,6 +17,8 @@ import type { HistoryCache } from "../services/history-cache";
 import type { SessionBackupService } from "../services/session-backups";
 import { installProjectAgentSkills } from "../services/agent-skill-installer";
 import { GithubProjectService } from "../services/github-projects";
+import type { GitWorkspaceService } from "../services/git-workspaces";
+import type { AgentAccountService } from "../services/agent-accounts";
 
 // 채팅 첨부 파일을 저장할 프로젝트 내 전용 디렉터리 이름.
 const ATTACHMENTS_DIRNAME = ".web-agent-manager-uploads";
@@ -38,7 +41,7 @@ function visibleChats(chats: Array<Record<string, unknown>>, adapterById: Map<Pr
 }
 
 // 프로젝트·채팅·메시지 생명주기 API를 구성한다.
-export function createProjectRouter(database: AppDatabase, config: AppConfig, sessions: SessionManager, adapters: ProviderAdapter[], historyCache: HistoryCache, backups?: SessionBackupService): Router {
+export function createProjectRouter(database: AppDatabase, config: AppConfig, sessions: SessionManager, adapters: ProviderAdapter[], accounts: AgentAccountService, historyCache: HistoryCache, backups?: SessionBackupService, gitWorkspaces?: GitWorkspaceService): Router {
   const router = Router();
   const adapterById = new Map(adapters.map((adapter) => [adapter.id, adapter]));
   const githubProjects = new GithubProjectService(database, config);
@@ -103,7 +106,7 @@ export function createProjectRouter(database: AppDatabase, config: AppConfig, se
     }
   });
   // 프로젝트를 실제로 지우지 않고 active=0으로만 표시해 목록에서 숨긴다(채팅 기록·백업은 그대로 보존).
-  router.delete("/projects/:id", requireAdmin, (request: AuthenticatedRequest, response, next) => {
+  router.delete("/projects/:id", requireAdmin, requireTrustedNetwork, (request: AuthenticatedRequest, response, next) => {
     try {
       const projectId = Number(request.params.id);
       const project = database.prepare("SELECT * FROM projects WHERE id = ? AND active = 1").get(projectId) as { id: number; path: string } | undefined;
@@ -170,7 +173,7 @@ export function createProjectRouter(database: AppDatabase, config: AppConfig, se
       next(error);
     }
   });
-  router.delete("/session-backups/:id", requireAdmin, (request: AuthenticatedRequest, response, next) => {
+  router.delete("/session-backups/:id", requireAdmin, requireTrustedNetwork, (request: AuthenticatedRequest, response, next) => {
     try {
       if (!backups) throw new Error("세션 백업 서비스가 준비되지 않았습니다.");
       backups.deleteBackup(String(request.params.id), request.authUser!.id);
@@ -179,7 +182,7 @@ export function createProjectRouter(database: AppDatabase, config: AppConfig, se
       next(error);
     }
   });
-  router.post("/chats", requireAdmin, (request: AuthenticatedRequest, response, next) => {
+  router.post("/chats", requireAdmin, async (request: AuthenticatedRequest, response, next) => {
     try {
       const projectId = Number(request.body?.projectId);
       const provider = request.body?.provider as Provider;
@@ -187,16 +190,59 @@ export function createProjectRouter(database: AppDatabase, config: AppConfig, se
       if (!Number.isInteger(projectId) || !adapter) throw new Error("프로젝트와 공급자가 필요합니다.");
       const project = database.prepare("SELECT id FROM projects WHERE id = ? AND active = 1").get(projectId);
       if (!project) throw new Error("프로젝트를 찾을 수 없습니다.");
+      // 계정을 고르지 않았으면 그 공급자의 기본 계정(기존 ~/.claude·~/.codex 인증)으로 만든다.
+      const account = accounts.requireForProvider(provider, request.body?.accountId != null ? Number(request.body.accountId) : null);
+      const gitBranch = gitWorkspaces ? await gitWorkspaces.projectBranch(projectId).catch(() => null) : null;
       const placeholder = `pending_${crypto.randomUUID().replaceAll("-", "")}`;
       const result = database.prepare(`
-        INSERT INTO chats(project_id, provider, tmux_name, status, title) VALUES (?, ?, ?, 'starting', ?)
-      `).run(projectId, provider, placeholder, `새 ${adapter.displayLabel} 채팅`);
+        INSERT INTO chats(project_id, provider, account_id, tmux_name, status, title, git_branch) VALUES (?, ?, ?, ?, 'starting', ?, ?)
+      `).run(projectId, provider, account.id, placeholder, `새 ${adapter.displayLabel} 채팅`, gitBranch);
       const chatId = Number(result.lastInsertRowid);
       const tmuxName = `web_agent_manager_chat_${chatId}`;
       database.prepare("UPDATE chats SET tmux_name = ? WHERE id = ?").run(tmuxName, chatId);
       sessions.start(chatId, false);
       logChatServer("chats:create", { userId: request.authUser!.id, projectId, provider, chatId });
       writeAudit(database, request.authUser!.id, "chat.create", "chat", chatId, { provider, projectId });
+      response.status(201).json({ chat: database.prepare("SELECT * FROM chats WHERE id = ?").get(chatId) });
+    } catch (error) {
+      next(error);
+    }
+  });
+  // 이슈·브랜치로 작업을 시작할 때, 전용 worktree를 만들고 거기에 붙는 새 채팅을 함께 만든다.
+  // 세션을 먼저 띄우면 실행 중 상태라 작업공간 전환이 막히므로, 채팅 행을 stopped로 만들어 worktree를
+  // 붙인 다음 마지막에 세션을 시작한다.
+  router.post("/chats/worktree", requireAdmin, async (request: AuthenticatedRequest, response, next) => {
+    try {
+      if (!gitWorkspaces) throw new Error("Git 작업공간 관리가 준비되지 않았습니다.");
+      const projectId = Number(request.body?.projectId);
+      const provider = request.body?.provider as Provider;
+      const adapter = adapterById.get(provider);
+      const branch = String(request.body?.branch ?? "").trim();
+      const create = request.body?.create !== false;
+      if (!Number.isInteger(projectId) || !adapter) throw new Error("프로젝트와 공급자가 필요합니다.");
+      if (!branch) throw new Error("브랜치 이름이 필요합니다.");
+      const project = database.prepare("SELECT id FROM projects WHERE id = ? AND active = 1").get(projectId);
+      if (!project) throw new Error("프로젝트를 찾을 수 없습니다.");
+      const title = typeof request.body?.title === "string" && request.body.title.trim()
+        ? request.body.title.trim().slice(0, 120)
+        : `${branch} 작업`;
+      const account = accounts.requireForProvider(provider, request.body?.accountId != null ? Number(request.body.accountId) : null);
+      const placeholder = `pending_${crypto.randomUUID().replaceAll("-", "")}`;
+      const result = database.prepare(`
+        INSERT INTO chats(project_id, provider, account_id, tmux_name, status, title) VALUES (?, ?, ?, ?, 'stopped', ?)
+      `).run(projectId, provider, account.id, placeholder, title);
+      const chatId = Number(result.lastInsertRowid);
+      database.prepare("UPDATE chats SET tmux_name = ? WHERE id = ?").run(`web_agent_manager_chat_${chatId}`, chatId);
+      try {
+        await gitWorkspaces.switchBranch(projectId, { chatId, branch, create, mode: "worktree" });
+      } catch (error) {
+        // worktree를 못 만들면 빈 채팅만 남으므로 되돌린다.
+        database.prepare("DELETE FROM chats WHERE id = ?").run(chatId);
+        throw error;
+      }
+      sessions.start(chatId, false);
+      logChatServer("chats:create_worktree", { userId: request.authUser!.id, projectId, provider, chatId, branch });
+      writeAudit(database, request.authUser!.id, "chat.create_worktree", "chat", chatId, { provider, projectId, branch, create });
       response.status(201).json({ chat: database.prepare("SELECT * FROM chats WHERE id = ?").get(chatId) });
     } catch (error) {
       next(error);
@@ -263,11 +309,13 @@ export function createProjectRouter(database: AppDatabase, config: AppConfig, se
   router.post("/chats/:id/attachments", requireAdmin, (request: AuthenticatedRequest, response, next) => {
     const chatId = Number(request.params.id);
     let projectPath: string;
+    let chatProjectId: number;
     try {
       const chat = database.prepare(`
-        SELECT p.path AS project_path FROM chats c JOIN projects p ON p.id = c.project_id WHERE c.id = ?
-      `).get(chatId) as { project_path: string } | undefined;
+        SELECT c.project_id, p.path AS project_path FROM chats c JOIN projects p ON p.id = c.project_id WHERE c.id = ?
+      `).get(chatId) as { project_id: number; project_path: string } | undefined;
       if (!chat) throw new Error("채팅을 찾을 수 없습니다.");
+      chatProjectId = chat.project_id;
       projectPath = fs.realpathSync(chat.project_path);
     } catch (error) {
       next(error);
@@ -291,7 +339,14 @@ export function createProjectRouter(database: AppDatabase, config: AppConfig, se
           maxBytes: 25 * 1024 * 1024,
           accountBytes,
         });
-        uploads.push({ name: original, path: path.relative(projectPath, path.join(actualUploadDir, filename)), size });
+        const relativePath = path.relative(projectPath, path.join(actualUploadDir, filename));
+        const workspacePath = gitWorkspaces?.workspacePath(chatProjectId, chatId);
+        if (workspacePath && workspacePath !== projectPath) {
+          const workspaceUploadDir = resolveProjectPath(workspacePath, uploadRelativeDir, false);
+          fs.mkdirSync(workspaceUploadDir, { recursive: true, mode: 0o700 });
+          fs.copyFileSync(path.join(actualUploadDir, filename), resolveProjectPath(workspacePath, relativePath, false));
+        }
+        uploads.push({ name: original, path: relativePath, size });
       }).then(() => {
         writeAudit(database, request.authUser!.id, "chat.attachment", "chat", chatId, { uploads });
         response.status(201).json({ uploads });
@@ -348,7 +403,7 @@ export function createProjectRouter(database: AppDatabase, config: AppConfig, se
       next(error);
     }
   });
-  router.delete("/chats/:id", requireAdmin, async (request: AuthenticatedRequest, response, next) => {
+  router.delete("/chats/:id", requireAdmin, requireTrustedNetwork, async (request: AuthenticatedRequest, response, next) => {
     try {
       if (!backups) throw new Error("세션 백업 서비스가 준비되지 않았습니다.");
       const chatId = Number(request.params.id);
@@ -356,8 +411,9 @@ export function createProjectRouter(database: AppDatabase, config: AppConfig, se
       if (!chat) throw new Error("채팅을 찾을 수 없습니다.");
       if (chat.status !== "stopped") await sessions.stop(chatId, request.authUser!);
       const backup = request.query.backup === "0" ? null : backups.backupChat(chatId, request.authUser!.id);
+      const workspace = await gitWorkspaces?.removeChatWorktree(chatId);
       backups.deleteChat(chatId, request.authUser!.id);
-      response.json({ deleted: true, backup });
+      response.json({ deleted: true, backup, workspace: workspace ?? null });
     } catch (error) {
       next(error);
     }

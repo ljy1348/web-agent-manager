@@ -85,8 +85,13 @@ export interface ProviderAdapter {
   id: Provider;
   displayLabel: string;
   usageWindowId: string;
+  // 초기화 알림을 보낼 사용량 창 목록. 생략하면 대표 usageWindowId 하나만 추적한다.
+  usageResetWindowIds?: string[];
   cliVersionCommand: ProviderLaunch;
+  // 기본 계정(CLI 기본 설정 디렉터리)의 기록 루트. historyRootFor(null)과 같은 값이다.
   historyRoot: string;
+  // 계정 슬롯의 설정 디렉터리를 받아 그 계정의 기록 루트를 계산한다. null이면 CLI 기본 경로를 쓴다.
+  historyRootFor(configDir: string | null): string;
   promptQuirks?: {
     slashCommandConfirmDelayMs?: number;
     usageCommandDelayMs?: number;
@@ -95,6 +100,8 @@ export interface ProviderAdapter {
     modelOptionsReadsEffortScreen?: boolean;
   };
   createLaunch(cwd: string, resumeSessionId?: string): ProviderLaunch;
+  // 사용량·모델 조회 전용 CLI에 더 가벼운 실행 모드가 있으면 일반 채팅 실행과 분리해 제공한다.
+  createMonitorLaunch?(cwd: string): ProviderLaunch;
   parseHistoryFile(file: string): HistorySession | null;
   // append-only JSONL의 새 레코드만 기존 파싱 결과에 합친다. 불완전하면 undefined로 전체 재파싱을 요청한다.
   appendHistoryLines?(file: string, previous: HistorySession, lines: string[]): HistorySession | undefined;

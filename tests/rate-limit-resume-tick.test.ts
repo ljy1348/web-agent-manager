@@ -58,8 +58,8 @@ describe("RateLimitResumeService.tick", () => {
     const hh = String(futureLocal.getHours()).padStart(2, "0");
     const mm = String(futureLocal.getMinutes()).padStart(2, "0");
     database.prepare(`
-      INSERT INTO usage_status(provider, monitor_status, data_status, used_percent, remaining_percent, reset_at)
-      VALUES ('codex', 'ready', 'fresh', 100, 0, ?)
+      INSERT INTO usage_status(provider, account_id, monitor_status, data_status, used_percent, remaining_percent, reset_at)
+      VALUES ('codex', (SELECT id FROM agent_accounts WHERE provider = 'codex' AND is_default = 1), 'ready', 'fresh', 100, 0, ?)
     `).run(`${hh}:${mm}`);
 
     await (service as unknown as { tick: () => Promise<void> }).tick();
@@ -87,8 +87,8 @@ describe("RateLimitResumeService.tick", () => {
     const staleResumeAfter = new Date(now.getTime() - 60_000).toISOString();
     database.prepare("INSERT INTO rate_limit_waits(chat_id, provider, resume_after) VALUES (?, 'codex', ?)").run(chat.id, staleResumeAfter);
     database.prepare(`
-      INSERT INTO usage_status(provider, monitor_status, data_status, used_percent, remaining_percent, reset_at)
-      VALUES ('codex', 'ready', 'fresh', 20, 80, '23:59')
+      INSERT INTO usage_status(provider, account_id, monitor_status, data_status, used_percent, remaining_percent, reset_at)
+      VALUES ('codex', (SELECT id FROM agent_accounts WHERE provider = 'codex' AND is_default = 1), 'ready', 'fresh', 20, 80, '23:59')
     `).run();
 
     await (service as unknown as { tick: () => Promise<void> }).tick();
@@ -110,7 +110,7 @@ describe("RateLimitResumeService.tick", () => {
     database.prepare("INSERT INTO chats(project_id, provider, tmux_name, status, title, busy) VALUES (?, 'codex', 'tmux-stopped', 'stopped', 'ui', 0)").run(project.id);
     const chat = database.prepare("SELECT id FROM chats").get() as { id: number };
     database.prepare("INSERT INTO rate_limit_waits(chat_id, provider, resume_after) VALUES (?, 'codex', ?)").run(chat.id, new Date(Date.now() - 60_000).toISOString());
-    database.prepare("INSERT INTO usage_status(provider, monitor_status, data_status, used_percent, remaining_percent, reset_at) VALUES ('codex', 'ready', 'fresh', 20, 80, '23:59')").run();
+    database.prepare("INSERT INTO usage_status(provider, account_id, monitor_status, data_status, used_percent, remaining_percent, reset_at) VALUES ('codex', (SELECT id FROM agent_accounts WHERE provider = 'codex' AND is_default = 1), 'ready', 'fresh', 20, 80, '23:59')").run();
 
     await (service as unknown as { tick: () => Promise<void> }).tick();
 
@@ -131,7 +131,7 @@ describe("RateLimitResumeService.tick", () => {
     database.prepare("INSERT INTO chats(project_id, provider, tmux_name, status, title, busy) VALUES (?, 'codex', 'tmux-missing', 'running', 'ui', 0)").run(project.id);
     const chat = database.prepare("SELECT id FROM chats").get() as { id: number };
     database.prepare("INSERT INTO rate_limit_waits(chat_id, provider, resume_after) VALUES (?, 'codex', ?)").run(chat.id, new Date(Date.now() - 60_000).toISOString());
-    database.prepare("INSERT INTO usage_status(provider, monitor_status, data_status, used_percent, remaining_percent, reset_at) VALUES ('codex', 'ready', 'fresh', 20, 80, '23:59')").run();
+    database.prepare("INSERT INTO usage_status(provider, account_id, monitor_status, data_status, used_percent, remaining_percent, reset_at) VALUES ('codex', (SELECT id FROM agent_accounts WHERE provider = 'codex' AND is_default = 1), 'ready', 'fresh', 20, 80, '23:59')").run();
 
     await (service as unknown as { tick: () => Promise<void> }).tick();
 

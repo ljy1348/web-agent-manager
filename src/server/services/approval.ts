@@ -121,26 +121,46 @@ export class ApprovalService {
   }
 
   // "닫기": 웹 목록에서만 정리한다. 실제로 AI가 지금 이 요청에 대한 응답을 기다리고 있는 게 확인되면
-  // (Claude 훅이 아직 대기 중이거나, 터미널 화면에 그 프롬프트가 여전히 떠 있으면) 절대 조용히 넘어가지
+  // (작업 중인 Claude 훅이 대기 중이거나, 터미널 화면에 그 프롬프트가 여전히 떠 있으면) 절대 조용히 넘어가지
   // 않고 에러를 던진다 — 살아있는 요청을 실수로 끊어버리는 대신, 사용자가 실제로 답변하거나 거부하도록
   // 강제한다. 이미 다른 경로로 끝났거나 화면이 지나간 게 확인된 경우에만 AI 쪽은 전혀 건드리지 않고
   // DB 상태만 정리한다.
   dismiss(id: string, user: AuthUser): void {
-    const approval = this.database.prepare("SELECT chat_id, provider, request_type, status FROM approvals WHERE id = ?").get(id) as {
+    const approval = this.database.prepare(`
+      SELECT a.chat_id, a.provider, a.request_type, a.status, c.busy,
+        CASE WHEN julianday(c.updated_at) > julianday(a.created_at) THEN 1 ELSE 0 END AS chat_progressed
+      FROM approvals a JOIN chats c ON c.id = a.chat_id
+      WHERE a.id = ?
+    `).get(id) as {
       chat_id: number;
       provider: "codex" | "claude";
       request_type: string;
       status: string;
+      busy: number;
+      chat_progressed: number;
     } | undefined;
     if (!approval || approval.status !== "pending") throw new Error("처리 가능한 승인 요청이 아닙니다.");
-      // Claude PermissionRequest 훅은 공급자 고유 HTTP 훅 경로라 어댑터 TUI 추상화 대상이 아니다.
-      const isHookLive = approval.provider === "claude" && approval.request_type === "permission" && this.waiting.has(id);
+    // Claude PermissionRequest 훅은 공급자 고유 HTTP 훅 경로라 어댑터 TUI 추상화 대상이 아니다.
+    // 요청 이후 기록이 갱신되고 busy까지 내려간 경우만 연결 유실 잔여 상태로 본다. 훅 생성 직후 기록
+    // 동기화 전의 짧은 busy=0 구간에서는 새 요청을 실수로 닫지 않는다.
+    const isHookLive = approval.provider === "claude" && approval.request_type === "permission"
+      && this.waiting.has(id) && (approval.busy === 1 || approval.chat_progressed === 0);
     const isTerminalLive = approval.request_type !== "permission" && (this.terminalLiveCheckHandler?.(approval.chat_id, approval.request_type) ?? false);
     if (isHookLive || isTerminalLive) throw new Error("AI가 지금 이 요청에 대한 응답을 실제로 기다리고 있어 그냥 닫을 수 없습니다. 답변하거나 거부해주세요.");
     this.database.prepare(`
       UPDATE approvals SET status = 'dismissed', decision = 'dismiss', decided_by = ?, resolved_at = CURRENT_TIMESTAMP WHERE id = ?
     `).run(user.id, id);
+    this.releaseHookWaiters(id, "이미 완료되어 닫힌 요청입니다.");
     this.realtime.broadcast("approval_resolved", { id, decision: "dismiss", chatId: approval.chat_id });
+  }
+
+  // Claude 턴 종료가 확인된 채팅의 남은 PermissionRequest 훅만 공급자 입력 없이 정리한다.
+  closeCompletedClaudeApprovals(chatId: number, message: string): void {
+    const rows = this.database.prepare(`
+      SELECT id FROM approvals
+      WHERE chat_id = ? AND provider = 'claude' AND request_type = 'permission' AND status = 'pending'
+    `).all(chatId) as { id: string }[];
+    for (const row of rows) this.finalizeApproval(row.id, "decline", null, message, false);
   }
 
   // 터미널·프로세스가 사라진 채팅에 남은 pending 승인을 전부 정리한다. 그대로 두면 대상이 없어진 요청이
@@ -148,6 +168,14 @@ export class ApprovalService {
   closeChatApprovals(chatId: number, message: string): void {
     const rows = this.database.prepare("SELECT id FROM approvals WHERE chat_id = ? AND status = 'pending'").all(chatId) as { id: string }[];
     for (const row of rows) this.finalizeApproval(row.id, "decline", null, message, false);
+  }
+
+  // 끊어진 Claude 훅 HTTP Promise를 거부 응답으로 끝내 메모리 대기자를 남기지 않는다.
+  private releaseHookWaiters(id: string, message: string): void {
+    const waiters = this.waiting.get(id);
+    if (!waiters) return;
+    for (const waiter of waiters) waiter("decline", message);
+    this.waiting.delete(id);
   }
 
   // 승인 요청을 실제로 종료 처리하는 단일 경로. decide()·9분 타임아웃·프로세스 종료 정리가 모두 여기를

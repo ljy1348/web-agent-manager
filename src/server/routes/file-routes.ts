@@ -6,7 +6,8 @@ import type { AppDatabase } from "../core/database";
 import { requireAdmin, type AuthenticatedRequest } from "../core/auth";
 import { safeBasename } from "../core/security";
 import { writeAudit } from "../core/audit";
-import { assertNonSensitiveRelativePath, getProjectPath, resolveNonSensitiveProjectPath, resolveProjectPath } from "./helpers";
+import { assertNonSensitiveRelativePath, chatWorkspacePath, resolveNonSensitiveProjectPath, resolveProjectPath, writeFileAtomic } from "./helpers";
+import type { GitWorkspaceService } from "../services/git-workspaces";
 import { processMultipartFiles, streamToFile } from "../core/uploads";
 
 // 재귀 압축의 민감 경로 필터링을 보강할 때까지 ZIP 다운로드를 차단한다.
@@ -142,12 +143,15 @@ function parseAttachmentPath(relativePath: string): { chatId: number; normalized
 }
 
 // 프로젝트 파일 탐색·업로드·다운로드·ZIP API를 구성한다.
-export function createFileRouter(database: AppDatabase): Router {
+export function createFileRouter(database: AppDatabase, workspaces?: GitWorkspaceService): Router {
+  // 선택한 채팅이 전용 worktree를 쓰면 파일 탭도 그 폴더를 봐야 한다(요청의 chatId 기준).
+  const rootFor = (request: AuthenticatedRequest, projectId: number): string =>
+    chatWorkspacePath(database, workspaces, projectId, Number(request.query.chatId) || null);
   const router = Router();
   // 권한 정책: 파일 목록 조회는 로그인 사용자에게 허용하고, 파일 반출·업로드·압축은 관리자만 허용한다.
   router.get("/projects/:id/files", (request: AuthenticatedRequest, response, next) => {
     try {
-      const root = getProjectPath(database, Number(request.params.id));
+      const root = rootFor(request, Number(request.params.id));
       const relativePath = typeof request.query.path === "string" ? request.query.path : "";
       response.json({ path: relativePath, entries: listDirectory(root, relativePath, fileAccess(request)), hiddenFilesVisible: request.trustedNetwork === true });
     } catch (error) {
@@ -158,7 +162,7 @@ export function createFileRouter(database: AppDatabase): Router {
     const projectId = Number(request.params.id);
     let root: string;
     try {
-      root = getProjectPath(database, projectId);
+      root = rootFor(request, projectId);
     } catch (error) {
       next(error);
       return;
@@ -196,7 +200,7 @@ export function createFileRouter(database: AppDatabase): Router {
     try {
       const projectId = Number(request.params.id);
       const relativePath = String(request.query.path ?? "");
-      const target = resolveNonSensitiveProjectPath(getProjectPath(database, projectId), relativePath, true, fileAccess(request));
+      const target = resolveNonSensitiveProjectPath(rootFor(request, projectId), relativePath, true, fileAccess(request));
       if (!fs.statSync(target).isFile()) throw new Error("다운로드 대상이 파일이 아닙니다.");
       writeAudit(database, request.authUser!.id, "file.download", "project", projectId, { path: relativePath, size: fs.statSync(target).size });
       // res.download()은 항상 Content-Disposition: attachment를 보내 브라우저가 무조건 저장 창을
@@ -223,7 +227,7 @@ export function createFileRouter(database: AppDatabase): Router {
       const { chatId, normalized } = parseAttachmentPath(String(request.query.path ?? ""));
       const chat = database.prepare("SELECT id FROM chats WHERE id = ? AND project_id = ?").get(chatId, projectId);
       if (!chat) throw new Error("이 프로젝트의 첨부파일이 아닙니다.");
-      const target = resolveProjectPath(getProjectPath(database, projectId), normalized);
+      const target = resolveProjectPath(chatWorkspacePath(database, workspaces, projectId, chatId), normalized);
       if (!fs.statSync(target).isFile()) throw new Error("첨부 대상이 파일이 아닙니다.");
       response.setHeader("X-Content-Type-Options", "nosniff");
       response.setHeader("Cache-Control", "private, no-store");
@@ -242,7 +246,7 @@ export function createFileRouter(database: AppDatabase): Router {
     try {
       const projectId = Number(request.params.id);
       const relativePath = wildcardPath(request.params.filePath);
-      const target = resolveNonSensitiveProjectPath(getProjectPath(database, projectId), relativePath, true, fileAccess(request));
+      const target = resolveNonSensitiveProjectPath(rootFor(request, projectId), relativePath, true, fileAccess(request));
       if (!fs.statSync(target).isFile()) throw new Error("미리보기 대상이 파일이 아닙니다.");
       const kind = previewKind(target);
       if (!kind || kind === "archive") throw new Error("미리보기 콘텐츠를 제공하지 않는 파일 형식입니다.");
@@ -269,7 +273,7 @@ export function createFileRouter(database: AppDatabase): Router {
     try {
       const projectId = Number(request.params.id);
       const relativePath = String(request.query.path ?? "");
-      const target = resolveNonSensitiveProjectPath(getProjectPath(database, projectId), relativePath, true, fileAccess(request));
+      const target = resolveNonSensitiveProjectPath(rootFor(request, projectId), relativePath, true, fileAccess(request));
       const stat = fs.statSync(target);
       if (!stat.isFile()) throw new Error("미리보기 대상이 파일이 아닙니다.");
       const kind = previewKind(target);
@@ -293,6 +297,29 @@ export function createFileRouter(database: AppDatabase): Router {
       next(error);
     }
   });
+  // 텍스트로 미리볼 수 있는 파일만 편집을 허용한다. 미리보기가 잘린 파일은 편집 화면에 전체 내용이
+  // 없어 그대로 저장하면 뒷부분이 사라지므로 클라이언트뿐 아니라 여기서도 막는다.
+  router.put("/projects/:id/files/content", requireAdmin, (request: AuthenticatedRequest, response, next) => {
+    try {
+      const projectId = Number(request.params.id);
+      const relativePath = String(request.body?.path ?? "");
+      if (typeof request.body?.content !== "string") throw new Error("저장할 내용이 필요합니다.");
+      const content = request.body.content as string;
+      const size = Buffer.byteLength(content);
+      if (size > TEXT_PREVIEW_LIMIT) throw new Error(`텍스트 편집은 ${TEXT_PREVIEW_LIMIT / 1024}KiB를 초과할 수 없습니다.`);
+      const target = resolveNonSensitiveProjectPath(rootFor(request, projectId), relativePath, true, fileAccess(request));
+      const stat = fs.statSync(target);
+      if (!stat.isFile()) throw new Error("편집 대상이 파일이 아닙니다.");
+      if (stat.size > TEXT_PREVIEW_LIMIT) throw new Error("미리보기에서 일부만 읽은 파일은 편집할 수 없습니다.");
+      const kind = previewKind(target);
+      if (kind !== "text" && kind !== "markdown") throw new Error("텍스트 형식이 아닌 파일은 편집할 수 없습니다.");
+      writeFileAtomic(target, content);
+      writeAudit(database, request.authUser!.id, "file.write", "project", projectId, { path: relativePath, bytes: size });
+      response.json({ saved: true, size });
+    } catch (error) {
+      next(error);
+    }
+  });
   router.post("/projects/:id/files/archive", requireAdmin, (request: AuthenticatedRequest, response, next) => {
     if (!archiveDownloadEnabled) {
       response.status(503).json({ error: "ZIP 다운로드 기능은 현재 비활성화되어 있습니다." });
@@ -300,7 +327,7 @@ export function createFileRouter(database: AppDatabase): Router {
     }
     try {
       const projectId = Number(request.params.id);
-      const root = getProjectPath(database, projectId);
+      const root = rootFor(request, projectId);
       const paths = Array.isArray(request.body?.paths) ? request.body.paths.filter((item: unknown) => typeof item === "string").slice(0, 100) as string[] : [];
       if (!paths.length) throw new Error("압축할 파일을 선택해주세요.");
       response.attachment("project-files.zip");

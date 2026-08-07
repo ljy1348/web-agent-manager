@@ -144,5 +144,18 @@ export function createAuthRouter(database: AppDatabase, config: AppConfig): Rout
       next(error);
     }
   });
+  // 현재 웹 계정의 채팅 화면 기본 모드를 저장한다.
+  router.put("/chat-view-mode", requireAuth, requireCsrf, (request: AuthenticatedRequest, response, next) => {
+    try {
+      const chatViewMode = request.body?.chatViewMode;
+      if (chatViewMode !== "chat" && chatViewMode !== "terminal") return response.status(400).json({ error: "채팅 화면 모드가 올바르지 않습니다." });
+      database.prepare("UPDATE users SET chat_view_mode = ? WHERE id = ?").run(chatViewMode, request.authUser!.id);
+      request.authUser!.chat_view_mode = chatViewMode;
+      writeAudit(database, request.authUser!.id, "user.chat_view_mode.update", "user", request.authUser!.id, { chatViewMode });
+      response.json({ chatViewMode });
+    } catch (error) {
+      next(error);
+    }
+  });
   return router;
 }

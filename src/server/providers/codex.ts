@@ -270,8 +270,14 @@ export class CodexAdapter implements ProviderAdapter {
   readonly id = "codex" as const;
   readonly displayLabel = "Codex";
   readonly usageWindowId = "weekly";
+  readonly usageResetWindowIds = ["weekly"];
   readonly cliVersionCommand = { command: "codex", args: ["--version"] };
   readonly historyRoot = path.join(os.homedir(), ".codex", "sessions");
+
+  // CODEX_HOME을 지정하면 Codex가 그 폴더 아래에 sessions/를 새로 만들어 기록을 남긴다.
+  historyRootFor(configDir: string | null): string {
+    return configDir ? path.join(configDir, "sessions") : this.historyRoot;
+  }
   readonly usageCommands = ["/usage weekly", "/status"];
   // 첫 사용자 메시지는 append-only 기록에서 바뀌지 않으므로 확인된 숨김 판정을 재사용한다.
   private readonly hiddenHistoryVerdicts = new Map<string, boolean>();

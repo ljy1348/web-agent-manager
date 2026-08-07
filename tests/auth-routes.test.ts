@@ -229,5 +229,38 @@ describe("인증 라우트 보안", () => {
     expect(save.status).toBe(200);
     expect(meBody.user.last_project_id).toBe(projectId);
     expect(meBody.user.last_chat_id).toBe(chatId);
+    expect(meBody.user.chat_view_mode).toBe("chat");
+  });
+
+  it("채팅 화면 모드를 웹 계정별로 저장하고 검증한다", async () => {
+    const { database, config } = createTestContext();
+    database.prepare("INSERT INTO users(username, password_hash, role) VALUES (?, ?, 'admin')")
+      .run("mode-admin", await hashPassword("correct-password"));
+    const baseUrl = await serveAuth(database, config);
+    const login = await fetch(`${baseUrl}/api/auth/login`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ username: "mode-admin", password: "correct-password" }),
+    });
+    const loginBody = await login.json();
+    const cookie = login.headers.get("set-cookie")?.split(";")[0] ?? "";
+
+    const invalid = await fetch(`${baseUrl}/api/auth/chat-view-mode`, {
+      method: "PUT",
+      headers: { "content-type": "application/json", cookie, "x-csrf-token": loginBody.csrfToken },
+      body: JSON.stringify({ chatViewMode: "split" }),
+    });
+    const saved = await fetch(`${baseUrl}/api/auth/chat-view-mode`, {
+      method: "PUT",
+      headers: { "content-type": "application/json", cookie, "x-csrf-token": loginBody.csrfToken },
+      body: JSON.stringify({ chatViewMode: "terminal" }),
+    });
+    const meBody = await (await fetch(`${baseUrl}/api/auth/me`, { headers: { cookie } })).json();
+    const audit = database.prepare("SELECT details FROM audit_logs WHERE action = 'user.chat_view_mode.update'").get() as { details: string };
+
+    expect(invalid.status).toBe(400);
+    expect(saved.status).toBe(200);
+    expect(meBody.user.chat_view_mode).toBe("terminal");
+    expect(JSON.parse(audit.details)).toEqual({ chatViewMode: "terminal" });
   });
 });

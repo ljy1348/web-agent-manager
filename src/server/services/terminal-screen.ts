@@ -44,6 +44,18 @@ export class TerminalScreen {
     return lines.join("\n");
   }
 
+  // 새 xterm 클라이언트가 같은 화면·커서에서 실시간 ANSI 스트림을 이어받도록 초기 프레임을 만든다.
+  ansiSnapshot(): string {
+    const buffer = this.terminal.buffer.active;
+    const lines: string[] = [];
+    for (let row = 0; row < this.terminal.rows; row += 1) {
+      lines.push(buffer.getLine(buffer.viewportY + row)?.translateToString(true).trimEnd() ?? "");
+    }
+    const cursorRow = Math.min(this.terminal.rows, Math.max(1, buffer.cursorY + 1));
+    const cursorColumn = Math.min(this.terminal.cols, Math.max(1, buffer.cursorX + 1));
+    return `\u001b[0m\u001b[2J\u001b[H${lines.join("\r\n")}\u001b[${cursorRow};${cursorColumn}H`;
+  }
+
   // 이전 조회 화면과 스크롤백을 제거한다.
   reset(): void {
     this.terminal.reset();

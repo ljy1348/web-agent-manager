@@ -46,7 +46,7 @@ function appForRole(role: "admin" | "user"): express.Express {
 describe("RBAC 가드", () => {
   it("일반 사용자의 관리자 전용 HTTP 변경 작업을 거부한다", async () => {
     const app = appForRole("user");
-    app.use(createProjectRouter({} as AppDatabase, { allowedRoots: [] } as never, {} as never, [], {} as never));
+    app.use(createProjectRouter({} as AppDatabase, { allowedRoots: [] } as never, {} as never, [], {} as never, {} as never));
     app.use(createInstructionRouter({} as AppDatabase));
     app.use(createGitRouter({} as AppDatabase));
     app.use(createFileRouter({} as AppDatabase));
@@ -92,7 +92,7 @@ describe("RBAC 가드", () => {
   it("일반 사용자의 채팅 프롬프트 전송은 허용한다", async () => {
     const sendPrompt = vi.fn().mockResolvedValue(undefined);
     const app = appForRole("user");
-    app.use(createProjectRouter({} as AppDatabase, {} as never, { sendPrompt } as never, [], {} as never));
+    app.use(createProjectRouter({} as AppDatabase, {} as never, { sendPrompt } as never, [], {} as never, {} as never));
     const baseUrl = await serve(app);
 
     const response = await fetch(`${baseUrl}/chats/7/messages`, {

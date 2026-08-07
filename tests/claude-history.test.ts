@@ -35,6 +35,12 @@ afterEach(() => {
 });
 
 describe("Claude 세션 기록 파싱", () => {
+  it("상태 조회 전용 실행은 인증과 내장 명령만 남기는 경량 모드를 사용한다", () => {
+    const adapter = new ClaudeAdapter("/tmp/settings.json", { WAM_HOOK: "enabled" });
+    expect(adapter.createMonitorLaunch("/tmp")).toEqual({ command: "claude", args: ["--safe-mode", "--ax-screen-reader"] });
+    expect(adapter.createLaunch("/tmp").args).toEqual(["--settings", "/tmp/settings.json"]);
+  });
+
   it("도구 실행 결과 턴을 user가 아닌 tool 역할로 분류한다", () => {
     const session = new ClaudeAdapter("", {}).parseHistoryFile(writeFixture());
     expect(session?.messages.map((message) => ({ role: message.role, kind: message.kind }))).toEqual([

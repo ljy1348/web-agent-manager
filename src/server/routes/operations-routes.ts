@@ -3,6 +3,7 @@ import { promisify } from "node:util";
 import { Router } from "express";
 import type { AppDatabase } from "../core/database";
 import { requireAdmin, type AuthenticatedRequest } from "../core/auth";
+import { requireTrustedNetwork } from "../core/network";
 import type { ApprovalService } from "../services/approval";
 import type { UsageMonitor } from "../services/usage-monitor";
 import type { SystemMetricsService } from "../services/system-metrics";
@@ -10,6 +11,7 @@ import type { SlackNotifier } from "../services/slack";
 import type { NtfyNotifier } from "../services/ntfy";
 import type { Provider } from "../../shared/types";
 import { writeAudit } from "../core/audit";
+import type { IdleChatReaper } from "../services/idle-chat-reaper";
 import type { ProviderAdapter } from "../providers/provider";
 
 const runFile = promisify(execFile);
@@ -33,9 +35,24 @@ export function createOperationsRouter(
   slack: SlackNotifier,
   ntfy: NtfyNotifier,
   adapters: ProviderAdapter[],
+  idleChatReaper: IdleChatReaper,
+  readVersion: typeof version = version,
 ): Router {
   const router = Router();
   const adapterById = new Map(adapters.map((adapter) => [adapter.id, adapter]));
+  // 런타임 버전은 서버 라우터 생성 시 한 번만 조회해 모든 API 요청에서 재사용한다.
+  const runtimeSnapshot = (async (): Promise<Record<string, string | null>> => {
+    const providerVersions = await Promise.all(adapters.map(async (adapter) => [
+      adapter.id,
+      await readVersion(adapter.cliVersionCommand.command, adapter.cliVersionCommand.args),
+    ] as const));
+    const [git, gh, tmux] = await Promise.all([
+      readVersion("git", ["--version"]),
+      readVersion("gh", ["--version"]),
+      readVersion("tmux", ["-V"]),
+    ]);
+    return { ...Object.fromEntries(providerVersions), git, gh, tmux };
+  })();
   const getProvider = (value: string): Provider => {
     const provider = value as Provider;
     if (!adapterById.has(provider)) throw new Error("지원하지 않는 공급자입니다.");
@@ -119,11 +136,15 @@ export function createOperationsRouter(
   router.get("/system", (_request, response) => response.json(metrics.snapshot()));
   // 대시보드 프로세스 표에서 관리자가 직접 종료(SIGTERM)·강제 종료(SIGKILL)할 수 있게 한다.
   // 서버 자기 자신과 init(pid 1)은 실수로 앱 전체가 죽는 것을 막기 위해 항상 거부한다.
-  router.post("/system/processes/:pid/kill", requireAdmin, (request: AuthenticatedRequest, response, next) => {
+  router.post("/system/processes/:pid/kill", requireAdmin, requireTrustedNetwork, (request: AuthenticatedRequest, response, next) => {
     try {
       const pid = Number(request.params.pid);
       if (!Number.isInteger(pid) || pid <= 1) throw new Error("유효하지 않은 PID입니다.");
       if (pid === process.pid) throw new Error("이 앱 자신의 프로세스는 종료할 수 없습니다.");
+      // 서버를 띄운 watch 프로세스나 MCP 브리지처럼 앱 구동에 필요한 프로세스도 막는다. 화면에서
+      // 버튼을 없애는 것만으로는 API를 직접 부르는 경로가 남는다.
+      const systemProcess = metrics.snapshot().latest?.processes.find((item) => item.pid === pid && item.group.kind === "system");
+      if (systemProcess) throw new Error("web-agent-manager 시스템 프로세스는 대시보드에서 종료할 수 없습니다.");
       const force = request.body?.force === true;
       process.kill(pid, force ? "SIGKILL" : "SIGTERM");
       writeAudit(database, request.authUser!.id, "process.kill", "process", String(pid), { force });
@@ -167,13 +188,23 @@ export function createOperationsRouter(
     writeAudit(database, request.authUser!.id, "ntfy.settings.update", "ntfy_settings", "1", { topicChanged: !!topic.trim(), serverUrlChanged: !!serverUrl.trim() });
     response.json(ntfy.settingsForAdmin());
   });
+  // 유휴 채팅 자동 종료 정책. 되돌릴 수 없는 동작이라 조회도 관리자로 제한한다.
+  router.get("/admin/idle-chat-settings", requireAdmin, (_request, response) => {
+    response.json(idleChatReaper.settings());
+  });
+  router.put("/admin/idle-chat-settings", requireAdmin, (request: AuthenticatedRequest, response, next) => {
+    try {
+      const enabled = request.body?.enabled !== false;
+      const timeoutHours = Number(request.body?.timeoutHours ?? 24);
+      const saved = idleChatReaper.updateSettings(enabled, timeoutHours);
+      writeAudit(database, request.authUser!.id, "idle_chat.settings.update", "idle_chat_settings", "1", { ...saved });
+      response.json(saved);
+    } catch (error) {
+      next(error);
+    }
+  });
   router.get("/runtime", async (_request, response) => {
-    const providerVersions = await Promise.all(adapters.map(async (adapter) => [
-      adapter.id,
-      await version(adapter.cliVersionCommand.command, adapter.cliVersionCommand.args),
-    ] as const));
-    const [git, gh, tmux] = await Promise.all([version("git", ["--version"]), version("gh", ["--version"]), version("tmux", ["-V"])]);
-    response.json({ ...Object.fromEntries(providerVersions), git, gh, tmux });
+    response.json(await runtimeSnapshot);
   });
   return router;
 }

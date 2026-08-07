@@ -7,6 +7,7 @@ import type { AuthUser, ChatRecord, Provider } from "../../shared/types";
 import type { RealtimeHub } from "./realtime";
 import type { ApprovalService } from "./approval";
 import type { Notifier } from "./notifier";
+import type { AgentAccountService } from "./agent-accounts";
 import { writeAudit } from "../core/audit";
 import { stripAnsi } from "../core/security";
 import { setChatBusy } from "../core/chat-busy";
@@ -16,7 +17,7 @@ import { parseResetTime } from "./rate-limit-resume";
 import { TerminalScreen } from "./terminal-screen";
 
 // 공급자(Claude·Codex)가 실제로 도는 tmux 창의 고정 크기. tmux는 창을 리사이즈해도 이미 스크롤백에
-// 찍힌 옛 줄을 새 폭으로 다시 감아주지 않아, "원본 터미널" 미리보기 패널(작은 박스)이 열릴 때마다
+// 찍힌 옛 줄을 새 폭으로 다시 감아주지 않아, 웹의 원본 터미널 화면이 열릴 때마다
 // 그 실제 DOM 크기로 여기를 리사이즈하면 그 이전 대화(특히 한글처럼 폭 계산이 예민한 내용)가 스크롤백에서
 // 계단식으로 깨져 보였다. 그래서 이 크기는 미리보기 패널 크기와 무관하게 항상 고정하고(TerminalPanel은
 // 이 크기로 절대 리사이즈 요청을 보내지 않는다), 패널 쪽 표시는 클라이언트 xterm이 로컬에서만 맞춘다.
@@ -44,6 +45,7 @@ const TERMINAL_STATE_IDLE_POLL_MS = 5_000;
 
 interface ChatWithProject extends ChatRecord {
   project_path: string;
+  workspace_path: string;
 }
 
 type ApprovalDecision = "accept" | "acceptForSession" | "decline" | "cancel";
@@ -82,6 +84,7 @@ export class SessionManager {
     private readonly realtime: RealtimeHub,
     private readonly approvals: ApprovalService,
     private readonly notifications: Notifier,
+    private readonly accounts: AgentAccountService,
   ) {
     this.adapters = new Map(adapters.map((adapter) => [adapter.id, adapter]));
     approvals.setTerminalDecisionHandler((chatId, decision, requestType) => this.applyTerminalApproval(chatId, decision, requestType));
@@ -95,7 +98,8 @@ export class SessionManager {
   // DB에 실행 중으로 남은 tmux 세션을 서버 시작 시 다시 연결한다.
   restore(): void {
     const chats = this.database.prepare(`
-      SELECT c.*, p.path AS project_path FROM chats c JOIN projects p ON p.id = c.project_id
+      SELECT c.*, p.path AS project_path, COALESCE(c.worktree_path, p.path) AS workspace_path
+      FROM chats c JOIN projects p ON p.id = c.project_id
       WHERE c.status IN ('starting', 'running', 'resuming')
     `).all() as ChatWithProject[];
     for (const chat of chats) {
@@ -115,17 +119,21 @@ export class SessionManager {
     const adapter = this.adapters.get(chat.provider);
     if (!adapter) throw new Error("지원하지 않는 공급자입니다.");
     if (resume && !chat.provider_session_id) throw new Error("재개할 공급자 세션 ID가 없습니다.");
-    const launch = adapter.createLaunch(chat.project_path, resume ? chat.provider_session_id! : undefined);
+    const launch = adapter.createLaunch(chat.workspace_path, resume ? chat.provider_session_id! : undefined);
     // -x/-y를 안 주면 tmux가 클라이언트 없는 세션을 자체 기본 크기(보통 80x24)로 만든다. Claude는
     // --ax-screen-reader 모드에서 시작 시점의 폭으로 이미 그려둔 과거 스크롤백을 나중에 attach()가
     // 120x36으로 리사이즈해도 다시 그리지 않아, 그 사이에 출력된 내용(특히 폭 계산이 더 예민한 한글
     // 같은 wide 문자가 많은 줄)이 원본 터미널(xterm.js)에서 계단식으로 밀려 보이는 문제가 있었다.
     // attach()의 pty.spawn과 같은 크기로 처음부터 만들어 이 불일치 자체를 없앤다.
-    const args = ["new-session", "-d", "-s", chat.tmux_name, "-x", String(DEFAULT_COLS), "-y", String(DEFAULT_ROWS), "-c", chat.project_path];
-    for (const [key, value] of Object.entries(launch.env ?? {})) args.push("-e", `${key}=${value}`);
+    // 채팅에 할당된 계정의 설정 디렉터리를 환경변수로 실어 보낸다. 환경변수는 tmux 세션을 만드는
+    // 이 시점에만 적용되므로, 이미 떠 있는 세션의 계정을 바꾸려면 세션을 종료하고 다시 시작해야 한다.
+    const account = this.accounts.resolveForChat(chat.provider, chat.account_id);
+    const launchEnv = { ...(launch.env ?? {}), ...this.accounts.environment(account) };
+    const args = ["new-session", "-d", "-s", chat.tmux_name, "-x", String(DEFAULT_COLS), "-y", String(DEFAULT_ROWS), "-c", chat.workspace_path];
+    for (const [key, value] of Object.entries(launchEnv)) args.push("-e", `${key}=${value}`);
     args.push("--", launch.command, ...launch.args);
     this.setStatus(chatId, resume ? "resuming" : "starting", null);
-    const result = spawnSync("tmux", args, { encoding: "utf8", env: { ...process.env, ...launch.env } });
+    const result = spawnSync("tmux", args, { encoding: "utf8", env: { ...process.env, ...launchEnv } });
     if (result.status !== 0) {
       const message = result.stderr?.trim() || "tmux 세션을 시작하지 못했습니다.";
       this.setStatus(chatId, "error", message);
@@ -209,6 +217,24 @@ export class SessionManager {
     this.database.prepare("UPDATE chats SET title = ?, title_source = 'manual' WHERE id = ?").run(trimmed, chatId);
     this.realtime.broadcast("chat_title", { chatId, title: trimmed });
     writeAudit(this.database, user.id, "chat.rename", "chat", chatId, { title: trimmed });
+  }
+
+  // 채팅이 쓸 인증 계정을 바꾼다. 환경변수는 tmux 세션 생성 시점에만 적용되므로 실행 중에는 바꿀 수 없고,
+  // 이미 다른 계정에서 만들어진 공급자 세션은 그 계정 폴더에만 기록이 있어 재개도 불가능하다.
+  // 그래서 계정을 옮기면 세션 연결을 끊고 다음 시작은 새 대화로 진행한다.
+  assignAccount(chatId: number, accountId: number | null, user: AuthUser): void {
+    const chat = this.getChat(chatId);
+    if (this.terminals.has(chatId) || tmuxExists(chat.tmux_name)) {
+      throw new Error("실행 중인 채팅은 계정을 바꿀 수 없습니다. 먼저 채팅을 종료해주세요.");
+    }
+    const account = this.accounts.requireForProvider(chat.provider, accountId);
+    if (account.id === chat.account_id) return;
+    // 옛 계정의 세션 ID를 그대로 두면 다음 시작에서 그 계정에 없는 세션을 재개하려다 실패한다.
+    // 기록 파일 자체는 지우지 않으므로 계정을 되돌리면 이전 대화를 다시 이어갈 수 있다.
+    this.database.prepare("UPDATE chats SET account_id = ?, provider_session_id = NULL, history_file = NULL WHERE id = ?")
+      .run(account.id, chatId);
+    this.realtime.broadcast("chat_account", { chatId, accountId: account.id });
+    writeAudit(this.database, user.id, "chat.assign_account", "chat", chatId, { accountId: account.id, label: account.label });
   }
 
   // /model 화면이 실제로 열린 뒤에만 다음 번호 키를 보내도록 대기한다.
@@ -347,20 +373,17 @@ export class SessionManager {
     return terminal?.screen?.visibleText() ?? "";
   }
 
-  // 새 웹 클라이언트가 구독할 때 tmux 자신에게 지금 화면을 실제 터미널 프로토콜로 다시 그려달라고
-  // 요청한다. 예전엔 여기서 captureSnapshot()의 평범한 텍스트 스냅샷을 그 클라이언트에만 직접
-  // write()했는데, 그건 커서 위치 정보가 없는 단순 텍스트라 클라이언트 xterm의 커서 상태가 실제 tmux
-  // 커서와 어긋났다. 뒤이어 오는 실시간 스트림(스피너·타이머 갱신처럼 "몇 줄 위로 이동해서 지우고
-  // 다시 쓰기" 같은 상대 커서 이동 시퀀스를 흔히 씀)이 그 어긋난 커서를 기준으로 적용되면서, 다른
-  // 채팅으로 갔다가 돌아올 때마다 같은 내용이 중복 출력되거나 정렬이 깨져 보였다. refresh-client는
-  // tmux가 새 클라이언트를 attach할 때와 같은 방식으로 화면을 실제로 다시 그려주므로 커서 상태까지
-  // 정확히 동기화되고, 그 출력은 기존 pty의 onData → 실시간 브로드캐스트 경로를 그대로 타 이미 열려
-  // 있는 다른 탭에도 자연스럽게 반영된다.
+  // 새 웹 클라이언트에 현재 화면·커서 초기 프레임을 즉시 보내고 서버가 소유한 tmux 클라이언트도 다시 그린다.
   private refreshTerminal(chatId: number): void {
     const terminal = this.terminals.get(chatId);
     if (!terminal) return;
-    const clients = spawnSync("tmux", ["list-clients", "-t", terminal.tmuxName, "-F", "#{client_tty}"], { encoding: "utf8" });
-    const tty = clients.status === 0 ? clients.stdout.split("\n").find(Boolean) : undefined;
+    const snapshot = terminal.screen?.ansiSnapshot();
+    if (snapshot) this.realtime.terminal(chatId, snapshot);
+    const clients = spawnSync("tmux", ["list-clients", "-t", terminal.tmuxName, "-F", "#{client_pid} #{client_tty}"], { encoding: "utf8" });
+    const ownClient = clients.status === 0
+      ? clients.stdout.split("\n").find((line) => line.startsWith(`${terminal.pty.pid} `))
+      : undefined;
+    const tty = ownClient?.slice(ownClient.indexOf(" ") + 1);
     if (tty) spawnSync("tmux", ["refresh-client", "-t", tty]);
   }
 
@@ -402,7 +425,8 @@ export class SessionManager {
   }
 
   // CLI에 정상 종료를 요청하고 제한 시간 뒤 남은 tmux 세션을 강제 종료한다.
-  async stop(chatId: number, user: AuthUser): Promise<void> {
+  // user가 null이면 유휴 자동 종료처럼 시스템이 스스로 실행한 종료라 감사 로그에 사용자를 남기지 않는다.
+  async stop(chatId: number, user: AuthUser | null): Promise<void> {
     const chat = this.getChat(chatId);
     this.setStatus(chatId, "stopping", null);
     // 사용자가 종료를 선택한 세션은 리밋이 풀린 뒤 시스템 입력으로 다시 시작하지 않는다.
@@ -428,7 +452,7 @@ export class SessionManager {
     this.terminals.delete(chatId);
     this.inputQueues.delete(chatId);
     this.setStatus(chatId, "stopped", null);
-    writeAudit(this.database, user.id, "terminal.stop", "chat", chatId);
+    writeAudit(this.database, user?.id ?? null, "terminal.stop", "chat", chatId);
   }
 
   // 서버 종료 시 tmux는 유지하고 연결된 PTY 클라이언트만 정리한다.
@@ -450,7 +474,7 @@ export class SessionManager {
       name: "xterm-256color",
       cols: DEFAULT_COLS,
       rows: DEFAULT_ROWS,
-      cwd: chat.project_path,
+      cwd: chat.workspace_path,
       env: { ...process.env, TERM: "xterm-256color" } as Record<string, string>,
     });
     const terminal: ManagedTerminal = {
@@ -671,7 +695,8 @@ export class SessionManager {
   // 채팅과 프로젝트 경로를 함께 조회한다.
   private getChat(chatId: number): ChatWithProject {
     const chat = this.database.prepare(`
-      SELECT c.*, p.path AS project_path FROM chats c JOIN projects p ON p.id = c.project_id WHERE c.id = ?
+      SELECT c.*, p.path AS project_path, COALESCE(c.worktree_path, p.path) AS workspace_path
+      FROM chats c JOIN projects p ON p.id = c.project_id WHERE c.id = ?
     `).get(chatId) as ChatWithProject | undefined;
     if (!chat) throw new Error("채팅을 찾을 수 없습니다.");
     return chat;

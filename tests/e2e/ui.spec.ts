@@ -15,14 +15,35 @@ test("로그인 후 대시보드와 채팅 화면을 렌더링한다", async ({ 
   await page.screenshot({ path: "artifacts/ui-dashboard.png", fullPage: true });
 });
 
-test("터미널 토글과 모바일 채팅 메뉴를 렌더링한다", async ({ page }) => {
+test("채팅·터미널 모드 전환과 모바일 채팅 메뉴를 렌더링한다", async ({ page }) => {
+  const terminalInputs: string[] = [];
+  let pushTerminalOutput: (data: string) => void = () => undefined;
+  await page.routeWebSocket("**/ws", (webSocket) => {
+    pushTerminalOutput = (data) => webSocket.send(JSON.stringify({ type: "terminal_output", payload: { chatId: 1, data } }));
+    webSocket.onMessage((raw) => {
+      const message = JSON.parse(String(raw));
+      if (message.type === "subscribe_terminal") {
+        const scrollback = Array.from({ length: 72 }, (_item, index) => `터미널 기록 ${String(index + 1).padStart(2, "0")}\r\n`).join("");
+        webSocket.send(JSON.stringify({ type: "terminal_output", payload: { chatId: message.chatId, data: `\u001b[2J\u001b[H${scrollback}원본 터미널 출력` } }));
+      }
+      if (message.type === "terminal_input") terminalInputs.push(message.data);
+    });
+  });
   const renameRequests: Record<string, unknown>[] = [];
   const deleteBackupRequests: string[] = [];
+  const chatViewModeRequests: string[] = [];
   let backupDeleted = false;
+  let chatViewMode = "chat";
   await page.route("**/api/**", async (route) => {
     const pathname = new URL(route.request().url()).pathname;
+    if (pathname === "/api/auth/chat-view-mode" && route.request().method() === "PUT") {
+      chatViewMode = JSON.parse(route.request().postData() || "{}").chatViewMode;
+      chatViewModeRequests.push(chatViewMode);
+      await route.fulfill({ json: { chatViewMode } });
+      return;
+    }
     const responses: Record<string, unknown> = {
-      "/api/auth/me": { user: { id: 1, username: "ui-test", role: "admin" }, csrfToken: "ui-test" },
+      "/api/auth/me": { user: { id: 1, username: "ui-test", role: "admin", chat_view_mode: chatViewMode }, csrfToken: "ui-test" },
       "/api/providers": { providers: [{ id: "codex", label: "Codex", usageWindowId: "weekly", supportsPermissionMode: false }, { id: "claude", label: "Claude", usageWindowId: "session", supportsPermissionMode: true }] },
       "/api/projects": { projects: [{ id: 1, name: "샘플 프로젝트", path: "/home/testuser/myagent" }] },
       "/api/usage": { usage: [] },
@@ -71,7 +92,8 @@ test("터미널 토글과 모바일 채팅 메뉴를 렌더링한다", async ({ 
   await expect(page.getByRole("heading", { name: "운영 대시보드" })).toBeVisible();
   await page.getByRole("button", { name: "채팅", exact: true }).click();
   await expect(page.getByRole("heading", { name: "채팅", exact: true })).toBeVisible();
-  await expect(page.locator(".terminal-panel")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "채팅 모드" })).toHaveAttribute("aria-pressed", "true");
+  await expect(page.locator(".terminal-panel-full")).toHaveCount(0);
   await expect(page.getByText("프로젝트와 새 채팅은 햄버거 메뉴에서 관리할 수 있습니다.", { exact: false })).toBeVisible();
   // Claude·Codex 둘 다 CLI 자체 /rename 명령을 지원하므로, 제목의 편집 버튼으로 그 명령을 실제로
   // 보낼 수 있어야 한다. Esc로는 아무 요청도 안 나가고 편집 상태만 닫혀야 한다.
@@ -118,12 +140,22 @@ test("터미널 토글과 모바일 채팅 메뉴를 렌더링한다", async ({ 
   await changeDetails.click();
   await expect(changeContent).toBeVisible();
   await changeDetails.click();
-  await page.getByRole("button", { name: "원본 터미널 켜기" }).click();
-  await expect(page.getByLabel("원본 터미널")).toBeVisible();
-  await expect(page.locator(".conversation .messages")).toBeVisible();
+  await page.getByRole("button", { name: "터미널 모드" }).click();
+  await expect(page.getByLabel("채팅 터미널")).toBeVisible();
+  await expect(page.locator(".terminal-host .xterm-rows")).toContainText("원본 터미널 출력");
+  await expect(page.locator(".xterm-helper-textarea")).toBeFocused();
+  await page.keyboard.type("pwd");
+  await expect.poll(() => terminalInputs.join("")).toContain("pwd");
+  await expect(page.locator(".conversation")).toHaveCount(0);
+  await expect(page.locator(".terminal-panel-full")).toHaveCSS("flex-grow", "1");
+  expect(chatViewModeRequests).toEqual(["terminal"]);
   fs.mkdirSync("artifacts", { recursive: true });
   await page.screenshot({ path: "artifacts/ui-chat-terminal.png", fullPage: true });
-  await page.getByRole("button", { name: "원본 터미널 끄기" }).click();
+  await page.reload();
+  await expect(page.getByLabel("채팅 터미널")).toBeVisible();
+  await page.getByRole("button", { name: "채팅 모드" }).click();
+  await expect(page.locator(".conversation")).toBeVisible();
+  expect(chatViewModeRequests).toEqual(["terminal", "chat"]);
 
   await page.setViewportSize({ width: 390, height: 844 });
   await page.reload();
@@ -158,11 +190,70 @@ test("터미널 토글과 모바일 채팅 메뉴를 렌더링한다", async ({ 
   await expect(page.getByRole("button", { name: "새 Codex 채팅" })).toBeVisible();
   await expect(page.getByRole("button", { name: "새 Claude 채팅" })).toBeVisible();
   await page.screenshot({ path: "artifacts/ui-mobile-menu.png", fullPage: true });
-  await page.getByRole("button", { name: "원본 터미널 켜기" }).click();
+  await page.locator(".mobile-menu-head").getByRole("button", { name: "메뉴 닫기" }).click();
+  await page.getByRole("button", { name: "터미널 모드" }).click();
   await expect(page.locator(".mobile-chat-menu")).toHaveCount(0);
-  await expect(page.getByLabel("원본 터미널")).toBeVisible();
-  await expect(page.locator(".conversation")).toBeVisible();
+  await expect(page.getByLabel("채팅 터미널")).toBeVisible();
+  await expect(page.locator(".conversation")).toHaveCount(0);
+  const terminalStage = page.locator(".terminal-stage");
+  const terminalHost = page.locator(".terminal-host");
+  const visibleTerminalRows = page.locator(".terminal-host .xterm-rows");
+  await expect(page.getByRole("toolbar", { name: "모바일 터미널 키" })).toBeVisible();
+  expect((await terminalStage.boundingBox())!.height).toBeGreaterThan(300);
+  // 세로 터치 제스처는 바깥 문서를 움직이지 않고 xterm의 실제 스크롤백을 이동해야 한다.
+  await expect(visibleTerminalRows).toContainText("터미널 기록");
+  const documentScrollBefore = await page.evaluate(() => window.scrollY);
+  const terminalRowsBefore = await visibleTerminalRows.textContent();
+  await terminalHost.dispatchEvent("pointerdown", { pointerType: "touch", pointerId: 7, clientX: 180, clientY: 280, bubbles: true });
+  await terminalHost.dispatchEvent("pointermove", { pointerType: "touch", pointerId: 7, clientX: 180, clientY: 390, bubbles: true });
+  await terminalHost.dispatchEvent("pointerup", { pointerType: "touch", pointerId: 7, clientX: 180, clientY: 390, bubbles: true });
+  await expect.poll(() => visibleTerminalRows.textContent()).not.toBe(terminalRowsBefore);
+  expect(await page.evaluate(() => window.scrollY)).toBe(documentScrollBefore);
+  // Codex·Claude TUI가 mouse mode를 켠 상태에서는 같은 스와이프가 xterm 스크롤백이 아니라
+  // 실제 PTY mouse-wheel 시퀀스로 전달되어 TUI 자체 기록을 움직여야 한다.
+  pushTerminalOutput("\u001b[?1000h\u001b[?1006h");
+  await page.waitForTimeout(50);
+  terminalInputs.length = 0;
+  await terminalHost.dispatchEvent("pointerdown", { pointerType: "touch", pointerId: 9, clientX: 180, clientY: 390, bubbles: true });
+  await terminalHost.dispatchEvent("pointermove", { pointerType: "touch", pointerId: 9, clientX: 180, clientY: 280, bubbles: true });
+  await terminalHost.dispatchEvent("pointerup", { pointerType: "touch", pointerId: 9, clientX: 180, clientY: 280, bubbles: true });
+  await expect.poll(() => terminalInputs.join("")).toMatch(/\u001b\[<6[45];/);
+  pushTerminalOutput("\u001b[?1000l\u001b[?1006l");
+  // 256열 화면은 좌우 제스처로 터미널 안에서만 이동하고 페이지 폭은 늘리지 않는다.
+  expect(await terminalHost.evaluate((element) => element.scrollWidth)).toBeGreaterThan(await terminalHost.evaluate((element) => element.clientWidth));
+  await terminalHost.dispatchEvent("pointerdown", { pointerType: "touch", pointerId: 8, clientX: 310, clientY: 280, bubbles: true });
+  await terminalHost.dispatchEvent("pointermove", { pointerType: "touch", pointerId: 8, clientX: 100, clientY: 280, bubbles: true });
+  await terminalHost.dispatchEvent("pointerup", { pointerType: "touch", pointerId: 8, clientX: 100, clientY: 280, bubbles: true });
+  expect(await terminalHost.evaluate((element) => element.scrollLeft)).toBeGreaterThan(0);
+  // 모바일 키보드에서 만들기 어려운 조합은 Ctrl/Alt 잠금과 전용 키 버튼으로 원시 PTY 바이트를 보낸다.
+  terminalInputs.length = 0;
+  await page.getByRole("button", { name: "⌨ 키보드", exact: true }).click();
+  await expect(page.locator(".xterm-helper-textarea")).toBeFocused();
+  await page.getByRole("button", { name: "Ctrl", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Ctrl", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await page.keyboard.type("c");
+  await expect.poll(() => terminalInputs.join("")).toBe("\u0003");
+  terminalInputs.length = 0;
+  await page.getByRole("button", { name: "Alt", exact: true }).click();
+  await page.keyboard.type("x");
+  await expect.poll(() => terminalInputs.join("")).toBe("\u001bx");
+  terminalInputs.length = 0;
+  await page.getByRole("button", { name: "PgUp", exact: true }).click();
+  await page.getByRole("button", { name: "⇧Tab", exact: true }).click();
+  await page.getByRole("button", { name: "Enter", exact: true }).click();
+  expect(terminalInputs.join("")).toBe("\u001b[5~\u001b[Z\r");
+  await page.getByRole("toolbar", { name: "모바일 터미널 키" }).evaluate((element) => { element.scrollLeft = 0; });
+  await terminalHost.evaluate((element) => { element.scrollLeft = 0; });
+  expect(await page.locator(".terminal-panel-full").evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   await page.screenshot({ path: "artifacts/ui-mobile-chat.png", fullPage: true });
+  // 소프트 키보드가 열린 것처럼 visual viewport 높이가 줄어도 터미널과 키 바가 사라지지 않아야 한다.
+  await page.setViewportSize({ width: 390, height: 390 });
+  await expect(page.getByRole("toolbar", { name: "모바일 터미널 키" })).toBeVisible();
+  expect((await terminalStage.boundingBox())!.height).toBeGreaterThan(130);
+  expect(await page.evaluate(() => document.documentElement.scrollHeight <= document.documentElement.clientHeight)).toBe(true);
+  await page.screenshot({ path: "artifacts/ui-mobile-terminal-compact.png" });
+  await page.setViewportSize({ width: 390, height: 844 });
 
   // 대시보드도 모바일 폭에서 가로 스크롤이 생기면 안 된다(에이전트 프로세스 표의 nowrap 헤더가
   // content-grid 트랙을 밀어올려 페이지 전체가 가로로 밀렸던 문제 재현·검증).
@@ -316,12 +407,14 @@ test("하단을 보고 있으면 새 답변을 따라가고 과거를 읽는 중
   await expect(page.getByText("첫 번째 새 답변", { exact: true })).toBeVisible();
   await expect.poll(() => messageList.evaluate((element) => element.scrollHeight - element.scrollTop - element.clientHeight)).toBeLessThan(30);
 
-  const readingPosition = await messageList.evaluate((element) => {
+  await messageList.evaluate((element) => {
     element.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -120 }));
     element.scrollTop = Math.floor((element.scrollHeight - element.clientHeight) / 2);
     element.dispatchEvent(new Event("scroll"));
-    return element.scrollTop;
   });
+  // 가상 목록이 현재 보이는 행의 새 높이를 반영한 뒤 안정된 읽기 위치를 기준으로 비교한다.
+  await page.waitForTimeout(120);
+  const readingPosition = await messageList.evaluate((element) => element.scrollTop);
   responseVersion = 2;
   const requestsBeforeSecondAnswer = messageRequests;
   await page.evaluate(() => (window as any).__emitWebAgentManagerSocket({ type: "history_updated", payload: { chatId: 1 } }));
@@ -634,7 +727,7 @@ test("도구와 GitHub는 응답 전 로딩을 표시하고 응답 후에만 빈
   await expect(page.getByText("이 provider에서 표시할 항목이 없습니다.")).toBeVisible();
 
   await page.getByRole("button", { name: "GitHub", exact: true }).click();
-  await page.locator(".git-tabs").getByRole("button", { name: "현재 저장소", exact: true }).click();
+  await page.locator(".git-tabs").getByRole("button", { name: "깃허브", exact: true }).click();
   await expect(page.getByRole("status")).toContainText("GitHub 정보 불러오는 중");
   await expect(page.getByText("gh 인증 또는 원격 저장소가 필요합니다.")).toHaveCount(0);
   await page.screenshot({ path: "artifacts/ui-github-loading.png", fullPage: true });
@@ -683,6 +776,7 @@ test("GitHub 저장소 목록에서 연결 프로젝트를 열고 미연결 저�
 
   await page.goto("/");
   await page.getByRole("button", { name: "GitHub", exact: true }).click();
+  await page.locator(".git-tabs").getByRole("button", { name: "저장소", exact: true }).click();
   const connected = page.locator(".repository-row").filter({ hasText: "owner/connected" });
   await expect(connected).toContainText("연결됨");
   await connected.getByRole("button", { name: "채팅 열기" }).click();
@@ -691,6 +785,7 @@ test("GitHub 저장소 목록에서 연결 프로젝트를 열고 미연결 저�
   await expect(page.getByRole("heading", { name: "채팅", exact: true })).toBeVisible();
 
   await page.getByRole("button", { name: "GitHub", exact: true }).click();
+  await page.locator(".git-tabs").getByRole("button", { name: "저장소", exact: true }).click();
   await page.getByLabel("GitHub 소유자 필터").selectOption("example-org");
   await expect(page.locator(".repository-row").filter({ hasText: "owner/connected" })).toHaveCount(0);
   const unconnected = page.locator(".repository-row").filter({ hasText: "example-org/new-repo" });
@@ -713,6 +808,7 @@ test("GitHub 저장소 목록에서 연결 프로젝트를 열고 미연결 저�
 });
 
 test("CLI 인증은 페이지 레이아웃 밖의 독립 팝업으로 열린다", async ({ page }) => {
+  let allAuthenticated = false;
   await page.route("**/api/**", async (route) => {
     const pathname = new URL(route.request().url()).pathname;
     const responses: Record<string, unknown> = {
@@ -726,9 +822,9 @@ test("CLI 인증은 페이지 레이아웃 밖의 독립 팝업으로 열린다"
       "/api/ntfy": { enabled: false },
       "/api/approvals": { approvals: [] },
       "/api/cli-auth": { providers: [
-        { provider: "codex", installed: true, authenticated: false, running: false, exitCode: null },
-        { provider: "claude", installed: true, authenticated: true, running: false, exitCode: 0 },
-        { provider: "github", installed: true, authenticated: true, running: false, exitCode: 0 },
+        { key: "codex", provider: "codex", installed: true, authenticated: allAuthenticated, running: false, exitCode: allAuthenticated ? 0 : null },
+        { key: "claude", provider: "claude", installed: true, authenticated: true, running: false, exitCode: 0 },
+        { key: "github", provider: "github", installed: true, authenticated: true, running: false, exitCode: 0 },
       ] },
     };
     if (pathname in responses) {
@@ -747,6 +843,23 @@ test("CLI 인증은 페이지 레이아웃 밖의 독립 팝업으로 열린다"
   await page.screenshot({ path: "artifacts/ui-cli-auth-popup.png", fullPage: true });
   await dialog.getByRole("button", { name: "닫기" }).click();
   await expect(dialog).toHaveCount(0);
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.reload();
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "닫기" })).toBeVisible();
+  await page.screenshot({ path: "artifacts/ui-cli-auth-popup-mobile.png", fullPage: true });
+  await page.evaluate(() => window.history.back());
+  await expect(dialog).toHaveCount(0);
+  const mobileAuth = page.getByRole("button", { name: "CLI 인증 관리" });
+  await expect(mobileAuth).toBeVisible();
+  await expect(mobileAuth.locator("xpath=..")).toHaveClass(/mobile-tabbar/);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+
+  allAuthenticated = true;
+  await page.reload();
+  await expect(dialog).toHaveCount(0);
+  await expect(mobileAuth).toHaveCount(0);
 });
 
 test("로컬 프로젝트 생성에서 GitHub 저장소 생성 옵션을 함께 전송한다", async ({ page }) => {
@@ -788,6 +901,10 @@ test("로컬 프로젝트 생성에서 GitHub 저장소 생성 옵션을 함께 
   const dialog = page.getByRole("dialog", { name: "프로젝트 생성" });
   await expect(dialog).toBeVisible();
   expect(await dialog.evaluate((element) => element.parentElement?.parentElement?.tagName)).toBe("BODY");
+  await page.evaluate(() => window.history.back());
+  await expect(dialog).toHaveCount(0);
+  await page.locator(".project-bar").getByRole("button", { name: "프로젝트", exact: true }).click();
+  await expect(dialog).toBeVisible();
   await dialog.getByLabel("서버의 프로젝트 절대 경로").fill("/workspace/local-app");
   await dialog.getByLabel("표시 이름").fill("로컬 앱");
   await dialog.getByLabel("GitHub 저장소 생성 및 origin 연결").check();
@@ -909,8 +1026,8 @@ test("PR diff는 상세 진입 시 자동으로 불러오고 파일별로 나눠
     "--- a/a.ts",
     "+++ b/a.ts",
     "@@ -1 +1 @@",
-    "-old a ".concat("very-long-content-".repeat(30)),
-    "+new a ".concat("very-long-content-".repeat(30)),
+    "-const oldValue: string = \"".concat("very-long-content-".repeat(30), "\";"),
+    "+const newValue: string = \"".concat("very-long-content-".repeat(30), "\";"),
     "diff --git a/b.ts b/b.ts",
     "index 333..444 100644",
     "--- a/b.ts",
@@ -951,29 +1068,32 @@ test("PR diff는 상세 진입 시 자동으로 불러오고 파일별로 나눠
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "운영 대시보드" })).toBeVisible();
   await page.getByRole("button", { name: "GitHub", exact: true }).click();
-  await page.locator(".git-tabs").getByRole("button", { name: "현재 저장소", exact: true }).click();
+  await page.locator(".git-tabs").getByRole("button", { name: "깃허브", exact: true }).click();
   await expect(page.getByText("이슈 기록 없음", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "PR", exact: true }).click();
   await page.getByText("#1 테스트 PR").click();
   await expect(page.getByRole("heading", { name: "#1 테스트 PR" })).toBeVisible();
   // PR 상세를 열면 별도 버튼 없이 diff를 한 번 자동으로 읽는다.
-  await expect(page.locator(".file-diff")).toHaveCount(2);
+  await expect(page.locator(".github-pr-diff .diff-file")).toHaveCount(2);
   expect(diffRequests).toHaveLength(1);
   // 두 파일이 섞인 diff가 로컬 Diff 탭·커밋 상세와 같은 방식으로 파일별 접이식 섹션으로 나뉘어야 한다.
-  await expect(page.locator(".file-diff")).toHaveCount(2);
-  await expect(page.locator(".file-diff summary").nth(0)).toHaveText("a.ts");
-  await expect(page.locator(".file-diff summary").nth(1)).toHaveText("b.ts");
+  await expect(page.locator(".github-pr-diff .diff-file")).toHaveCount(2);
+  await expect(page.locator(".github-pr-diff .diff-file-path").nth(0)).toHaveText("a.ts");
+  await expect(page.locator(".github-pr-diff .diff-file-path").nth(1)).toHaveText("b.ts");
   await expect(page.getByText("2개 파일", { exact: true })).toBeVisible();
   // 대형 PR의 모든 줄을 동시에 만들지 않고, 펼친 파일의 diff만 지연 렌더링한다.
-  await expect(page.locator(".github-pr-diff .diff-view")).toHaveCount(0);
-  await page.locator(".file-diff summary").first().click();
-  await expect(page.locator(".github-pr-diff .diff-view")).toHaveCount(1);
+  await expect(page.locator(".github-pr-diff .diff-body")).toHaveCount(0);
+  await page.locator(".github-pr-diff .diff-file-toggle").first().click();
+  await expect(page.locator(".github-pr-diff .diff-body")).toHaveCount(1);
+  await expect(page.locator(".github-pr-diff .diff-token").first()).toBeVisible();
+  expect(await page.locator(".github-pr-diff .diff-row-add .diff-token").evaluateAll((tokens) => new Set(tokens.map((token) => getComputedStyle(token).color)).size)).toBeGreaterThan(1);
   await page.locator(".github-pr-diff").getByRole("button", { name: "분할", exact: true }).click();
-  await expect(page.locator(".github-pr-diff .diff-split")).toHaveCount(1);
-  await expect(page.locator(".github-pr-diff .diff-split-number.remove").first()).toHaveText("1");
-  await expect(page.locator(".github-pr-diff .diff-split-number.add").first()).toHaveText("1");
-  expect(await page.locator(".github-pr-diff .diff-split-code").evaluateAll((cells) => cells.every((cell) => cell.scrollWidth <= cell.clientWidth + 1))).toBe(true);
-  expect(await page.locator(".github-pr-diff .diff-split-text").evaluateAll((texts) => texts.every((text) => {
+  await expect(page.locator(".github-pr-diff .diff-body-split")).toHaveCount(1);
+  await expect(page.locator(".github-pr-diff .diff-body-split .diff-token").first()).toBeVisible();
+  await expect(page.locator(".github-pr-diff .diff-num.remove").first()).toHaveText("1");
+  await expect(page.locator(".github-pr-diff .diff-num.add").first()).toHaveText("1");
+  expect(await page.locator(".github-pr-diff .diff-body-split .diff-code").evaluateAll((cells) => cells.every((cell) => cell.scrollWidth <= cell.clientWidth + 1))).toBe(true);
+  expect(await page.locator(".github-pr-diff .diff-body-split .diff-text").evaluateAll((texts) => texts.every((text) => {
     const cell = text.parentElement;
     if (!cell) return false;
     const boundary = cell.getBoundingClientRect();
@@ -985,13 +1105,13 @@ test("PR diff는 상세 진입 시 자동으로 불러오고 파일별로 나눠
   await page.screenshot({ path: "artifacts/ui-pr-diff-split.png", fullPage: true });
   await page.setViewportSize({ width: 390, height: 844 });
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
-  expect(await page.locator(".github-pr-diff .diff-split").first().evaluate((element) => element.scrollWidth > element.clientWidth)).toBe(true);
+  expect(await page.locator(".github-pr-diff .diff-body-split").first().evaluate((element) => element.scrollWidth > element.clientWidth)).toBe(true);
   await page.screenshot({ path: "artifacts/ui-pr-diff-split-mobile.png", fullPage: true });
   await page.setViewportSize({ width: 1440, height: 1000 });
   await page.locator(".github-pr-diff").getByRole("button", { name: "통합", exact: true }).click();
-  await expect(page.locator(".github-pr-diff .diff-view")).toHaveCount(1);
-  await page.locator(".file-diff summary").first().click();
-  await expect(page.locator(".github-pr-diff .diff-view")).toHaveCount(0);
+  await expect(page.locator(".github-pr-diff .diff-body-unified")).toHaveCount(1);
+  await page.locator(".github-pr-diff .diff-file-toggle").first().click();
+  await expect(page.locator(".github-pr-diff .diff-body")).toHaveCount(0);
   await page.screenshot({ path: "artifacts/ui-pr-diff.png", fullPage: true });
 });
 
@@ -1031,7 +1151,7 @@ test("PR 병합 실패 시 버튼이 '처리 중…'을 거쳐 오류 메시지�
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "운영 대시보드" })).toBeVisible();
   await page.getByRole("button", { name: "GitHub", exact: true }).click();
-  await page.locator(".git-tabs").getByRole("button", { name: "현재 저장소", exact: true }).click();
+  await page.locator(".git-tabs").getByRole("button", { name: "깃허브", exact: true }).click();
   await page.getByRole("button", { name: "PR", exact: true }).click();
   await page.getByText("#1 테스트 PR").click();
   await expect(page.getByRole("heading", { name: "#1 테스트 PR" })).toBeVisible();
@@ -1086,4 +1206,160 @@ test("대시보드에서 사용량 카드마다 터미널 스냅샷을 볼 수 �
   await page.screenshot({ path: "artifacts/ui-usage-snapshot.png" });
   await page.getByRole("button", { name: "닫기" }).click();
   await expect(page.getByText("터미널 스냅샷")).toHaveCount(0);
+});
+
+test("채팅과 GitHub 탭에서 채팅별 브랜치와 worktree를 전환한다", async ({ page }) => {
+  const branchRequests: Record<string, unknown>[] = [];
+  let workspace = {
+    chatId: 11,
+    branch: "main",
+    path: "/workspace/sample",
+    mode: "shared",
+    dirty: false,
+    canSwitch: true,
+    branches: [
+      { name: "main", remote: false, checkedOutPath: "/workspace/sample" },
+      { name: "feature/existing", remote: false, checkedOutPath: null },
+    ],
+    worktrees: [{ path: "/workspace/agent-worktree", branch: "feature/agent", main: false, appManaged: false, assignedChatId: null }],
+  };
+  await page.route("**/api/**", async (route) => {
+    const url = new URL(route.request().url());
+    const pathname = url.pathname;
+    const responses: Record<string, unknown> = {
+      "/api/auth/me": { user: { id: 1, username: "ui-test", role: "admin" }, csrfToken: "ui-test" },
+      "/api/providers": { providers: [{ id: "codex", label: "Codex", usageWindowId: "weekly", supportsPermissionMode: false }] },
+      "/api/projects": { projects: [{ id: 1, name: "샘플 프로젝트", path: "/workspace/sample" }] },
+      "/api/chats": { chats: [{ id: 11, project_id: 1, provider: "codex", status: "stopped", title: "브랜치 작업", git_branch: workspace.branch, worktree_path: workspace.mode === "worktree" ? workspace.path : null }] },
+      "/api/chats/11/messages": { messages: [], hasMore: false },
+      "/api/projects/1/session-backups": { backups: [] },
+      "/api/models/codex": { options: { provider: "codex", models: [], efforts: [] } },
+      "/api/projects/1/git": { status: `## ${workspace.branch}`, commits: [], remotes: "" },
+      "/api/projects/1/git/changes": { changes: [] },
+      "/api/projects/1/git/diff": { diff: "" },
+      "/api/projects/1/github/repositories": { repositories: [], organizations: [] },
+      "/api/usage": { usage: [] },
+      "/api/system": { latest: null },
+      "/api/runtime": { codex: "disabled", claude: "disabled" },
+      "/api/slack": { enabled: false },
+      "/api/ntfy": { enabled: false },
+      "/api/approvals": { approvals: [] },
+    };
+    if (pathname === "/api/projects/1/git/workspace") {
+      await route.fulfill({ json: workspace });
+      return;
+    }
+    if (pathname === "/api/projects/1/git/branch" && route.request().method() === "POST") {
+      const body = JSON.parse(route.request().postData() || "{}");
+      branchRequests.push(body);
+      workspace = { ...workspace, branch: String(body.branch), mode: body.mode, path: body.mode === "worktree" ? "/data/git-worktrees/1/11" : "/workspace/sample" };
+      await route.fulfill({ json: workspace });
+      return;
+    }
+    if (pathname in responses) {
+      await route.fulfill({ json: responses[pathname] });
+      return;
+    }
+    await route.fulfill({ json: {} });
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "채팅", exact: true }).click();
+  const chatControl = page.locator(".workspace .git-branch-control");
+  await expect(page.locator(".workspace > .git-branch-control")).toHaveCount(0);
+  await expect(chatControl.locator(".git-branch-trigger code")).toHaveText("main");
+  expect(await chatControl.evaluate((element) => element.getBoundingClientRect().height)).toBeLessThan(45);
+  await chatControl.getByRole("button", { name: "Git 작업공간 변경" }).click();
+  const desktopEditor = chatControl.locator(".git-branch-editor");
+  await expect(desktopEditor).toBeVisible();
+  const desktopEditorBox = await desktopEditor.boundingBox();
+  expect(desktopEditorBox).not.toBeNull();
+  expect(desktopEditorBox!.x).toBeGreaterThanOrEqual(0);
+  expect(desktopEditorBox!.x + desktopEditorBox!.width).toBeLessThanOrEqual(1440);
+  await chatControl.getByLabel("Git 브랜치 선택").selectOption("feature/existing");
+  await chatControl.getByRole("button", { name: "전용", exact: true }).click();
+  await chatControl.getByRole("button", { name: "전환", exact: true }).click();
+  expect(branchRequests).toEqual([{ chatId: 11, branch: "feature/existing", create: false, mode: "worktree" }]);
+  await expect(chatControl.getByText("전용", { exact: true })).toBeVisible();
+  expect(await chatControl.evaluate((element) => element.getBoundingClientRect().height)).toBeLessThan(45);
+  fs.mkdirSync("artifacts", { recursive: true });
+  await page.screenshot({ path: "artifacts/ui-chat-branch-compact.png", fullPage: true });
+
+  await page.getByRole("button", { name: "GitHub", exact: true }).click();
+  await page.locator(".git-tabs").getByRole("button", { name: "로컬", exact: true }).click();
+  const gitControl = page.locator(".git-page > .git-branch-control");
+  await expect(gitControl.locator(".git-branch-trigger code")).toHaveText("feature/existing");
+  await expect(page.getByRole("heading", { name: "최근 커밋" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "전체 diff" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "브랜치 변경" })).toHaveCount(0);
+  expect(await gitControl.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await gitControl.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  expect(await page.locator(".git-main").evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
+  // GitHub 화면은 확인 전용이라 실제 브랜치 변경 메뉴를 열지 않고 현재 작업공간만 표시한다.
+  await expect(gitControl.getByRole("button", { name: "Git 작업공간 변경" })).toHaveCount(0);
+  await page.screenshot({ path: "artifacts/ui-chat-git-worktree.png", fullPage: true });
+});
+
+test("지침 편집기와 도구 상세를 데스크톱·모바일에서 렌더링한다", async ({ page }) => {
+  await page.route("**/api/**", async (route) => {
+    const pathname = new URL(route.request().url()).pathname;
+    const responses: Record<string, unknown> = {
+      "/api/auth/me": { user: { id: 1, username: "ui-test", role: "admin" }, csrfToken: "ui-test" },
+      "/api/providers": { providers: [{ id: "codex", label: "Codex" }, { id: "claude", label: "Claude" }] },
+      "/api/projects": { projects: [{ id: 1, name: "샘플 프로젝트", path: "/workspace/sample" }], defaultPath: "/workspace" },
+      "/api/chats": { chats: [] },
+      "/api/projects/1/session-backups": { backups: [] },
+      "/api/usage": { usage: [] },
+      "/api/system": { latest: null },
+      "/api/runtime": { codex: "0.2.0", claude: "1.0.0" },
+      "/api/slack": { enabled: false },
+      "/api/ntfy": { enabled: false },
+      "/api/approvals": { approvals: [] },
+      "/api/agent-accounts": { accounts: [], usageScope: "default" },
+      "/api/instructions/catalog": { project: ["AGENTS.md", "CLAUDE.md"], global: ["codex/AGENTS.md"] },
+      "/api/instructions": { content: "# 프로젝트 지침\n\n- 변경 전 화면을 직접 확인합니다.\n- 검증 후 작업 기록을 남깁니다.\n" },
+      "/api/tools/catalog": { items: [
+        { id: "claude:skills:ui-review", provider: "claude", kind: "skills", label: "UI Review", name: "ui-review", description: "화면의 정보 위계와 반응형 동작을 검토합니다.", source: "project", scope: "project", status: "active", details: { path: "skills/ui-review/SKILL.md" } },
+      ] },
+    };
+    if (pathname in responses) {
+      await route.fulfill({ json: responses[pathname] });
+      return;
+    }
+    await route.fulfill({ json: {} });
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "지침", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "AGENTS.md · CLAUDE.md" })).toBeVisible();
+  await expect(page.locator(".code-editor")).toContainText("변경 전 화면을 직접 확인합니다.");
+  await page.screenshot({ path: "artifacts/ui-instructions.png", fullPage: true });
+
+  await page.getByRole("button", { name: "도구", exact: true }).click();
+  await page.locator(".segmented").getByRole("button", { name: "Skills", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "UI Review" })).toBeVisible();
+  await page.screenshot({ path: "artifacts/ui-tools-detail.png", fullPage: true });
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(page.getByRole("heading", { name: "UI Review" })).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  await page.screenshot({ path: "artifacts/ui-tools-detail-mobile.png", fullPage: true });
+  await page.getByRole("button", { name: "지침", exact: true }).click();
+  await expect(page.locator(".code-editor")).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  await page.screenshot({ path: "artifacts/ui-instructions-mobile.png", fullPage: true });
+});
+
+test("로그인 화면을 데스크톱·모바일에서 렌더링한다", async ({ page }) => {
+  await page.route("**/api/auth/me", (route) => route.fulfill({ status: 401, json: { error: "로그인이 필요합니다." } }));
+  await page.route("**/api/auth/setup-status", (route) => route.fulfill({ json: { setupRequired: false } }));
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "web-agent-manager" })).toBeVisible();
+  await expect(page.getByLabel("아이디")).toBeVisible();
+  await page.screenshot({ path: "artifacts/ui-login.png", fullPage: true });
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  await page.screenshot({ path: "artifacts/ui-login-mobile.png", fullPage: true });
 });

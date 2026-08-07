@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import { Router } from "express";
 import type { AppDatabase } from "../core/database";
 import { requireAdmin, type AuthenticatedRequest } from "../core/auth";
+import { requireTrustedNetwork } from "../core/network";
 import { writeAudit } from "../core/audit";
 import { resolveProjectPath } from "./helpers";
 import type { Provider } from "../../shared/types";
@@ -748,7 +749,7 @@ export function createToolRouter(database: AppDatabase): Router {
       next(error);
     }
   });
-  router.delete("/tools/mcp/:provider/:scope/:name", requireAdmin, (request: AuthenticatedRequest, response, next) => {
+  router.delete("/tools/mcp/:provider/:scope/:name", requireAdmin, requireTrustedNetwork, (request: AuthenticatedRequest, response, next) => {
     try {
       const provider = String(request.params.provider) as Provider;
       if (!["claude", "codex"].includes(provider)) throw new Error("지원하지 않는 MCP 공급자입니다.");

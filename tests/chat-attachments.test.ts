@@ -1,3 +1,4 @@
+import type { AgentAccountService } from "../src/server/services/agent-accounts";
 import { once } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
@@ -11,6 +12,7 @@ import type { SessionManager } from "../src/server/services/session-manager";
 import type { ProviderAdapter } from "../src/server/providers/provider";
 import { HistoryCache } from "../src/server/services/history-cache";
 import { createProjectRouter } from "../src/server/routes/project-routes";
+import type { GitWorkspaceService } from "../src/server/services/git-workspaces";
 
 let closeServer: (() => Promise<void>) | undefined;
 
@@ -23,7 +25,7 @@ afterEach(async () => {
 function stubDatabase(projectPath: string): AppDatabase {
   return {
     prepare: (sql: string) => {
-      if (sql.includes("FROM chats c JOIN projects p")) return { get: () => ({ project_path: projectPath }) };
+      if (sql.includes("FROM chats c JOIN projects p")) return { get: () => ({ project_id: 1, project_path: projectPath }) };
       return { get: () => undefined, run: () => ({ changes: 0 }), all: () => [] };
     },
   } as unknown as AppDatabase;
@@ -34,7 +36,7 @@ describe("채팅 첨부 파일 API", () => {
     const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "web-agent-manager-attach-"));
     const app = express();
     app.use((request: any, _response, next) => { request.authUser = { id: 1, username: "tester", role: "admin" }; next(); });
-    app.use(createProjectRouter(stubDatabase(projectDir), {} as AppConfig, {} as SessionManager, [] as ProviderAdapter[], new HistoryCache()));
+    app.use(createProjectRouter(stubDatabase(projectDir), {} as AppConfig, {} as SessionManager, [] as ProviderAdapter[], {} as AgentAccountService, new HistoryCache()));
     const server = app.listen(0, "127.0.0.1");
     await once(server, "listening");
     closeServer = () => new Promise((resolve, reject) => {
@@ -61,7 +63,7 @@ describe("채팅 첨부 파일 API", () => {
     fs.symlinkSync(outsideDir, path.join(projectDir, ".web-agent-manager-uploads"));
     const app = express();
     app.use((request: any, _response, next) => { request.authUser = { id: 1, username: "tester", role: "admin" }; next(); });
-    app.use(createProjectRouter(stubDatabase(projectDir), {} as AppConfig, {} as SessionManager, [] as ProviderAdapter[], new HistoryCache()));
+    app.use(createProjectRouter(stubDatabase(projectDir), {} as AppConfig, {} as SessionManager, [] as ProviderAdapter[], {} as AgentAccountService, new HistoryCache()));
     app.use((error: unknown, _request: express.Request, response: express.Response, _next: express.NextFunction) => {
       response.status(400).json({ error: error instanceof Error ? error.message : "오류" });
     });
@@ -81,5 +83,31 @@ describe("채팅 첨부 파일 API", () => {
     expect(fs.readdirSync(outsideDir)).toEqual([]);
     fs.rmSync(projectDir, { recursive: true, force: true });
     fs.rmSync(outsideDir, { recursive: true, force: true });
+  });
+
+  it("전용 worktree 채팅은 같은 상대 경로로 첨부 파일을 복제한다", async () => {
+    const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "web-agent-manager-attach-project-"));
+    const worktreeDir = fs.mkdtempSync(path.join(os.tmpdir(), "web-agent-manager-attach-worktree-"));
+    const gitWorkspaces = { workspacePath: () => worktreeDir } as unknown as GitWorkspaceService;
+    const app = express();
+    app.use((request: any, _response, next) => { request.authUser = { id: 1, username: "tester", role: "admin" }; next(); });
+    app.use(createProjectRouter(stubDatabase(projectDir), {} as AppConfig, {} as SessionManager, [] as ProviderAdapter[], {} as AgentAccountService, new HistoryCache(), undefined, gitWorkspaces));
+    const server = app.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    closeServer = () => new Promise((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+    });
+    const { port } = server.address() as AddressInfo;
+
+    const form = new FormData();
+    form.append("file", new Blob(["worktree attachment"], { type: "text/plain" }), "note.txt");
+    const response = await fetch(`http://127.0.0.1:${port}/chats/41/attachments`, { method: "POST", body: form });
+    const body = await response.json();
+
+    expect(response.status).toBe(201);
+    expect(fs.readFileSync(path.join(projectDir, body.uploads[0].path), "utf8")).toBe("worktree attachment");
+    expect(fs.readFileSync(path.join(worktreeDir, body.uploads[0].path), "utf8")).toBe("worktree attachment");
+    fs.rmSync(projectDir, { recursive: true, force: true });
+    fs.rmSync(worktreeDir, { recursive: true, force: true });
   });
 });

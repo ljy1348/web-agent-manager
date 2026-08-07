@@ -7,6 +7,8 @@ import type { ProviderAdapter, HistorySession } from "../providers/provider";
 import type { RealtimeHub } from "./realtime";
 import type { Notifier } from "./notifier";
 import type { HistoryCache } from "./history-cache";
+import type { ApprovalService } from "./approval";
+import type { AgentAccountService } from "./agent-accounts";
 import { setChatBusy } from "../core/chat-busy";
 
 // 세션 저장소 아래의 JSONL 파일을 재귀적으로 찾는다. Task 도구로 뜬 서브에이전트 기록
@@ -61,6 +63,8 @@ export class HistorySynchronizer {
     private readonly realtime: RealtimeHub,
     private readonly notifications: Notifier,
     private readonly historyCache: HistoryCache,
+    private readonly approvals: ApprovalService,
+    private readonly accounts: AgentAccountService,
   ) {}
 
   // 초기 전체 스캔 후 주기적인 증분 동기화를 시작한다.
@@ -75,26 +79,29 @@ export class HistorySynchronizer {
     if (this.timer) clearInterval(this.timer);
   }
 
-  // 모든 공급자의 변경된 JSONL 파일을 동기화한다.
+  // 모든 공급자의 변경된 JSONL 파일을 동기화한다. 계정마다 설정 디렉터리가 달라 기록 루트도 갈라지므로
+  // 등록된 계정 전부를 훑는다 — 한 루트만 보면 다른 계정에서 만든 채팅이 목록에 아예 나타나지 않는다.
   syncAll(notifyCompletion = false): void {
     for (const adapter of this.adapters) {
-      for (const file of findJsonlFiles(adapter.historyRoot)) {
-        let mtime: number;
-        try {
-          mtime = fs.statSync(file).mtimeMs;
-        } catch {
-          continue;
-        }
-        if (this.seenMtime.get(file) === mtime) continue;
-        if (adapter.isHiddenHistoryFile?.(file)) {
-          this.removeHiddenChat(adapter, file);
+      for (const account of this.accounts.list(adapter.id)) {
+        for (const file of findJsonlFiles(adapter.historyRootFor(account.config_dir))) {
+          let mtime: number;
+          try {
+            mtime = fs.statSync(file).mtimeMs;
+          } catch {
+            continue;
+          }
+          if (this.seenMtime.get(file) === mtime) continue;
+          if (adapter.isHiddenHistoryFile?.(file)) {
+            this.removeHiddenChat(adapter, file);
+            this.seenMtime.set(file, mtime);
+            continue;
+          }
+          const session = this.historyCache.get(adapter, file);
+          if (!session || !isAllowedProject(session.cwd, this.config.allowedRoots)) continue;
+          this.persist(adapter, session, notifyCompletion, account.id);
           this.seenMtime.set(file, mtime);
-          continue;
         }
-        const session = this.historyCache.get(adapter, file);
-        if (!session || !isAllowedProject(session.cwd, this.config.allowedRoots)) continue;
-        this.persist(adapter, session, notifyCompletion);
-        this.seenMtime.set(file, mtime);
       }
     }
   }
@@ -109,20 +116,41 @@ export class HistorySynchronizer {
   }
 
   // 파싱한 세션과 메시지를 중복 없이 데이터베이스에 반영한다.
-  private persist(adapter: ProviderAdapter, session: HistorySession, notifyCompletion: boolean): void {
+  // accountId는 이 기록 파일이 발견된 계정 슬롯으로, 채팅이 어느 계정에서 만들어졌는지의 실제 근거다.
+  private persist(adapter: ProviderAdapter, session: HistorySession, notifyCompletion: boolean, accountId: number): void {
     const transaction = this.database.transaction(() => {
       const normalizedPath = fs.realpathSync(session.cwd);
-      this.database.prepare(`
-        INSERT INTO projects(name, path, source, updated_at)
-        VALUES (?, ?, 'discovered', CURRENT_TIMESTAMP)
-        ON CONFLICT(path) DO UPDATE SET updated_at = CURRENT_TIMESTAMP
-      `).run(path.basename(normalizedPath), normalizedPath);
-      const project = this.database.prepare("SELECT id FROM projects WHERE path = ?").get(normalizedPath) as { id: number };
+      // 채팅 전용 worktree에서 실행하면 세션 cwd가 worktree 경로다. 그 경로로 프로젝트를 새로 만들면
+      // worktree마다 "193" 같은 별도 프로젝트가 생기고 대화 기록이 그쪽으로 흘러가, 정작 채팅이 속한
+      // 원본 프로젝트 화면에서는 답변이 보이지 않았다(실사용 보고, 2026-08-07). worktree는 같은
+      // 프로젝트의 다른 작업공간이므로 그 worktree를 쓰는 채팅의 프로젝트로 귀속시킨다.
+      // worktree_path가 그 프로젝트의 checkout 경로와 같은 행이 과거 데이터에 있어(정상 상태에서는 NULL),
+      // 그대로 두면 일반 프로젝트 세션까지 worktree로 오판한다 — 프로젝트 경로와 다른 경우만 인정한다.
+      const worktreeOwner = this.database.prepare(`
+        SELECT c.id, c.project_id AS projectId FROM chats c JOIN projects p ON p.id = c.project_id
+        WHERE c.worktree_path = ? AND c.provider = ? AND c.worktree_path <> p.path
+        ORDER BY c.id DESC LIMIT 1
+      `).get(normalizedPath, session.provider) as { id: number; projectId: number; branch: string | null } | undefined;
+      let project: { id: number };
+      if (worktreeOwner) {
+        project = { id: worktreeOwner.projectId };
+      } else {
+        this.database.prepare(`
+          INSERT INTO projects(name, path, source, updated_at)
+          VALUES (?, ?, 'discovered', CURRENT_TIMESTAMP)
+          ON CONFLICT(path) DO UPDATE SET updated_at = CURRENT_TIMESTAMP
+        `).run(path.basename(normalizedPath), normalizedPath);
+        project = this.database.prepare("SELECT id FROM projects WHERE path = ?").get(normalizedPath) as { id: number };
+      }
       let chat = this.database.prepare("SELECT id FROM chats WHERE provider = ? AND provider_session_id = ?").get(session.provider, session.sessionId) as { id: number } | undefined;
+      // worktree 채팅은 프로젝트 경로가 아니라 worktree 경로로 찾아야 아래 경로 매칭에서 놓치지 않는다.
+      if (!chat && worktreeOwner) {
+        chat = this.database.prepare("SELECT id FROM chats WHERE id = ? AND provider_session_id IS NULL").get(worktreeOwner.id) as { id: number } | undefined;
+      }
       if (!chat) {
         chat = this.database.prepare(`
           SELECT c.id FROM chats c JOIN projects p ON p.id = c.project_id
-          WHERE c.provider = ? AND c.provider_session_id IS NULL AND p.path = ?
+          WHERE c.provider = ? AND c.provider_session_id IS NULL AND p.path = ? AND c.worktree_path IS NULL
           ORDER BY c.created_at DESC LIMIT 1
         `).get(session.provider, normalizedPath) as { id: number } | undefined;
       }
@@ -130,21 +158,35 @@ export class HistorySynchronizer {
       // 이름, 없으면 aiTitle)이 있으면 그걸, 없으면 원래대로 첫 메시지 기반 제목을 쓴다.
       const preferredTitle = session.displayTitle?.trim() || session.title;
       if (chat) {
+        // 귀속 규칙이 바뀌기 전에 만들어진 채팅은 다음 동기화에서 provider_session_id로 곧바로 찾아져
+        // 프로젝트가 다시 계산되지 않았다. worktree 세션이 별도 프로젝트에 붙어 원본 화면에서 보이지
+        // 않던 문제라, 기존 채팅도 매번 올바른 프로젝트로 되돌린다.
+        this.database.prepare("UPDATE chats SET project_id = ? WHERE id = ? AND project_id != ?")
+          .run(project.id, chat.id, project.id);
+        // 세션이 worktree에서 돌고 있으면 그 경로·브랜치도 채팅에 남긴다. 이게 없으면 목록에서
+        // worktree 묶음이 아니라 프로젝트 채팅 묶음에 섞여 "워크트리 채팅이 안 보인다"가 된다.
+        if (worktreeOwner) {
+          this.database.prepare("UPDATE chats SET worktree_path = ?, git_branch = COALESCE(git_branch, ?) WHERE id = ?")
+            .run(normalizedPath, worktreeOwner.branch, chat.id);
+        }
         // title_source가 'manual'(SessionManager.renameSession으로 사람이 직접 이름을 바꾼 경우)이면
         // 절대 덮어쓰지 않는다. 그 외(아직 아무도 안 바꾼 채팅 전부, 기존 행 포함 — NULL도 여기 해당)는
         // 매 동기화마다 그 시점 최선의 제목으로 계속 갱신한다.
+        // 기록 파일이 실제로 놓인 계정이 그 채팅의 계정이다. 계정을 옮긴 뒤 새로 만들어진 세션도
+        // 이 경로로 올바른 계정에 다시 붙는다.
         this.database.prepare(`
-          UPDATE chats SET provider_session_id = ?, history_file = ?,
+          UPDATE chats SET provider_session_id = ?, history_file = ?, account_id = ?,
             title = CASE WHEN title_source = 'manual' THEN title ELSE ? END,
             updated_at = ?, status = CASE WHEN status = 'starting' THEN 'running' ELSE status END
           WHERE id = ?
-        `).run(session.sessionId, session.historyFile, preferredTitle, session.updatedAt, chat.id);
+        `).run(session.sessionId, session.historyFile, accountId, preferredTitle, session.updatedAt, chat.id);
       } else {
         const tmuxSuffix = crypto.createHash("sha256").update(`${session.provider}:${session.sessionId}`).digest("hex").slice(0, 16);
         const result = this.database.prepare(`
-          INSERT INTO chats(project_id, provider, provider_session_id, tmux_name, status, title, history_file, created_at, updated_at)
-          VALUES (?, ?, ?, ?, 'stopped', ?, ?, ?, ?)
-        `).run(project.id, session.provider, session.sessionId, `web_agent_manager_${tmuxSuffix}`, preferredTitle, session.historyFile, session.createdAt, session.updatedAt);
+          INSERT INTO chats(project_id, provider, account_id, provider_session_id, tmux_name, status, title, history_file, worktree_path, git_branch, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, 'stopped', ?, ?, ?, ?, ?, ?)
+        `).run(project.id, session.provider, accountId, session.sessionId, `web_agent_manager_${tmuxSuffix}`, preferredTitle, session.historyFile,
+          worktreeOwner ? normalizedPath : null, worktreeOwner?.branch ?? null, session.createdAt, session.updatedAt);
         chat = { id: Number(result.lastInsertRowid) };
       }
       return { chatId: chat.id };
@@ -185,6 +227,10 @@ export class HistorySynchronizer {
     } else {
       if (decision.markBusy) setChatBusy(this.database, this.realtime, chatId, true);
       if (decision.clearBusy) setChatBusy(this.database, this.realtime, chatId, false);
+    }
+    // Claude가 턴을 끝냈다면 훅 요청에도 더 이상 응답을 기다리지 않으므로 유실된 HTTP 대기를 정리한다.
+    if (adapter.id === "claude" && decision.notifyCompletion) {
+      this.approvals.closeCompletedClaudeApprovals(chatId, "Claude 응답이 완료되어 자동으로 정리되었습니다.");
     }
     if (decision.notifyCompletion && notifyCompletion) {
       const completionKey = session.turnEndedAt ?? last?.id ?? session.updatedAt;

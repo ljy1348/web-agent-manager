@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import {
-  Download, File, FileArchive, FilePlus2, FileText, Film, FolderOpen, Image, Music, Upload, X,
+  Download, File, FileArchive, FilePlus2, FileText, Film, FolderOpen, Image, Music, Pencil, Upload, X,
 } from "lucide-react";
 import { api } from "../../api";
 import { isImagePath, MessageBody } from "../../lib/attachments";
@@ -31,9 +31,9 @@ function fileDate(value: unknown): string {
 }
 
 // 파일 미리보기 원본을 경로 세그먼트별로 인코딩한 API URL로 만든다.
-export function fileContentUrl(projectId: number, filePath: string): string {
+export function fileContentUrl(projectId: number, filePath: string, chatId?: number | null): string {
   const encodedPath = filePath.split("/").filter(Boolean).map(encodeURIComponent).join("/");
-  return `/api/projects/${projectId}/files/content/${encodedPath}`;
+  return `/api/projects/${projectId}/files/content/${encodedPath}${chatId ? `?chatId=${chatId}` : ""}`;
 }
 
 // 파일 확장자에 맞는 목록 아이콘을 선택한다.
@@ -46,9 +46,14 @@ function FileIcon({ path }: { path: string }): React.ReactElement {
   return <File aria-hidden="true" />;
 }
 
+// 서버가 텍스트로 판정했고 전체 내용을 받은 파일만 편집을 허용한다(잘린 내용으로 저장하면 뒷부분이 사라짐).
+function isEditable(preview: Json | null): boolean {
+  return !!preview?.previewable && !preview.truncated && (preview.kind === "text" || preview.kind === "markdown");
+}
+
 // 서버가 판정한 파일 종류에 맞는 미리보기 본문을 렌더링한다.
-function PreviewContent({ preview, project, openProjectFile }: { preview: Json; project: Json; openProjectFile: (path: string) => void }): React.ReactElement {
-  const url = fileContentUrl(project.id, preview.path);
+function PreviewContent({ preview, project, chatId, openProjectFile }: { preview: Json; project: Json; chatId?: number | null; openProjectFile: (path: string) => void }): React.ReactElement {
+  const url = fileContentUrl(project.id, preview.path, chatId);
   if (!preview.previewable) return <p className="muted">{preview.reason || "미리볼 수 없는 파일입니다."}</p>;
   if (preview.kind === "markdown") {
     const linkBasePath = preview.path.split("/").slice(0, -1).join("/");
@@ -64,20 +69,25 @@ function PreviewContent({ preview, project, openProjectFile }: { preview: Json; 
 }
 
 // 선택 프로젝트의 파일 목록과 탐색·업로드·형식별 미리보기를 제공한다.
-export function FilesView({ project, target, onNavigate }: { project: Json | null; target?: FileTarget | null; onNavigate?: (path: string) => void }): React.ReactElement {
+export function FilesView({ project, chat, target, onNavigate }: { project: Json | null; chat?: Json | null; target?: FileTarget | null; onNavigate?: (path: string) => void }): React.ReactElement {
+  // 선택한 채팅이 전용 worktree를 쓰면 파일 탭도 그 폴더를 봐야 한다.
+  const chatQuery = chat?.id ? `&chatId=${chat.id}` : "";
   const [directory, setDirectory] = useState("");
   const [entries, setEntries] = useState<Json[]>([]);
   const [preview, setPreview] = useState<Json | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [listError, setListError] = useState("");
   const [uploadCount, setUploadCount] = useState(0);
+  const [draft, setDraft] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [editStatus, setEditStatus] = useState("");
   const input = useRef<HTMLInputElement>(null);
 
   // 지정 디렉터리의 목록을 불러오고 현재 탐색 위치를 갱신한다.
   async function loadDirectory(nextPath: string, clearPreview = true): Promise<Json[]> {
     if (!project) return [];
     try {
-      const data = await api(`/projects/${project.id}/files?path=${encodeURIComponent(nextPath)}`);
+      const data = await api(`/projects/${project.id}/files?path=${encodeURIComponent(nextPath)}${chatQuery}`);
       const nextEntries = data.entries || [];
       setDirectory(nextPath);
       setEntries(nextEntries);
@@ -90,13 +100,21 @@ export function FilesView({ project, target, onNavigate }: { project: Json | nul
     }
   }
 
+  // 편집 중인 내용을 버리고 다른 곳으로 이동해도 되는지 사용자에게 확인한다.
+  function confirmDiscard(): boolean {
+    if (draft === null) return true;
+    return window.confirm("편집 중인 내용이 저장되지 않았습니다. 변경을 버리고 이동할까요?");
+  }
+
   // 서버의 형식 판정을 읽어 선택 파일의 미리보기를 연다.
   async function previewFile(filePath: string): Promise<void> {
     if (!project) return;
+    setDraft(null);
+    setEditStatus("");
     setPreviewLoading(true);
     setPreview({ path: filePath, previewable: true, kind: "loading" });
     try {
-      const data = await api(`/projects/${project.id}/files/preview?path=${encodeURIComponent(filePath)}`);
+      const data = await api(`/projects/${project.id}/files/preview?path=${encodeURIComponent(filePath)}${chatQuery}`);
       setPreview({ ...data, path: filePath });
     } catch (error) {
       setPreview({ path: filePath, previewable: false, reason: error instanceof Error ? error.message : "미리보기 실패" });
@@ -122,6 +140,8 @@ export function FilesView({ project, target, onNavigate }: { project: Json | nul
   }
 
   useEffect(() => {
+    setDraft(null);
+    setEditStatus("");
     if (!project) {
       setDirectory("");
       setEntries([]);
@@ -131,21 +151,40 @@ export function FilesView({ project, target, onNavigate }: { project: Json | nul
     const targetPath = target && target.projectId === project.id ? target.path : null;
     if (targetPath !== null) void revealPath(targetPath);
     else void loadDirectory("");
-  }, [project?.id, target?.requestId]);
+  }, [project?.id, chat?.id, target?.requestId]);
 
   // 선택한 파일들을 현재 디렉터리에 업로드한 뒤 목록을 갱신한다.
   async function upload(): Promise<void> {
     if (!project || !input.current?.files?.length) return;
     const form = new FormData();
     Array.from(input.current.files).forEach((file) => form.append("files", file));
-    await api(`/projects/${project.id}/files/upload?path=${encodeURIComponent(directory)}`, { method: "POST", body: form });
+    await api(`/projects/${project.id}/files/upload?path=${encodeURIComponent(directory)}${chatQuery}`, { method: "POST", body: form });
     input.current.value = "";
     setUploadCount(0);
     await loadDirectory(directory);
   }
 
+  // 편집 중인 텍스트를 저장하고 미리보기와 목록의 크기·수정 시각을 갱신한다.
+  async function saveDraft(): Promise<void> {
+    if (!project || !preview || draft === null) return;
+    setSaving(true);
+    setEditStatus("");
+    try {
+      await api(`/projects/${project.id}/files/content?chatId=${chat?.id ?? ""}`, { method: "PUT", body: JSON.stringify({ path: preview.path, content: draft }) });
+      setDraft(null);
+      await previewFile(preview.path);
+      await loadDirectory(directory, false);
+      setEditStatus("저장했습니다.");
+    } catch (error) {
+      setEditStatus(error instanceof Error ? error.message : "저장하지 못했습니다.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
   // 목록 항목의 기본 동작을 폴더 진입 또는 파일 미리보기로 연결한다.
   function openEntry(entry: Json, relativePath: string): void {
+    if (!confirmDiscard()) return;
     onNavigate?.(relativePath);
     if (entry.directory) void loadDirectory(relativePath);
     else void previewFile(relativePath);
@@ -172,20 +211,32 @@ export function FilesView({ project, target, onNavigate }: { project: Json | nul
         className={`file-row ${entry.directory ? "file-folder" : "file-item"}${preview?.path === relativePath ? " active" : ""}`}
       >
         <button type="button" className="file-row-open" title={entry.name} aria-label={`${entry.directory ? "폴더 열기" : "파일 미리보기"}: ${entry.name}`} onClick={() => openEntry(entry, relativePath)}>
-          {image && <span className="file-thumb"><img src={fileContentUrl(project.id, relativePath)} alt={entry.name} loading="lazy" /></span>}
+          {image && <span className="file-thumb"><img src={fileContentUrl(project.id, relativePath, chat?.id)} alt={entry.name} loading="lazy" /></span>}
           {!image && <span className="file-row-icon">{entry.directory ? <FolderOpen aria-hidden="true" /> : <FileIcon path={relativePath} />}</span>}
           <b>{entry.name}</b>
         </button>
         <span className="file-row-size">{entry.directory ? "-" : bytes(entry.size)}</span>
         <time className="file-row-modified" dateTime={entry.modifiedAt || undefined}>{fileDate(entry.modifiedAt)}</time>
-        <div className="file-actions">{!entry.directory && <a title="다운로드" aria-label={`${entry.name} 다운로드`} href={`/api/projects/${project?.id}/files/download?path=${encodeURIComponent(relativePath)}`}><Download /></a>}</div>
+        <div className="file-actions">{!entry.directory && <a title="다운로드" aria-label={`${entry.name} 다운로드`} href={`/api/projects/${project?.id}/files/download?path=${encodeURIComponent(relativePath)}${chatQuery}`}><Download /></a>}</div>
       </div>;
     })}
       {!entries.length && <p className="file-list-empty">이 폴더는 비어 있습니다.</p>}
     </div>
-    {preview && <aside className="file-preview" role="dialog" aria-modal="true" aria-label={`${preview.path} 미리보기`}><div className="git-box-head"><h3>미리보기</h3><button type="button" title="미리보기 닫기" aria-label="미리보기 닫기" onClick={() => { setPreview(null); onNavigate?.(directory); }}><X /></button></div>
+    {preview && <aside className="file-preview" role="dialog" aria-modal="true" aria-label={`${preview.path} 미리보기`}><div className="git-box-head"><h3>{draft === null ? "미리보기" : "편집"}</h3><div className="file-preview-head-actions">
+      {draft === null && isEditable(preview) && <button type="button" title="편집" aria-label={`${preview.path} 편집`} onClick={() => { setDraft(preview.content || ""); setEditStatus(""); }}><Pencil /></button>}
+      <button type="button" title="미리보기 닫기" aria-label="미리보기 닫기" onClick={() => { if (!confirmDiscard()) return; setDraft(null); setPreview(null); onNavigate?.(directory); }}><X /></button>
+    </div></div>
       {preview && <strong>{preview.path}</strong>}
-      {previewLoading ? <p className="muted">불러오는 중...</p> : preview && project ? <PreviewContent preview={preview} project={project} openProjectFile={(path) => { onNavigate?.(path); void revealPath(path); }} /> : <p className="muted">파일을 선택하면 형식에 맞는 미리보기가 표시됩니다.</p>}
+      {previewLoading ? <p className="muted">불러오는 중...</p> : draft !== null ? <>
+        <textarea className="file-preview-editor" value={draft} onChange={(event) => setDraft(event.target.value)} spellCheck={false} aria-label={`${preview.path} 내용 편집`} />
+        <div className="file-edit-actions">
+          <button type="button" className="primary" disabled={saving} onClick={() => void saveDraft()}>{saving ? "저장 중..." : "저장"}</button>
+          <button type="button" disabled={saving} onClick={() => { if (!confirmDiscard()) return; setDraft(null); setEditStatus(""); }}>취소</button>
+          {editStatus && <span className="inline-status">{editStatus}</span>}
+        </div>
+      </> : preview && project ? <><PreviewContent preview={preview} project={project} chatId={chat?.id} openProjectFile={(path) => { if (!confirmDiscard()) return; onNavigate?.(path); void revealPath(path); }} />
+        {editStatus && <p className="inline-status">{editStatus}</p>}
+      </> : <p className="muted">파일을 선택하면 형식에 맞는 미리보기가 표시됩니다.</p>}
     </aside>}</div>
   </section>;
 }

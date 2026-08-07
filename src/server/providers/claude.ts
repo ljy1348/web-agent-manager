@@ -403,8 +403,14 @@ export class ClaudeAdapter implements ProviderAdapter {
   readonly id = "claude" as const;
   readonly displayLabel = "Claude";
   readonly usageWindowId = "session";
+  readonly usageResetWindowIds = ["session", "weekly_all"];
   readonly cliVersionCommand = { command: "claude", args: ["--version"] };
   readonly historyRoot = path.join(os.homedir(), ".claude", "projects");
+
+  // CLAUDE_CONFIG_DIR를 지정하면 Claude가 그 폴더 아래에 projects/를 새로 만들어 기록을 남긴다.
+  historyRootFor(configDir: string | null): string {
+    return configDir ? path.join(configDir, "projects") : this.historyRoot;
+  }
   readonly usageCommands = ["/usage"];
   readonly promptQuirks = {
     usageCommandDelayMs: 8_000,
@@ -424,6 +430,11 @@ export class ClaudeAdapter implements ProviderAdapter {
     const args = ["--settings", this.settingsFile];
     if (resumeSessionId) args.push("--resume", resumeSessionId);
     return { command: "claude", args, env: this.hookEnvironment };
+  }
+
+  // 상태 조회는 인증·내장 명령만 유지하고 훅·MCP·플러그인과 장식 렌더링을 생략한다.
+  createMonitorLaunch(_cwd: string): ProviderLaunch {
+    return { command: "claude", args: ["--safe-mode", "--ax-screen-reader"] };
   }
 
   // Claude 세션 기록 파일을 공통 세션 형태로 변환한다.

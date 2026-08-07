@@ -37,7 +37,12 @@ import { AgentIntegrationManager } from "./services/agent-integration";
 import { createAgentIntegrationRouter } from "./routes/agent-integration-routes";
 import { createAgentDelegationRouter } from "./routes/agent-delegation-routes";
 import { CliAuthManager } from "./services/cli-auth";
+import { AgentAccountService } from "./services/agent-accounts";
 import { createCliAuthRouter } from "./routes/cli-auth-routes";
+import { createAgentAccountRouter } from "./routes/agent-account-routes";
+import { GitWorkspaceService } from "./services/git-workspaces";
+import { IdleChatReaper } from "./services/idle-chat-reaper";
+import { UsageResetNotifier } from "./services/usage-reset-notifier";
 
 // 이름 변경 전 남은 비활성 Unix 소켓만 제거해 새 브리지 경로와 혼동되지 않게 한다.
 function removeLegacyAgentSocket(dataDir: string): void {
@@ -67,13 +72,16 @@ async function main(): Promise<void> {
   const notifications = new NotificationHub([slack, ntfy]);
   const approvals = new ApprovalService(config, database, realtime, notifications);
   const adapters = [new CodexAdapter(), new ClaudeAdapter(runtime.claudeSettingsFile, runtime.hookEnvironment)];
-  const sessions = new SessionManager(database, adapters, realtime, approvals, notifications);
+  const accounts = new AgentAccountService(config, database);
+  const sessions = new SessionManager(database, adapters, realtime, approvals, notifications, accounts);
   const historyCache = new HistoryCache();
   const backups = new SessionBackupService(config, database, adapters, historyCache);
-  const history = new HistorySynchronizer(config, database, adapters, realtime, notifications, historyCache);
-  const usage = new UsageMonitor(database, adapters, realtime);
+  const history = new HistorySynchronizer(config, database, adapters, realtime, notifications, historyCache, approvals, accounts);
+  const usageResetNotifier = new UsageResetNotifier(database, notifications, realtime, adapters);
+  const usage = new UsageMonitor(database, adapters, realtime, accounts, usageResetNotifier);
   const metrics = new SystemMetricsService(realtime, database);
   const rateLimitResume = new RateLimitResumeService(database, sessions, notifications, realtime, adapters);
+  const idleChatReaper = new IdleChatReaper(database, (chatId) => sessions.stop(chatId, null));
   const agentBridge = new AgentBridge({
     database,
     adapters,
@@ -81,13 +89,14 @@ async function main(): Promise<void> {
     sessions,
     socketPath: path.join(config.dataDir, "web-agent-manager-agent.sock"),
   });
-  const agentIntegrations = new AgentIntegrationManager(config);
-  const cliAuth = new CliAuthManager(config, realtime);
+  const agentIntegrations = new AgentIntegrationManager(config, database);
+  const cliAuth = new CliAuthManager(config, realtime, accounts);
+  const gitWorkspaces = new GitWorkspaceService(database, config);
 
   app.disable("x-powered-by");
   app.use(createHttpSecurityHeaders(config.publicUrl, process.env.NODE_ENV !== "production"));
   app.use(express.json({ limit: "2mb" }));
-  app.use(createNetworkCapability(config.trustedNetworks?.length ? config.trustedNetworks : DEFAULT_TRUSTED_NETWORKS));
+  app.use(createNetworkCapability(config.trustedNetworks?.length ? config.trustedNetworks : DEFAULT_TRUSTED_NETWORKS, Boolean(config.trustedProxies?.length)));
   app.use(createSessionLoader(database));
   app.use(createRequestLogger());
   app.get("/health", (_request, response) => response.json({ ok: true }));
@@ -98,15 +107,16 @@ async function main(): Promise<void> {
   });
   app.use("/api", requireAuth, requireCsrf);
   app.post("/api/logs/client", createClientLogHandler());
-  app.use("/api", createProjectRouter(database, config, sessions, adapters, historyCache, backups));
-  app.use("/api", createFileRouter(database));
-  app.use("/api", createInstructionRouter(database));
-  app.use("/api", createGitRouter(database));
+  app.use("/api", createProjectRouter(database, config, sessions, adapters, accounts, historyCache, backups, gitWorkspaces));
+  app.use("/api", createFileRouter(database, gitWorkspaces));
+  app.use("/api", createInstructionRouter(database, gitWorkspaces));
+  app.use("/api", createGitRouter(database, gitWorkspaces));
   app.use("/api", createToolRouter(database));
   app.use("/api", createAgentIntegrationRouter(database, agentIntegrations));
   app.use("/api", createCliAuthRouter(database, cliAuth));
+  app.use("/api", createAgentAccountRouter(database, accounts, cliAuth, usage, sessions));
   app.use("/api", createAgentDelegationRouter(database, agentBridge));
-  app.use("/api", createOperationsRouter(database, approvals, usage, metrics, slack, ntfy, adapters));
+  app.use("/api", createOperationsRouter(database, approvals, usage, metrics, slack, ntfy, adapters, idleChatReaper));
 
   if (process.env.NODE_ENV === "production") {
     const clientDir = path.join(config.rootDir, "dist", "client");
@@ -131,12 +141,17 @@ async function main(): Promise<void> {
   }
   removeLegacyAgentSocket(config.dataDir);
   await agentBridge.start();
+  await agentIntegrations.initialize();
+  await cliAuth.initialize();
+  await gitWorkspaces.initialize();
   server.listen(config.port, config.host, () => process.stdout.write(`web-agent-manager: ${config.publicUrl}\n`));
   history.start();
   sessions.restore();
   metrics.start();
+  if (config.runtimeEnabled) usageResetNotifier.start();
   if (config.runtimeEnabled) usage.start();
   if (config.runtimeEnabled) rateLimitResume.start();
+  if (config.runtimeEnabled) idleChatReaper.start();
 
   // 종료 신호에서 앱 소유 자원만 닫고 tmux 채팅은 유지한다.
   let shuttingDown = false;
@@ -144,7 +159,9 @@ async function main(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     if (config.runtimeEnabled) usage.stop();
+    if (config.runtimeEnabled) usageResetNotifier.stop();
     if (config.runtimeEnabled) rateLimitResume.stop();
+    if (config.runtimeEnabled) idleChatReaper.stop();
     metrics.stop();
     history.stop();
     sessions.close();

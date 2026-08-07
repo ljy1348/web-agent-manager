@@ -84,4 +84,58 @@ describe("ApprovalService.handleClaudeHook 중복 방지", () => {
     expect(calls[0].eventType).toBe("approval_requested");
     expect(calls[0].text).toContain("요청: 1. Resume from summary");
   });
+
+  it("작업 중인 Claude 훅 요청은 웹 목록에서 닫지 못하게 한다", async () => {
+    const database = createTestDatabase();
+    const chatId = createChat(database);
+    database.prepare("UPDATE chats SET busy = 1 WHERE id = ?").run(chatId);
+    const service = new ApprovalService(loadConfig(), database, new RealtimeHub(fakeHttpServer(), database), new SlackNotifier(loadConfig(), database));
+    const pendingResult = service.handleClaudeHook({ session_id: "s1", tool_name: "Bash", tool_input: { command: "ls" } });
+    const approval = database.prepare("SELECT id FROM approvals WHERE status = 'pending'").get() as { id: string };
+
+    expect(() => service.dismiss(approval.id, { id: 1, username: "admin", role: "admin" })).toThrow("실제로 기다리고 있어");
+
+    service.decide(approval.id, "decline", { id: 1, username: "admin", role: "admin" });
+    await pendingResult;
+  });
+
+  it("완료된 채팅에 남은 Claude 훅 요청은 닫고 HTTP 대기도 해제한다", async () => {
+    const database = createTestDatabase();
+    createChat(database);
+    const service = new ApprovalService(loadConfig(), database, new RealtimeHub(fakeHttpServer(), database), new SlackNotifier(loadConfig(), database));
+    const pendingResult = service.handleClaudeHook({ session_id: "s1", tool_name: "AskUserQuestion", tool_input: { question: "선택" } });
+    const approval = database.prepare("SELECT id FROM approvals WHERE status = 'pending'").get() as { id: string };
+
+    expect(() => service.dismiss(approval.id, { id: 1, username: "admin", role: "admin" })).toThrow("실제로 기다리고 있어");
+    database.prepare("UPDATE chats SET busy = 0, updated_at = datetime('now', '+1 second') WHERE provider_session_id = 's1'").run();
+
+    service.dismiss(approval.id, { id: 1, username: "admin", role: "admin" });
+
+    await expect(pendingResult).resolves.toEqual({
+      hookSpecificOutput: {
+        hookEventName: "PermissionRequest",
+        decision: { behavior: "deny", message: "이미 완료되어 닫힌 요청입니다.", interrupt: false },
+      },
+    });
+    expect(database.prepare("SELECT status, decision FROM approvals WHERE id = ?").get(approval.id)).toEqual({ status: "dismissed", decision: "dismiss" });
+  });
+
+  it("Claude 턴 완료 정리는 훅 승인만 종료한다", async () => {
+    const database = createTestDatabase();
+    const chatId = createChat(database);
+    const service = new ApprovalService(loadConfig(), database, new RealtimeHub(fakeHttpServer(), database), new SlackNotifier(loadConfig(), database));
+    const terminalId = service.createTerminalApproval(chatId, "claude", "선택", "confirm_yn", false);
+    const hookResult = service.handleClaudeHook({ session_id: "s1", tool_name: "AskUserQuestion", tool_input: { question: "선택" } });
+
+    service.closeCompletedClaudeApprovals(chatId, "Claude 응답이 완료되어 자동으로 정리되었습니다.");
+
+    await expect(hookResult).resolves.toEqual({
+      hookSpecificOutput: {
+        hookEventName: "PermissionRequest",
+        decision: { behavior: "deny", message: "Claude 응답이 완료되어 자동으로 정리되었습니다.", interrupt: false },
+      },
+    });
+    expect(database.prepare("SELECT status FROM approvals WHERE request_type = 'permission'").get()).toEqual({ status: "declined" });
+    expect(database.prepare("SELECT status FROM approvals WHERE id = ?").get(terminalId)).toEqual({ status: "pending" });
+  });
 });

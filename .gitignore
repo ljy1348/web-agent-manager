@@ -18,6 +18,7 @@ artifacts/*
 !artifacts/ui-github-project-popup.png
 !artifacts/ui-github-repositories.png
 !artifacts/ui-mobile-menu.png
+!artifacts/ui-mobile-terminal-compact.png
 !artifacts/ui-pr-diff-split.png
 !artifacts/ui-project-create.png
 !artifacts/ui-subagent-manager.png

@@ -20,6 +20,8 @@ export function isSameOrigin(request: IncomingMessage, publicUrl?: string): bool
     const originUrl = new URL(origin);
     if (originUrl.host !== request.headers.host) return false;
     let expectedProtocol = (request.socket as IncomingMessage["socket"] & { encrypted?: boolean }).encrypted ? "https:" : "http:";
+    const forwardedProto = String(request.headers["x-forwarded-proto"] ?? "").split(",", 1)[0].trim().toLowerCase();
+    if (["http", "https"].includes(forwardedProto)) expectedProtocol = `${forwardedProto}:`;
     if (publicUrl) {
       const configuredUrl = new URL(publicUrl);
       if (configuredUrl.host === request.headers.host) expectedProtocol = configuredUrl.protocol;

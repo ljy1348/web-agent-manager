@@ -18,7 +18,7 @@ function buildManager(chat?: Record<string, unknown>): SessionManager {
   const realtime = { setTerminalHandlers: () => undefined } as any;
   const approvals = { setTerminalDecisionHandler: () => undefined, setTerminalLiveCheckHandler: () => undefined } as any;
   const adapter = { id: "codex", displayLabel: "Codex" } as unknown as ProviderAdapter;
-  return new SessionManager(stubDatabase(chat), [adapter], realtime, approvals, notifications);
+  return new SessionManager(stubDatabase(chat), [adapter], realtime, approvals, notifications, { resolveForChat: () => ({ id: 1, config_dir: null }), environment: () => ({}) } as never);
 }
 
 describe("채팅 이름 변경 입력 검증", () => {

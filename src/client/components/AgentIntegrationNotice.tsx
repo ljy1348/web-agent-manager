@@ -14,7 +14,7 @@ interface AgentIntegrationStatus {
 
 const PROVIDER_LABELS = { codex: "Codex", claude: "Claude" } as const;
 
-// 새로 설치된 Codex·Claude를 감지해 관리자에게 web-agent-manager 연동 버튼을 제공한다.
+// 서버 시작 시 실패한 Codex·Claude 연동에 관리자 연결 버튼을 제공한다.
 export function AgentIntegrationNotice({ user }: { user: Json }): React.ReactElement | null {
   const [integrations, setIntegrations] = useState<AgentIntegrationStatus[]>([]);
   const [installing, setInstalling] = useState<AgentIntegrationStatus["provider"] | null>(null);
@@ -29,15 +29,6 @@ export function AgentIntegrationNotice({ user }: { user: Json }): React.ReactEle
   useEffect(() => {
     if (user.role !== "admin") return;
     void refresh().catch(() => undefined);
-    const timer = window.setInterval(() => void refresh().catch(() => undefined), 60_000);
-    const handleVisibility = (): void => {
-      if (document.visibilityState === "visible") void refresh().catch(() => undefined);
-    };
-    document.addEventListener("visibilitychange", handleVisibility);
-    return () => {
-      window.clearInterval(timer);
-      document.removeEventListener("visibilitychange", handleVisibility);
-    };
   }, [user.role]);
 
   // 선택한 공급자에 전역 스킬과 web-agent-manager MCP를 함께 설치한다.

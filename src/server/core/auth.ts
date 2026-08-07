@@ -17,7 +17,7 @@ export function createSessionLoader(database: AppDatabase) {
     const token = cookies.web_agent_manager_session ?? cookies.myagent_session;
     if (!token) return next();
     const row = database.prepare(`
-      SELECT s.id AS session_id, s.csrf_token, u.id, u.username, u.role, u.last_project_id, u.last_chat_id
+      SELECT s.id AS session_id, s.csrf_token, u.id, u.username, u.role, u.last_project_id, u.last_chat_id, u.chat_view_mode
       FROM web_sessions s JOIN users u ON u.id = s.user_id
       WHERE s.token_hash = ? AND s.expires_at > datetime('now')
     `).get(hashToken(token)) as {
@@ -28,9 +28,10 @@ export function createSessionLoader(database: AppDatabase) {
       role: "admin" | "user";
       last_project_id: number | null;
       last_chat_id: number | null;
+      chat_view_mode: "chat" | "terminal";
     } | undefined;
     if (row) {
-      request.authUser = { id: row.id, username: row.username, role: row.role, last_project_id: row.last_project_id, last_chat_id: row.last_chat_id };
+      request.authUser = { id: row.id, username: row.username, role: row.role, last_project_id: row.last_project_id, last_chat_id: row.last_chat_id, chat_view_mode: row.chat_view_mode };
       request.authSession = { id: row.session_id, csrfToken: row.csrf_token };
     }
     next();
@@ -72,13 +73,14 @@ export async function login(
   username: string,
   password: string,
 ): Promise<{ user: AuthUser; token: string; csrfToken: string } | null> {
-  const row = database.prepare("SELECT id, username, role, password_hash, last_project_id, last_chat_id FROM users WHERE username = ?").get(username) as {
+  const row = database.prepare("SELECT id, username, role, password_hash, last_project_id, last_chat_id, chat_view_mode FROM users WHERE username = ?").get(username) as {
     id: number;
     username: string;
     role: "admin" | "user";
     password_hash: string;
     last_project_id: number | null;
     last_chat_id: number | null;
+    chat_view_mode: "chat" | "terminal";
   } | undefined;
   const passwordMatches = await verifyPassword(password, row?.password_hash ?? dummyPasswordHash());
   if (!row || !passwordMatches) return null;
@@ -88,7 +90,7 @@ export async function login(
     INSERT INTO web_sessions(user_id, token_hash, csrf_token, expires_at)
     VALUES (?, ?, ?, datetime('now', ?))
   `).run(row.id, hashToken(token), csrfToken, `+${config.sessionTtlHours} hours`);
-  return { user: { id: row.id, username: row.username, role: row.role, last_project_id: row.last_project_id, last_chat_id: row.last_chat_id }, token, csrfToken };
+  return { user: { id: row.id, username: row.username, role: row.role, last_project_id: row.last_project_id, last_chat_id: row.last_chat_id, chat_view_mode: row.chat_view_mode }, token, csrfToken };
 }
 
 // 현재 웹 세션을 데이터베이스에서 제거한다.

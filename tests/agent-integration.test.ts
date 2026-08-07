@@ -3,15 +3,17 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { AppConfig } from "../src/server/core/config";
+import { openDatabase, type AppDatabase } from "../src/server/core/database";
 import {
   AgentIntegrationManager,
   type AgentIntegrationRuntime,
 } from "../src/server/services/agent-integration";
 
 const temporaryRoots: string[] = [];
+const databases: AppDatabase[] = [];
 
 // 에이전트 연동 테스트용 web-agent-manager 루트·홈·데이터 경로를 구성한다.
-function createFixture(): { config: AppConfig; calls: Array<{ command: string; args: string[] }>; installedMcp: Set<string> } {
+function createFixture(): { config: AppConfig; database: AppDatabase; calls: Array<{ command: string; args: string[] }>; installedMcp: Set<string> } {
   const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "web-agent-manager-integration-"));
   temporaryRoots.push(rootDir);
   const homeDir = path.join(rootDir, "home");
@@ -24,20 +26,24 @@ function createFixture(): { config: AppConfig; calls: Array<{ command: string; a
   }
   fs.mkdirSync(homeDir, { recursive: true });
   fs.mkdirSync(dataDir, { recursive: true });
+  const config: AppConfig = {
+    rootDir,
+    homeDir,
+    dataDir,
+    host: "127.0.0.1",
+    port: 4317,
+    publicUrl: "http://127.0.0.1:4317",
+    allowedRoots: ["/"],
+    sessionTtlHours: 1,
+    runtimeEnabled: false,
+    slack: {},
+    ntfy: { serverUrl: "https://ntfy.sh" },
+  };
+  const database = openDatabase(config);
+  databases.push(database);
   return {
-    config: {
-      rootDir,
-      homeDir,
-      dataDir,
-      host: "127.0.0.1",
-      port: 4317,
-      publicUrl: "http://127.0.0.1:4317",
-      allowedRoots: ["/"],
-      sessionTtlHours: 1,
-      runtimeEnabled: false,
-      slack: {},
-      ntfy: { serverUrl: "https://ntfy.sh" },
-    },
+    config,
+    database,
     calls: [],
     installedMcp: new Set<string>(),
   };
@@ -74,6 +80,7 @@ function fakeRuntime(
 }
 
 afterEach(() => {
+  for (const database of databases.splice(0)) database.close();
   for (const root of temporaryRoots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -81,7 +88,7 @@ describe("에이전트 전역 연동 관리", () => {
   it("설치된 Codex에 전역 스킬과 stdio MCP를 함께 연결한다", async () => {
     const fixture = createFixture();
     const runtime = fakeRuntime(new Set(["codex"]), fixture.installedMcp, fixture.calls);
-    const manager = new AgentIntegrationManager(fixture.config, runtime);
+    const manager = new AgentIntegrationManager(fixture.config, fixture.database, runtime);
 
     expect((await manager.status()).integrations).toEqual([
       expect.objectContaining({ provider: "codex", cliInstalled: true, ready: false }),
@@ -104,7 +111,7 @@ describe("에이전트 전역 연동 관리", () => {
   it("Claude는 사용자 범위 MCP와 Claude 전역 스킬 경로를 사용한다", async () => {
     const fixture = createFixture();
     const runtime = fakeRuntime(new Set(["claude"]), fixture.installedMcp, fixture.calls);
-    const manager = new AgentIntegrationManager(fixture.config, runtime);
+    const manager = new AgentIntegrationManager(fixture.config, fixture.database, runtime);
 
     const result = await manager.install("claude");
     const addCall = fixture.calls.find((call) => call.args[0] === "mcp" && call.args[1] === "add");
@@ -123,11 +130,62 @@ describe("에이전트 전역 연동 관리", () => {
     const fixture = createFixture();
     const manager = new AgentIntegrationManager(
       fixture.config,
+      fixture.database,
       fakeRuntime(new Set(), fixture.installedMcp, fixture.calls),
     );
 
     await expect(manager.install("codex")).rejects.toThrow("codex CLI가 설치되어 있지 않습니다.");
     expect(fixture.calls).toHaveLength(0);
     expect(fs.existsSync(path.join(fixture.config.homeDir, ".codex"))).toBe(false);
+  });
+
+  it("시작 시 실패한 연동 상태를 API 조회마다 다시 실행하지 않는다", async () => {
+    const fixture = createFixture();
+    const manager = new AgentIntegrationManager(
+      fixture.config,
+      fixture.database,
+      fakeRuntime(new Set(["claude"]), fixture.installedMcp, fixture.calls),
+    );
+
+    expect((await manager.status()).integrations[1]).toMatchObject({ provider: "claude", cliInstalled: true, ready: false });
+    expect(fixture.calls).toHaveLength(1);
+    await manager.status();
+    await manager.status();
+    expect(fixture.calls).toHaveLength(1);
+  });
+
+  it("성공 상태를 저장해 다음 서버 시작에서는 CLI 검사를 생략한다", async () => {
+    const fixture = createFixture();
+    const installedProviders = new Set(["codex"]);
+    const manager = new AgentIntegrationManager(
+      fixture.config,
+      fixture.database,
+      fakeRuntime(installedProviders, fixture.installedMcp, fixture.calls),
+    );
+    await manager.install("codex");
+    fixture.calls.length = 0;
+
+    const restarted = new AgentIntegrationManager(
+      fixture.config,
+      fixture.database,
+      fakeRuntime(installedProviders, fixture.installedMcp, fixture.calls),
+    );
+    expect((await restarted.status()).integrations[0]).toMatchObject({ provider: "codex", ready: true });
+    expect(fixture.calls).toHaveLength(0);
+  });
+
+  it("버튼 클릭 시 이미 연결된 MCP는 제거하거나 다시 추가하지 않는다", async () => {
+    const fixture = createFixture();
+    fixture.installedMcp.add("claude");
+    const manager = new AgentIntegrationManager(
+      fixture.config,
+      fixture.database,
+      fakeRuntime(new Set(["claude"]), fixture.installedMcp, fixture.calls),
+    );
+
+    const result = await manager.install("claude");
+
+    expect(result.integration.ready).toBe(true);
+    expect(fixture.calls.some((call) => call.args[0] === "mcp" && ["remove", "add"].includes(call.args[1]))).toBe(false);
   });
 });
