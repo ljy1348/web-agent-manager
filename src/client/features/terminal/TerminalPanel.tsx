@@ -2,16 +2,15 @@ import React, { useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import type { Json } from "../../types";
 
-// 서버 tmux 창의 고정 크기(session-manager.ts의 DEFAULT_COLS/DEFAULT_ROWS)와 반드시 같아야 한다.
-// 커서 절대 위치 이동 같은 ANSI 시퀀스는 "행·열 번호"만 담고 있어, 클라이언트 xterm의 논리적 그리드
-// 크기가 서버 tmux pane 크기와 다르면 같은 번호가 서로 다른 위치를 가리키게 된다. 열(가로)뿐 아니라
-// 행(세로)도 마찬가지다 — tmux 자체 상태바처럼 절대 행 번호(예: "맨 아래 행")로 그려지는 요소가 있는데,
-// 예전에 세로만 미리보기 박스 높이에 맞춰 fit()했더니 서버는 36행 기준으로 상태바를 그리고 클라이언트는
-// 훨씬 적은 행수라 그 위치가 클라이언트 뷰포트 밖으로 밀려나면서 상태바 줄이 계속 새로 쌓여 보였다.
-// 그래서 행도 열과 마찬가지로 fit() 없이 서버와 같은 값으로 고정하고, 박스보다 큰 내용은 가로·세로
-// 스크롤(styles.css의 .terminal-host)로 본다.
+// 가로 폭을 바꾸면 기존 tmux 스크롤백의 줄바꿈이 깨질 수 있어 256열로 고정한다. 세로 행 수는
+// 줄바꿈에 영향을 주지 않으므로 데스크톱 패널 높이로 계산해 서버 tmux와 함께 동기화한다.
 const TERMINAL_COLS = 256;
-const TERMINAL_ROWS = 36;
+const TERMINAL_DEFAULT_ROWS = 36;
+const TERMINAL_MIN_ROWS = 12;
+const TERMINAL_MAX_ROWS = 120;
+const TERMINAL_FONT_SIZE = 13;
+// 한 번의 관성 스크롤이 서버 tmux 명령 수십 번이 되지 않도록 짧게 모아서 보낸다.
+const TERMINAL_SCROLL_FLUSH_MS = 60;
 
 const MOBILE_PRIMARY_SHORTCUTS = [
   { label: "Esc", title: "Escape", data: "\u001b" },
@@ -48,6 +47,19 @@ function modifiedKey(key: string, control: boolean, alt: boolean): string | null
   return alt ? `\u001b${result}` : result;
 }
 
+// 기본 글자 크기의 실제 셀 높이로 패널에 들어갈 논리 행 수를 계산한다.
+function terminalRowsForHeight(instance: Terminal, hostElement: HTMLElement): number {
+  // 모바일은 세로 공간이 키보드에 따라 자주 변하므로 기존 36행 + 스와이프 방식을 유지한다.
+  if (window.matchMedia("(max-width: 700px)").matches) return TERMINAL_DEFAULT_ROWS;
+  const rowsElement = hostElement.querySelector<HTMLElement>(".xterm-rows");
+  const rendered = rowsElement?.getBoundingClientRect().height ?? 0;
+  const style = window.getComputedStyle(hostElement);
+  const available = hostElement.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom) - 2;
+  if (rendered <= 0 || available <= 0) return instance.rows;
+  const cellHeight = rendered / instance.rows;
+  return Math.max(TERMINAL_MIN_ROWS, Math.min(TERMINAL_MAX_ROWS, Math.floor(available / cellHeight)));
+}
+
 // HTTPS가 아닌 LAN 접속 등 비보안 컨텍스트에서는 navigator.clipboard 자체가 없어, 옛 방식(임시
 // textarea + execCommand)으로 대체한다.
 function copyText(text: string): void {
@@ -67,6 +79,7 @@ function copyText(text: string): void {
 export function TerminalPanel({ chat, socket }: { chat: Json | null; socket: WebSocket | null }): React.ReactElement {
   const host = useRef<HTMLDivElement>(null);
   const terminal = useRef<Terminal | null>(null);
+  const terminalRows = useRef(TERMINAL_DEFAULT_ROWS);
   const controlRef = useRef(false);
   const altRef = useRef(false);
   const [controlActive, setControlActive] = useState(false);
@@ -79,6 +92,16 @@ export function TerminalPanel({ chat, socket }: { chat: Json | null; socket: Web
     if (chat && socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "terminal_input", chatId: chat.id, data }));
   }
 
+  // 현재 채팅의 tmux 기록(copy-mode)을 lines만큼 옮기도록 요청한다. 양수가 과거 방향이다.
+  function sendTerminalScroll(lines: number): void {
+    if (chat && socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "terminal_scroll", chatId: chat.id, lines }));
+  }
+
+  // 브라우저 xterm과 서버 tmux가 같은 세로 행 수를 사용하도록 리사이즈를 요청한다.
+  function sendTerminalResize(rows: number): void {
+    if (chat && socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "terminal_resize", chatId: chat.id, rows }));
+  }
+
   // 모바일 보조 키를 전송하고 일회성 modifier 상태를 정리한다.
   function pressShortcut(data: string): void {
     sendTerminalInput(data);
@@ -89,10 +112,31 @@ export function TerminalPanel({ chat, socket }: { chat: Json | null; socket: Web
   useEffect(() => {
     const hostElement = host.current;
     if (!hostElement) return;
-    const instance = new Terminal({ cols: TERMINAL_COLS, rows: TERMINAL_ROWS, cursorBlink: true, fontSize: 13, theme: { background: "#0b1110", foreground: "#d8e5de" } });
+    // 스크롤백을 클라이언트에 쌓지 않는다(서버 TerminalScreen도 같은 `scrollback: 0` 계약이다).
+    // 여기 쌓이는 건 tmux가 pane을 다시 그리며 흘려보낸 잔해라 진짜 CLI 기록이 아닌데, 그게 남아 있으면
+    // 휠이 그 잔해 안에서만 맴돌아 실제 tmux 기록까지 닿지 못하고 타이핑해도 맨 아래로 돌아오지 않았다
+    // (실제 서버·tmux·Chrome으로 재현). 기록은 tmux copy-mode 하나만 정본으로 쓴다.
+    const instance = new Terminal({ cols: TERMINAL_COLS, rows: TERMINAL_DEFAULT_ROWS, scrollback: 0, cursorBlink: true, fontSize: TERMINAL_FONT_SIZE, lineHeight: 1, theme: { background: "#0b1110", foreground: "#d8e5de" } });
     instance.open(hostElement);
     instance.focus();
     terminal.current = instance;
+    // 상자 크기가 바뀌면 글자 배율은 그대로 두고 실제 행 수를 패널 높이에 맞춘다.
+    let resizeFrame = 0;
+    const syncRows = (): void => {
+      const rows = terminalRowsForHeight(instance, hostElement);
+      if (rows === instance.rows) return;
+      instance.resize(TERMINAL_COLS, rows);
+      terminalRows.current = rows;
+      sendTerminalResize(rows);
+    };
+    const scheduleResize = (): void => {
+      cancelAnimationFrame(resizeFrame);
+      resizeFrame = requestAnimationFrame(syncRows);
+    };
+    terminalRows.current = instance.rows;
+    scheduleResize();
+    const sizeObserver = new ResizeObserver(scheduleResize);
+    sizeObserver.observe(hostElement);
     // Ctrl+C는 원래 SIGINT로 보내야 하지만, 텍스트를 선택해둔 상태에서는(원본 터미널 로그를 복사하고
     // 싶은 경우가 많음) 그 선택을 복사하는 쪽이 자연스럽다. 선택이 있을 때만 가로채 복사하고 xterm의
     // 기본 처리(SIGINT 전송)를 막는다 — 선택이 없으면 평소대로 인터럽트로 동작한다.
@@ -102,6 +146,40 @@ export function TerminalPanel({ chat, socket }: { chat: Json | null; socket: Web
         return false;
       }
       return true;
+    });
+    // 서버가 tmux 명령을 실행해야 하는 요청이라, 휠 한 번에 한 건씩 보내지 않고 잠깐 모아서 보낸다.
+    let pendingScrollLines = 0;
+    let scrollTimer: number | undefined;
+    const flushScroll = (): void => {
+      scrollTimer = undefined;
+      const lines = Math.trunc(pendingScrollLines);
+      pendingScrollLines -= lines;
+      if (lines) sendTerminalScroll(lines);
+    };
+    const requestHistoryScroll = (lines: number): void => {
+      pendingScrollLines += lines;
+      if (scrollTimer === undefined) scrollTimer = window.setTimeout(flushScroll, TERMINAL_SCROLL_FLUSH_MS);
+    };
+    // 진짜 이전 내역은 tmux 기록에 있다. xterm 스크롤백은 0이지만 모바일의 잘린 고정 화면처럼 내부
+    // viewport가 움직일 수 있는 경우를 먼저 처리하고, 끝에 닿으면 tmux 기록으로 이어간다. 그대로 두면
+    // xterm이 휠을 위·아래 방향키로 바꿔 CLI에 보내거나, 휠이 바깥으로 새어 페이지가 밀렸다.
+    instance.attachCustomWheelEventHandler((event) => {
+      // TUI가 mouse mode를 켠 동안에는 휠이 그 TUI의 입력이다 — 우리가 가로채면 안 된다.
+      if (instance.modes.mouseTrackingMode !== "none") return true;
+      const buffer = instance.buffer.active;
+      const scrollbackEnd = event.deltaY < 0 ? buffer.viewportY <= 0 : buffer.viewportY >= buffer.baseY;
+      if (buffer.type === "normal" && buffer.baseY > 0 && !scrollbackEnd) return true;
+      // 모바일처럼 고정 행이 상자보다 큰 경우에는 먼저 상자를 굴려 잘린 행을 보여준다.
+      const overflow = hostElement.scrollHeight - hostElement.clientHeight;
+      if (overflow > 0 && (event.deltaY < 0 ? hostElement.scrollTop > 0 : hostElement.scrollTop < overflow)) return true;
+      const cell = Math.max(1, (hostElement.querySelector<HTMLElement>(".xterm-rows")?.getBoundingClientRect().height ?? 0) / instance.rows);
+      const rows = event.deltaMode === WheelEvent.DOM_DELTA_LINE ? event.deltaY
+        : event.deltaMode === WheelEvent.DOM_DELTA_PAGE ? event.deltaY * instance.rows
+          : event.deltaY / cell;
+      requestHistoryScroll(-rows);
+      event.preventDefault();
+      event.stopPropagation();
+      return false;
     });
     instance.onData((data) => {
       const modified = controlRef.current || altRef.current ? modifiedKey(data, controlRef.current, altRef.current) : null;
@@ -138,9 +216,15 @@ export function TerminalPanel({ chat, socket }: { chat: Json | null; socket: Web
           if (rows) {
             const before = instance.buffer.active.viewportY;
             instance.scrollLines(rows);
-            gesture.remainder -= rows * Math.max(12, instance.options.fontSize ?? 13);
-            // 스크롤백이 없는 고정 화면에서는 잘린 행을 볼 수 있도록 호스트 자체를 이동한다.
-            if (instance.buffer.active.viewportY === before) hostElement.scrollTop += deltaY;
+            gesture.remainder -= rows * Math.max(12, instance.options.fontSize ?? TERMINAL_FONT_SIZE);
+            if (instance.buffer.active.viewportY === before) {
+              // 스크롤백이 없는 고정 화면에서는 먼저 잘린 행을 볼 수 있도록 호스트 자체를 이동하고,
+              // 더 이동할 곳이 없으면 휠과 마찬가지로 tmux 기록(copy-mode)을 옮긴다.
+              const overflow = hostElement.scrollHeight - hostElement.clientHeight;
+              const movable = deltaY < 0 ? hostElement.scrollTop > 0 : hostElement.scrollTop < overflow;
+              if (overflow > 0 && movable) hostElement.scrollTop += deltaY;
+              else requestHistoryScroll(-rows);
+            }
           }
         }
       } else hostElement.scrollLeft += deltaX;
@@ -155,6 +239,9 @@ export function TerminalPanel({ chat, socket }: { chat: Json | null; socket: Web
     return () => {
       disposed = true;
       gesture = null;
+      cancelAnimationFrame(resizeFrame);
+      sizeObserver.disconnect();
+      if (scrollTimer !== undefined) clearTimeout(scrollTimer);
       hostElement.removeEventListener("pointerdown", pointerDown, true);
       hostElement.removeEventListener("pointermove", pointerMove, true);
       hostElement.removeEventListener("pointerup", pointerEnd, true);
@@ -176,8 +263,11 @@ export function TerminalPanel({ chat, socket }: { chat: Json | null; socket: Web
 
   useEffect(() => {
     if (!chat || !socket || socket.readyState !== WebSocket.OPEN) return;
-    terminal.current?.clear();
-    socket.send(JSON.stringify({ type: "subscribe_terminal", chatId: chat.id }));
+    const frame = requestAnimationFrame(() => {
+      terminal.current?.clear();
+      socket.send(JSON.stringify({ type: "subscribe_terminal", chatId: chat.id, rows: terminalRows.current }));
+    });
+    return () => cancelAnimationFrame(frame);
   }, [chat?.id, socket]);
 
   return <div className="terminal-console">

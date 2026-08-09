@@ -21,6 +21,11 @@ export class TerminalScreen {
     this.terminal.write(data, callback);
   }
 
+  // 브라우저와 tmux에 맞춰 화면 재구성기의 논리 그리드 크기를 바꾼다.
+  resize(cols: number, rows: number): void {
+    this.terminal.resize(cols, rows);
+  }
+
   // 현재 버퍼의 공백이 아닌 줄을 하나의 파싱용 문자열로 반환한다.
   text(): string {
     const buffer = this.terminal.buffer.active;

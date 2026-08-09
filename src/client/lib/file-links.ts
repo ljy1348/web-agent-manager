@@ -37,3 +37,9 @@ export function projectFilePathFromHref(href: string | undefined, projectPath: s
   }
   return normalizeRelativePath([relativeTo, linkedPath].filter(Boolean).join("/"));
 }
+
+// 프로젝트 상대 파일 경로를 현재 채팅 작업공간의 inline 콘텐츠 API URL로 만든다.
+export function projectFileContentUrl(projectId: number, filePath: string, chatId?: number | null): string {
+  const encodedPath = filePath.split("/").filter(Boolean).map(encodeURIComponent).join("/");
+  return `/api/projects/${projectId}/files/content/${encodedPath}${chatId ? `?chatId=${chatId}` : ""}`;
+}

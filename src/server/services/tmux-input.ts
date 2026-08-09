@@ -67,6 +67,41 @@ export function sendTmuxRight(tmuxName: string): void {
   assertTmuxSuccess(result, "tmux에 오른쪽 화살표 키를 보내지 못했습니다.");
 }
 
+// tmux pane 기록(스크롤백)을 lines만큼 위(양수)·아래(음수)로 이동시키고, 이동 후에도 copy-mode에
+// 남아 있는지를 돌려준다. 웹 터미널은 tmux attach 클라이언트라 xterm 자체 스크롤백이 비어 있어,
+// 실제 CLI에서처럼 이전 내역을 보려면 tmux의 copy-mode를 대신 움직여야 한다. `-e`로 진입하면 맨
+// 아래까지 되돌아왔을 때 tmux가 알아서 copy-mode를 빠져나간다.
+export function scrollTmuxHistory(tmuxName: string, lines: number): boolean {
+  if (!lines) return isTmuxCopyMode(tmuxName);
+  // 이미 최신 화면인데 "더 아래로"를 요청하면 아무것도 하지 않는다. 여기서 copy-mode에 새로 들어가면
+  // 화면만 기록 보기로 바뀌어 오히려 실시간 화면에서 벗어난다.
+  if (lines < 0 && !isTmuxCopyMode(tmuxName)) return false;
+  const enter = spawnSync("tmux", ["copy-mode", "-e", "-t", tmuxName], { encoding: "utf8" });
+  assertTmuxSuccess(enter, "tmux 기록 보기로 전환하지 못했습니다.");
+  const command = lines > 0 ? "scroll-up" : "scroll-down";
+  // 아래로 내려가다 맨 아래에 닿으면 tmux(-e)가 스스로 copy-mode를 끝내므로, 그 직후의 이동 명령은
+  // "not in a mode"로 실패하는 게 정상이다. 실패를 오류로 올리지 않고 현재 상태만 알려준다.
+  spawnSync("tmux", ["send-keys", "-X", "-t", tmuxName, "-N", String(Math.abs(lines)), command], { stdio: "ignore" });
+  return isTmuxCopyMode(tmuxName);
+}
+
+// 해당 pane이 지금 copy-mode(기록 보기) 상태인지 확인한다.
+export function isTmuxCopyMode(tmuxName: string): boolean {
+  const result = spawnSync("tmux", ["display-message", "-p", "-t", tmuxName, "#{pane_in_mode}"], { encoding: "utf8" });
+  return result.status === 0 && result.stdout.trim() === "1";
+}
+
+// 기록 보기를 끝내고 실시간 화면으로 되돌린다. copy-mode가 아니면 조용히 무시한다.
+export function exitTmuxCopyMode(tmuxName: string): void {
+  spawnSync("tmux", ["send-keys", "-X", "-t", tmuxName, "cancel"], { stdio: "ignore" });
+}
+
+// tmux 창을 웹 xterm과 같은 논리 그리드 크기로 맞춘다.
+export function resizeTmuxWindow(tmuxName: string, cols: number, rows: number): void {
+  const result = spawnSync("tmux", ["resize-window", "-t", tmuxName, "-x", String(cols), "-y", String(rows)], { encoding: "utf8" });
+  assertTmuxSuccess(result, "tmux 터미널 크기를 바꾸지 못했습니다.");
+}
+
 // tmux pane에 짧은 리터럴 키 입력을 보낸다.
 export function sendTmuxText(tmuxName: string, text: string): void {
   if (!text) return;

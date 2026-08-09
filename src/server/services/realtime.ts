@@ -37,7 +37,9 @@ export class RealtimeHub {
   private readonly server = new WebSocketServer({ noServer: true });
   private readonly clients = new Set<ClientState>();
   private inputHandler?: (chatId: number, data: string, user: AuthUser) => void;
-  private subscribeHandler?: (chatId: number, user: AuthUser) => void;
+  private subscribeHandler?: (chatId: number, user: AuthUser, rows?: number) => void;
+  private scrollHandler?: (chatId: number, lines: number, user: AuthUser) => void;
+  private resizeHandler?: (chatId: number, rows: number, user: AuthUser) => void;
   private authInputHandler?: (provider: string, data: string, user: AuthUser) => void;
   private authSubscribeHandler?: (provider: string, user: AuthUser) => void;
 
@@ -56,13 +58,17 @@ export class RealtimeHub {
     });
   }
 
-  // 터미널 입력과 구독 요청을 처리할 콜백을 등록한다.
+  // 터미널 입력·구독·기록 스크롤·세로 리사이즈 요청을 처리할 콜백을 등록한다.
   setTerminalHandlers(
     inputHandler: (chatId: number, data: string, user: AuthUser) => void,
-    subscribeHandler: (chatId: number, user: AuthUser) => void,
+    subscribeHandler: (chatId: number, user: AuthUser, rows?: number) => void,
+    scrollHandler?: (chatId: number, lines: number, user: AuthUser) => void,
+    resizeHandler?: (chatId: number, rows: number, user: AuthUser) => void,
   ): void {
     this.inputHandler = inputHandler;
     this.subscribeHandler = subscribeHandler;
+    this.scrollHandler = scrollHandler;
+    this.resizeHandler = resizeHandler;
   }
 
   // CLI 인증 터미널의 입력과 구독 콜백을 등록한다.
@@ -116,7 +122,7 @@ export class RealtimeHub {
     socket.on("close", () => this.clients.delete(client));
     socket.on("message", (raw) => {
       try {
-        const message = JSON.parse(raw.toString()) as { type?: string; chatId?: number; provider?: string; data?: string };
+        const message = JSON.parse(raw.toString()) as { type?: string; chatId?: number; provider?: string; data?: string; lines?: number; rows?: number };
         if (message.type === "subscribe_terminal" && Number.isInteger(message.chatId)) {
           if (user.role !== "admin") {
             socket.send(JSON.stringify({ type: "error", payload: { message: "관리자만 터미널을 구독할 수 있습니다." } }));
@@ -124,7 +130,7 @@ export class RealtimeHub {
           }
           client.terminalChatId = message.chatId!;
           client.authProvider = null;
-          this.subscribeHandler?.(message.chatId!, user);
+          this.subscribeHandler?.(message.chatId!, user, Number.isInteger(message.rows) ? message.rows : undefined);
         }
         if (message.type === "terminal_input" && Number.isInteger(message.chatId) && typeof message.data === "string") {
           if (user.role !== "admin") {
@@ -132,6 +138,23 @@ export class RealtimeHub {
             return;
           }
           this.inputHandler?.(message.chatId!, message.data, user);
+        }
+        // 기록 스크롤은 화면을 되짚어 보는 읽기 동작이지만 결국 그 채팅의 tmux pane을 움직이므로
+        // 입력과 같은 관리자 권한을 요구한다.
+        if (message.type === "terminal_scroll" && Number.isInteger(message.chatId) && Number.isFinite(message.lines)) {
+          if (user.role !== "admin") {
+            socket.send(JSON.stringify({ type: "error", payload: { message: "관리자만 터미널을 조작할 수 있습니다." } }));
+            return;
+          }
+          this.scrollHandler?.(message.chatId!, message.lines!, user);
+        }
+        // 세로 리사이즈도 공유 tmux pane의 상태를 바꾸므로 터미널 입력과 같은 관리자 권한을 요구한다.
+        if (message.type === "terminal_resize" && Number.isInteger(message.chatId) && Number.isInteger(message.rows)) {
+          if (user.role !== "admin") {
+            socket.send(JSON.stringify({ type: "error", payload: { message: "관리자만 터미널을 조작할 수 있습니다." } }));
+            return;
+          }
+          this.resizeHandler?.(message.chatId!, message.rows!, user);
         }
         if (message.type === "subscribe_auth_terminal" && typeof message.provider === "string") {
           if (user.role !== "admin") {

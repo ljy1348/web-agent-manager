@@ -105,15 +105,16 @@ describe("RBAC 가드", () => {
     expect(sendPrompt).toHaveBeenCalledWith(7, "안녕", { id: 2, username: "user", role: "user" });
   });
 
-  it("일반 사용자의 WebSocket 터미널 구독과 raw 입력을 거부한다", async () => {
+  it("일반 사용자의 WebSocket 터미널 구독·raw 입력·리사이즈를 거부한다", async () => {
     const server = http.createServer();
     const inputHandler = vi.fn();
     const subscribeHandler = vi.fn();
+    const resizeHandler = vi.fn();
     const database = {
       prepare: () => ({ get: () => ({ id: 2, username: "user", role: "user" }) }),
     } as unknown as AppDatabase;
     const hub = new RealtimeHub(server as Server, database);
-    hub.setTerminalHandlers(inputHandler, subscribeHandler);
+    hub.setTerminalHandlers(inputHandler, subscribeHandler, undefined, resizeHandler);
     server.listen(0, "127.0.0.1");
     await once(server, "listening");
     closeServer = () => new Promise((resolve, reject) => {
@@ -128,11 +129,15 @@ describe("RBAC 가드", () => {
     const [subscribeError] = await once(socket, "message");
     socket.send(JSON.stringify({ type: "terminal_input", chatId: 1, data: "q" }));
     const [inputError] = await once(socket, "message");
+    socket.send(JSON.stringify({ type: "terminal_resize", chatId: 1, rows: 58 }));
+    const [resizeError] = await once(socket, "message");
     socket.close();
 
     expect(JSON.parse(subscribeError.toString()).payload.message).toBe("관리자만 터미널을 구독할 수 있습니다.");
     expect(JSON.parse(inputError.toString()).payload.message).toBe("관리자만 터미널에 입력할 수 있습니다.");
+    expect(JSON.parse(resizeError.toString()).payload.message).toBe("관리자만 터미널을 조작할 수 있습니다.");
     expect(subscribeHandler).not.toHaveBeenCalled();
     expect(inputHandler).not.toHaveBeenCalled();
+    expect(resizeHandler).not.toHaveBeenCalled();
   });
 });

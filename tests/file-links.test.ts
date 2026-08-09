@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { projectFilePathFromHref } from "../src/client/lib/file-links";
+import { projectFileContentUrl, projectFilePathFromHref } from "../src/client/lib/file-links";
 
 describe("채팅 프로젝트 파일 링크", () => {
   it("프로젝트 절대 경로와 줄 번호를 상대 파일 경로로 바꾼다", () => {
@@ -17,5 +17,11 @@ describe("채팅 프로젝트 파일 링크", () => {
     expect(projectFilePathFromHref("/home/testuser/other/file.ts", "/home/testuser/web-agent-manager")).toBeNull();
     expect(projectFilePathFromHref("../../etc/passwd", "/home/testuser/web-agent-manager")).toBeNull();
     expect(projectFilePathFromHref("#section", "/home/testuser/web-agent-manager")).toBeNull();
+  });
+
+  it("프로젝트 파일 콘텐츠 URL에 경로와 채팅 작업공간을 반영한다", () => {
+    expect(projectFileContentUrl(7, "artifacts/검증 화면 (최종).png", 199)).toBe(
+      "/api/projects/7/files/content/artifacts/%EA%B2%80%EC%A6%9D%20%ED%99%94%EB%A9%B4%20(%EC%B5%9C%EC%A2%85).png?chatId=199",
+    );
   });
 });

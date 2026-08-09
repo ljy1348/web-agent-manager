@@ -21,4 +21,13 @@ describe("headless 터미널 화면", () => {
     expect(snapshot).toMatch(/\u001b\[2;4H$/);
     screen.dispose();
   });
+
+  it("리사이즈한 행 수로 새 클라이언트 스냅샷을 만든다", () => {
+    const screen = new TerminalScreen({ cols: 20, rows: 3, scrollback: 0 });
+
+    screen.resize(20, 5);
+
+    expect(screen.ansiSnapshot().split("\r\n")).toHaveLength(5);
+    screen.dispose();
+  });
 });
