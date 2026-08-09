@@ -1192,11 +1192,11 @@ nav button.active { color: #fff; border-bottom-color: #d6f56f; }
 }
 .terminal-panel-full .terminal-panel-head {
   display: flex;
-  min-height: 34px;
+  min-height: 28px;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 8px 12px;
+  padding: 5px 12px;
 }
 .terminal-panel-full .terminal-panel-head span { color: #d7deeb; }
 .terminal-panel-full .terminal-panel-head small {
@@ -1205,16 +1205,20 @@ nav button.active { color: #fff; border-bottom-color: #d6f56f; }
   letter-spacing: 0;
   text-transform: none;
 }
+.terminal-mode .chat-view-tabs { padding-block: 4px; }
 .terminal-console { display: flex; min-width: 0; min-height: 0; flex: 1; flex-direction: column; background: #090e18; }
 .terminal-stage { min-width: 0; min-height: 0; flex: 1; overflow: hidden; background: #090e18; }
 .terminal-panel-full .terminal-host {
   width: 100%;
   height: 100%;
-  padding: 12px;
+  padding: 8px 10px;
   overflow: auto;
   overscroll-behavior: contain;
   touch-action: none;
 }
+/* 실제로 스크롤되는 요소는 호스트가 아니라 xterm이 만든 내부 뷰포트라, 여기에도 경계를 줘야 한다.
+   이게 없으면 xterm 스크롤백 끝에서 휠이 바깥 페이지로 이어져(스크롤 체이닝) 화면이 밀렸다. */
+.terminal-host .xterm-viewport { overscroll-behavior: contain; }
 .terminal-mobile-toolbar, .terminal-touch-hint { display: none; }
 .terminal-empty {
   display: grid;
@@ -1423,11 +1427,28 @@ input, select, textarea { border-radius: 10px !important; }
 .process-group-row > td { background: #f7f8fc; }
 .process-group-badge.kind-chat { background: var(--accent-soft); color: #4c40c4; }
 
+/* 빼는 값은 채팅 화면 위아래로 실제로 쌓이는 높이(헤더 72 + 프로젝트 바 60 + main 여백 26/30)와
+   같아야 한다. 예전 184는 4px이 모자라 문서 자체에 4px짜리 스크롤이 생겼고, 터미널 위에서 휠을
+   굴렸을 때 페이지가 미세하게 움직이는 원인이 됐다. */
 .chat-layout {
   grid-template-columns: 280px minmax(0, 1fr);
   gap: 16px;
-  height: calc(100dvh - 184px);
+  height: calc(100dvh - 188px);
   min-height: 560px;
+}
+/* 터미널 모드는 실제 셀 높이로 행 수를 계산하므로, 페이지 위아래 여백을 줄인 만큼 더 많은 논리 행을
+   tmux와 xterm에 함께 배정한다. */
+.main.main-chat-terminal { padding-top: 12px; padding-bottom: 14px; }
+/* 채팅 탭은 헤더·프로젝트 바 위에 에이전트 연동 안내 배너처럼 무엇이 더 붙을 수 있어서, 높이를
+   고정값 빼기(calc(100dvh - N))로 잡으면 그 배너가 뜨는 순간 딱 그만큼 문서 스크롤이 생긴다(실제
+   앱에서 53px 배너 때문에 재현됨 — 터미널 위에서 휠을 굴리면 페이지가 밀려 올라갔다). 남은 높이를
+   그대로 쓰게 해 위에 무엇이 붙든 문서에는 스크롤이 생기지 않게 한다. */
+@media (min-width: 701px) {
+  .app-shell.tab-chat { display: flex; height: 100dvh; flex-direction: column; }
+  .app-shell.tab-chat > * { flex: none; }
+  .app-shell.tab-chat > .main-chat { min-height: 0; flex: 1; }
+  .main-chat .chat-layout { height: 100%; }
+  .main-chat-terminal .chat-layout { min-height: 0; }
 }
 .chat-layout.has-approvals { grid-template-columns: 280px minmax(0, 1fr) 292px; }
 .chat-list, .approval-list, .workspace { border-color: #d9e0ea; border-radius: 16px; box-shadow: var(--shadow); }

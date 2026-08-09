@@ -12,19 +12,16 @@ import { writeAudit } from "../core/audit";
 import { stripAnsi } from "../core/security";
 import { setChatBusy } from "../core/chat-busy";
 import { createLogger } from "../core/logger";
-import { pastePromptToTmux, sendTmuxEnter, sendTmuxEscape, sendTmuxBackspace, sendTmuxLeft, sendTmuxRight, sendTmuxShiftTab, sendTmuxText } from "./tmux-input";
+import { pastePromptToTmux, sendTmuxEnter, sendTmuxEscape, sendTmuxBackspace, sendTmuxLeft, sendTmuxRight, sendTmuxShiftTab, sendTmuxText, scrollTmuxHistory, exitTmuxCopyMode, resizeTmuxWindow } from "./tmux-input";
 import { parseResetTime } from "./rate-limit-resume";
 import { TerminalScreen } from "./terminal-screen";
 
-// 공급자(Claude·Codex)가 실제로 도는 tmux 창의 고정 크기. tmux는 창을 리사이즈해도 이미 스크롤백에
-// 찍힌 옛 줄을 새 폭으로 다시 감아주지 않아, 웹의 원본 터미널 화면이 열릴 때마다
-// 그 실제 DOM 크기로 여기를 리사이즈하면 그 이전 대화(특히 한글처럼 폭 계산이 예민한 내용)가 스크롤백에서
-// 계단식으로 깨져 보였다. 그래서 이 크기는 미리보기 패널 크기와 무관하게 항상 고정하고(TerminalPanel은
-// 이 크기로 절대 리사이즈 요청을 보내지 않는다), 패널 쪽 표시는 클라이언트 xterm이 로컬에서만 맞춘다.
-// COLS를 넉넉하게 잡아둔 이유는 폭이 좁으면 줄바꿈이 잦아져 diff·긴 줄이 보기 불편해서다 — 클라이언트가
-// 박스보다 넓은 내용은 가로 스크롤로 보여주는 대신, 최대한 안 잘리고 한 줄로 나오게 한다.
+// 가로 열 수를 바꾸면 이미 찍힌 tmux 스크롤백이 새 폭으로 다시 감기지 않아 한글·긴 줄이 깨질 수 있다.
+// 따라서 256열은 고정하고, 줄바꿈에 영향을 주지 않는 세로 행 수만 웹 패널 높이에 맞춰 동기화한다.
 const DEFAULT_COLS = 256;
 const DEFAULT_ROWS = 36;
+const MIN_ROWS = 12;
+const MAX_ROWS = 120;
 
 interface ManagedTerminal {
   pty: IPty;
@@ -34,12 +31,15 @@ interface ManagedTerminal {
   approvalCandidateFingerprint: string | null;
   approvalVerifyTimer?: NodeJS.Timeout;
   tmuxName: string;
+  rows: number;
   busyPollTimer?: NodeJS.Timeout;
   stateScanTimer?: NodeJS.Timeout;
   lastStateScanAt?: number;
   readySince?: number;
+  copyMode?: boolean;
 }
 
+const TERMINAL_SCROLL_MAX_LINES = 200;
 const TERMINAL_STATE_SCAN_THROTTLE_MS = 500;
 const TERMINAL_STATE_IDLE_POLL_MS = 5_000;
 
@@ -91,7 +91,9 @@ export class SessionManager {
     approvals.setTerminalLiveCheckHandler((chatId, requestType) => this.isTerminalApprovalLive(chatId, requestType));
     realtime.setTerminalHandlers(
       (chatId, data, user) => this.writeTerminal(chatId, data, user),
-      (chatId) => this.refreshTerminal(chatId),
+      (chatId, _user, rows) => rows === undefined ? this.refreshTerminal(chatId) : this.resizeTerminal(chatId, rows),
+      (chatId, lines) => this.scrollTerminal(chatId, lines),
+      (chatId, rows) => this.resizeTerminal(chatId, rows),
     );
   }
 
@@ -270,6 +272,8 @@ export class SessionManager {
     // 작업 중 추가 입력은 TUI 큐에 들어가므로, 중지 후 복구·정리할 원래 실행 질문을 후속 입력으로
     // 덮어쓰지 않는다.
     if (!chat.busy) this.lastPromptText.set(chatId, text);
+    // 누군가 웹에서 기록을 위로 올려둔 상태면 붙여넣기·Enter가 copy-mode에 먹히므로 먼저 되돌린다.
+    this.leaveCopyMode(terminal);
     pastePromptToTmux(terminal.tmuxName, text);
     sendTmuxEnter(terminal.tmuxName);
     // 새 assistant 메시지가 JSONL에 나타나면 history-sync가 chat_busy:false로 정리한다.
@@ -341,6 +345,8 @@ export class SessionManager {
 
   // TUI 프롬프트가 화면에 나타날 때까지 제한 시간 동안 기다린다.
   private async waitUntilReady(chatId: number, provider: Provider): Promise<ManagedTerminal> {
+    const existing = this.terminals.get(chatId);
+    if (existing) this.leaveCopyMode(existing);
     const deadline = Date.now() + 15_000;
     while (Date.now() < deadline) {
       const terminal = this.terminals.get(chatId);
@@ -362,8 +368,43 @@ export class SessionManager {
   writeTerminal(chatId: number, data: string, user: AuthUser): void {
     const terminal = this.terminals.get(chatId);
     if (!terminal) throw new Error("실행 중인 터미널이 없습니다.");
+    this.leaveCopyMode(terminal);
     terminal.pty.write(data);
     writeAudit(this.database, user.id, "terminal.input", "chat", chatId, { bytes: Buffer.byteLength(data) });
+  }
+
+  // 브라우저 터미널의 휠·스와이프를 tmux 기록(copy-mode) 이동으로 옮긴다. 양수는 과거, 음수는
+  // 현재 방향이다. 웹 터미널은 tmux attach 클라이언트라 xterm 자체 스크롤백이 항상 비어 있어,
+  // 이 경로가 없으면 실제 CLI처럼 이전 내역을 되짚어 볼 방법이 없다.
+  scrollTerminal(chatId: number, lines: number): void {
+    const terminal = this.terminals.get(chatId);
+    if (!terminal) return;
+    const amount = Math.trunc(Math.max(-TERMINAL_SCROLL_MAX_LINES, Math.min(TERMINAL_SCROLL_MAX_LINES, lines)));
+    if (!amount) return;
+    terminal.copyMode = scrollTmuxHistory(terminal.tmuxName, amount);
+  }
+
+  // 데스크톱 패널 높이에 맞춰 PTY·tmux·서버 화면의 세로 행 수를 함께 바꾼다.
+  resizeTerminal(chatId: number, rows: number): void {
+    const terminal = this.terminals.get(chatId);
+    if (!terminal) return;
+    const nextRows = Math.max(MIN_ROWS, Math.min(MAX_ROWS, Math.trunc(rows)));
+    if (nextRows !== terminal.rows) {
+      this.leaveCopyMode(terminal);
+      terminal.rows = nextRows;
+      terminal.screen?.resize(DEFAULT_COLS, nextRows);
+      terminal.pty.resize(DEFAULT_COLS, nextRows);
+      resizeTmuxWindow(terminal.tmuxName, DEFAULT_COLS, nextRows);
+    }
+    this.refreshTerminal(chatId);
+  }
+
+  // 기록 보기 중에는 키 입력이 copy-mode 키 테이블에 먹히고 화면 스냅샷도 과거 내용이라, 입력·상태
+  // 판정 전에 실시간 화면으로 되돌린다(실제 터미널에서 스크롤 중 타이핑하면 맨 아래로 돌아오는 것과 같다).
+  private leaveCopyMode(terminal: ManagedTerminal): void {
+    if (!terminal.copyMode) return;
+    terminal.copyMode = false;
+    exitTmuxCopyMode(terminal.tmuxName);
   }
 
   // 새 웹 클라이언트가 구독할 때 누적된 원시 바이트를 재생하는 대신 tmux가 그려주는 현재 화면 스냅샷을 전달한다.
@@ -396,6 +437,8 @@ export class SessionManager {
     // attach된 클라이언트 pty에 raw 0x1b 바이트를 직접 쓰면 클라이언트 쪽 이스케이프 시퀀스 파서에
     // 걸려 응답 생성이나 실행 중인 도구를 실제로는 중단시키지 못하는 경우가 있었다(Bash 도구 실행
     // 중 raw ESC로는 sleep이 끝까지 실행됐지만, tmux의 이름 있는 키 전송으로는 실제로 중단됨을 확인).
+    // 기록 보기 중이면 Escape가 copy-mode 종료로만 소비되므로 먼저 실시간 화면으로 되돌린다.
+    this.leaveCopyMode(terminal);
     sendTmuxEscape(terminal.tmuxName);
     writeAudit(this.database, user.id, "chat.interrupt", "chat", chatId);
     // Claude는 취소된 질문을 자기 입력창에 그대로 복구해두는데(웹 입력창 복구는 별개로 처리한다),
@@ -484,6 +527,7 @@ export class SessionManager {
       approvalFingerprint: null,
       approvalCandidateFingerprint: null,
       tmuxName: chat.tmux_name,
+      rows: DEFAULT_ROWS,
     };
     this.terminals.set(chat.id, terminal);
     // detectTerminalApproval은 원래 onData(새 출력 도착)에서만 돌았는데, 서버 재시작 등으로 이미
@@ -547,6 +591,8 @@ export class SessionManager {
   // 현재 화면을 한 번만 캡처해 승인·작업·권한 모드 판정에 함께 사용한다.
   private scanTerminalState(chat: ChatWithProject, terminal: ManagedTerminal): void {
     if (this.terminals.get(chat.id) !== terminal) return;
+    // 기록 보기 중에는 화면이 과거 내용이라 승인·작업중 판정이 어긋난다. 실시간 화면으로 돌아온 뒤 다시 판정한다.
+    if (terminal.copyMode) return;
     if (terminal.stateScanTimer) {
       clearTimeout(terminal.stateScanTimer);
       terminal.stateScanTimer = undefined;
@@ -684,6 +730,8 @@ export class SessionManager {
       ? adapter?.resolveRateLimitInput?.(decision, this.captureSnapshot(chatId)) ?? null
       : adapter?.approvalInput(decision, requestType);
     if (!terminal || !input) return;
+    // 웹에서 기록을 위로 올려둔 상태면 승인 키가 copy-mode에 먹히므로 먼저 실시간 화면으로 되돌린다.
+    this.leaveCopyMode(terminal);
     // ESC·Enter는 raw 바이트로 직접 쓰면 attach된 클라이언트의 이스케이프 시퀀스 파서에 걸려 실제로는
     // 반영되지 않는 경우가 있어(interrupt()에서 확인한 것과 같은 문제) tmux 이름 있는 키로 보낸다.
     if (input === "\u001b") { sendTmuxEscape(terminal.tmuxName); return; }

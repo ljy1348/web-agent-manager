@@ -17,15 +17,22 @@ test("로그인 후 대시보드와 채팅 화면을 렌더링한다", async ({ 
 
 test("채팅·터미널 모드 전환과 모바일 채팅 메뉴를 렌더링한다", async ({ page }) => {
   const terminalInputs: string[] = [];
+  const terminalScrolls: number[] = [];
+  const terminalRowRequests: number[] = [];
+  const projectImageRequests: string[] = [];
   let pushTerminalOutput: (data: string) => void = () => undefined;
   await page.routeWebSocket("**/ws", (webSocket) => {
     pushTerminalOutput = (data) => webSocket.send(JSON.stringify({ type: "terminal_output", payload: { chatId: 1, data } }));
+    // 실제 서버처럼 구독·리사이즈 뒤 현재 tmux 화면을 다시 보내는 목 스냅샷이다.
+    const sendTerminalSnapshot = (chatId: number): void => {
+      const scrollback = Array.from({ length: 72 }, (_item, index) => `터미널 기록 ${String(index + 1).padStart(2, "0")}\r\n`).join("");
+      webSocket.send(JSON.stringify({ type: "terminal_output", payload: { chatId, data: `\u001b[2J\u001b[H${scrollback}원본 터미널 출력` } }));
+    };
     webSocket.onMessage((raw) => {
       const message = JSON.parse(String(raw));
-      if (message.type === "subscribe_terminal") {
-        const scrollback = Array.from({ length: 72 }, (_item, index) => `터미널 기록 ${String(index + 1).padStart(2, "0")}\r\n`).join("");
-        webSocket.send(JSON.stringify({ type: "terminal_output", payload: { chatId: message.chatId, data: `\u001b[2J\u001b[H${scrollback}원본 터미널 출력` } }));
-      }
+      if (message.type === "terminal_scroll") terminalScrolls.push(message.lines);
+      if ((message.type === "terminal_resize" || message.type === "subscribe_terminal") && Number.isInteger(message.rows)) terminalRowRequests.push(message.rows);
+      if (message.type === "subscribe_terminal" || message.type === "terminal_resize") sendTerminalSnapshot(message.chatId);
       if (message.type === "terminal_input") terminalInputs.push(message.data);
     });
   });
@@ -71,7 +78,16 @@ test("채팅·터미널 모드 전환과 모바일 채팅 메뉴를 렌더링한
       return;
     }
     if (pathname === "/api/chats/1/messages") {
-      await route.fulfill({ json: { messages: [{ id: "u1", role: "user", kind: "text", content: "모바일에서도 채팅에 집중하고 싶어." }, { id: "a1", role: "assistant", kind: "text", content: "프로젝트와 새 채팅은 햄버거 메뉴에서 관리할 수 있습니다. very_long_unbroken_response_text_that_must_wrap_without_horizontal_scrolling\n```diff\n-old line\n+new line\n```" }, { id: "t1", role: "tool", kind: "function_call_output", content: "diff --git a/file b/file\n도구 실행 결과" }, { id: "a2", role: "assistant", kind: "text", content: "화면 확인: [첨부: artifacts/missing.png]" }] } });
+      await route.fulfill({ json: { messages: [{ id: "u1", role: "user", kind: "text", content: "모바일에서도 채팅에 집중하고 싶어." }, { id: "a1", role: "assistant", kind: "text", content: "프로젝트와 새 채팅은 햄버거 메뉴에서 관리할 수 있습니다. very_long_unbroken_response_text_that_must_wrap_without_horizontal_scrolling\n```diff\n-old line\n+new line\n```" }, { id: "t1", role: "tool", kind: "function_call_output", content: "diff --git a/file b/file\n도구 실행 결과" }, { id: "a2", role: "assistant", kind: "text", content: "화면 확인: [첨부: artifacts/missing.png]" }, { id: "a3", role: "assistant", kind: "text", content: "상대 경로: [첨부: artifacts/relative.png]\n절대 경로: [첨부: /home/testuser/myagent/artifacts/absolute.png]" }] } });
+      return;
+    }
+    if (pathname.startsWith("/api/projects/1/files/content/artifacts/")) {
+      projectImageRequests.push(route.request().url());
+      if (pathname.endsWith("/missing.png")) {
+        await route.fulfill({ status: 404, json: { error: "ENOENT: no such file or directory" } });
+        return;
+      }
+      await route.fulfill({ contentType: "image/png", body: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64") });
       return;
     }
     if (pathname === "/api/projects/1/files/download") {
@@ -125,7 +141,10 @@ test("채팅·터미널 모드 전환과 모바일 채팅 메뉴를 렌더링한
   // 박스로 바뀌어야 한다 — 크기 없는 img가 로딩 실패 순간 크기 변하며 채팅창이 들썩이던 문제 재현·검증.
   const brokenThumb = page.locator(".attachment-thumb-broken");
   await expect(brokenThumb).toBeVisible();
-  await expect(page.locator(".attachment-thumb-link")).toHaveCount(0);
+  await expect(page.locator(".attachment-thumb-link img")).toHaveCount(2);
+  await expect.poll(() => page.locator(".attachment-thumb-link img").evaluateAll((images) => images.every((image) => (image as HTMLImageElement).naturalWidth > 0))).toBe(true);
+  expect(projectImageRequests.some((url) => url.includes("/files/content/artifacts/relative.png?chatId=1"))).toBe(true);
+  expect(projectImageRequests.some((url) => url.includes("/files/content/artifacts/absolute.png?chatId=1"))).toBe(true);
   const brokenHeight1 = await brokenThumb.evaluate((element) => element.getBoundingClientRect().height);
   await page.waitForTimeout(300);
   const brokenHeight2 = await brokenThumb.evaluate((element) => element.getBoundingClientRect().height);
@@ -149,8 +168,49 @@ test("채팅·터미널 모드 전환과 모바일 채팅 메뉴를 렌더링한
   await expect(page.locator(".conversation")).toHaveCount(0);
   await expect(page.locator(".terminal-panel-full")).toHaveCSS("flex-grow", "1");
   expect(chatViewModeRequests).toEqual(["terminal"]);
+  // 글자 크기와 줄 간격은 유지하고, 실제 논리 행 수를 tmux와 함께 늘려 패널 세로 공간을 채운다.
+  await expect.poll(() => terminalRowRequests.at(-1) ?? 0).toBeGreaterThan(36);
+  const rowFit = await page.locator(".terminal-host").evaluate((element) => {
+    const style = getComputedStyle(element);
+    return {
+      available: element.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom),
+      rendered: element.querySelector(".xterm-rows")!.getBoundingClientRect().height,
+      visible: element.querySelectorAll(".xterm-rows > div").length,
+      overflow: element.scrollHeight - element.clientHeight,
+      lineHeight: element.querySelector(".xterm-rows")!.getBoundingClientRect().height / element.querySelectorAll(".xterm-rows > div").length,
+    };
+  });
+  expect(rowFit.visible).toBe(terminalRowRequests.at(-1));
+  expect(rowFit.rendered).toBeLessThanOrEqual(rowFit.available + 2);
+  expect(rowFit.available - rowFit.rendered).toBeLessThan(20);
+  expect(rowFit.lineHeight).toBeLessThan(20);
+  expect(rowFit.overflow).toBe(0);
+  expect(await page.evaluate(() => document.documentElement.scrollHeight - document.documentElement.clientHeight)).toBe(0);
+  // 실제 사용자 첨부 화면과 같은 큰 뷰포트에서는 행 수가 더 늘고 같은 정상 줄 간격으로 하단까지 찬다.
+  const rowsBeforeLargeViewport = terminalRowRequests.at(-1)!;
+  await page.setViewportSize({ width: 2048, height: 1114 });
+  await expect.poll(() => terminalRowRequests.at(-1) ?? 0).toBeGreaterThan(rowsBeforeLargeViewport);
+  await expect.poll(() => page.locator(".terminal-host").evaluate((element) => {
+    const style = getComputedStyle(element);
+    const available = element.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
+    const rendered = element.querySelector(".xterm-rows")!.getBoundingClientRect().height;
+    return available - rendered;
+  })).toBeLessThan(40);
   fs.mkdirSync("artifacts", { recursive: true });
   await page.screenshot({ path: "artifacts/ui-chat-terminal.png", fullPage: true });
+  // 실제 tmux attach 화면은 대체 버퍼라 xterm 자체 스크롤백이 없다. 이때 휠은 페이지나 상자를
+  // 움직이는 대신 tmux 기록(copy-mode) 이동 요청이 되어야 한다 — 실제 CLI에서 위로 스크롤한 것과 같다.
+  pushTerminalOutput("\u001b[?1049h\u001b[2J\u001b[H대체 화면 출력");
+  await page.waitForTimeout(50);
+  terminalScrolls.length = 0;
+  await page.locator(".terminal-host").hover();
+  await page.mouse.wheel(0, -300);
+  await expect.poll(() => terminalScrolls.reduce((sum, lines) => sum + lines, 0)).toBeGreaterThan(0);
+  await page.mouse.wheel(0, 300);
+  await expect.poll(() => terminalScrolls.some((lines) => lines < 0)).toBe(true);
+  expect(await page.evaluate(() => window.scrollY)).toBe(0);
+  expect(await page.locator(".terminal-host").evaluate((element) => element.scrollTop)).toBe(0);
+  pushTerminalOutput("\u001b[?1049l");
   await page.reload();
   await expect(page.getByLabel("채팅 터미널")).toBeVisible();
   await page.getByRole("button", { name: "채팅 모드" }).click();
@@ -200,14 +260,16 @@ test("채팅·터미널 모드 전환과 모바일 채팅 메뉴를 렌더링한
   const visibleTerminalRows = page.locator(".terminal-host .xterm-rows");
   await expect(page.getByRole("toolbar", { name: "모바일 터미널 키" })).toBeVisible();
   expect((await terminalStage.boundingBox())!.height).toBeGreaterThan(300);
-  // 세로 터치 제스처는 바깥 문서를 움직이지 않고 xterm의 실제 스크롤백을 이동해야 한다.
+  // 세로 터치 제스처는 바깥 문서를 절대 움직이지 않는다. 클라이언트는 스크롤백을 쌓지 않으므로
+  // (기록의 정본은 tmux copy-mode다) 잘린 행이 남아 있으면 상자를 옮기고, 없으면 tmux 기록을 요청한다.
   await expect(visibleTerminalRows).toContainText("터미널 기록");
   const documentScrollBefore = await page.evaluate(() => window.scrollY);
-  const terminalRowsBefore = await visibleTerminalRows.textContent();
+  const hostScrollBefore = await terminalHost.evaluate((element) => element.scrollTop);
+  terminalScrolls.length = 0;
   await terminalHost.dispatchEvent("pointerdown", { pointerType: "touch", pointerId: 7, clientX: 180, clientY: 280, bubbles: true });
   await terminalHost.dispatchEvent("pointermove", { pointerType: "touch", pointerId: 7, clientX: 180, clientY: 390, bubbles: true });
   await terminalHost.dispatchEvent("pointerup", { pointerType: "touch", pointerId: 7, clientX: 180, clientY: 390, bubbles: true });
-  await expect.poll(() => visibleTerminalRows.textContent()).not.toBe(terminalRowsBefore);
+  await expect.poll(async () => terminalScrolls.some((lines) => lines > 0) || await terminalHost.evaluate((element) => element.scrollTop) !== hostScrollBefore).toBe(true);
   expect(await page.evaluate(() => window.scrollY)).toBe(documentScrollBefore);
   // Codex·Claude TUI가 mouse mode를 켠 상태에서는 같은 스와이프가 xterm 스크롤백이 아니라
   // 실제 PTY mouse-wheel 시퀀스로 전달되어 TUI 자체 기록을 움직여야 한다.
