@@ -4,6 +4,7 @@ import {
 } from "lucide-react";
 import { api } from "../../api";
 import { isImagePath, MessageBody } from "../../lib/attachments";
+import { projectFileContentUrl } from "../../lib/file-links";
 import { bytes } from "../../lib/format";
 import type { Json } from "../../types";
 
@@ -30,12 +31,6 @@ function fileDate(value: unknown): string {
   return FILE_DATE_FORMATTER.format(date);
 }
 
-// 파일 미리보기 원본을 경로 세그먼트별로 인코딩한 API URL로 만든다.
-export function fileContentUrl(projectId: number, filePath: string, chatId?: number | null): string {
-  const encodedPath = filePath.split("/").filter(Boolean).map(encodeURIComponent).join("/");
-  return `/api/projects/${projectId}/files/content/${encodedPath}${chatId ? `?chatId=${chatId}` : ""}`;
-}
-
 // 파일 확장자에 맞는 목록 아이콘을 선택한다.
 function FileIcon({ path }: { path: string }): React.ReactElement {
   if (/\.(png|jpe?g|gif|webp|bmp)$/i.test(path)) return <Image aria-hidden="true" />;
@@ -52,12 +47,12 @@ function isEditable(preview: Json | null): boolean {
 }
 
 // 서버가 판정한 파일 종류에 맞는 미리보기 본문을 렌더링한다.
-function PreviewContent({ preview, project, chatId, openProjectFile }: { preview: Json; project: Json; chatId?: number | null; openProjectFile: (path: string) => void }): React.ReactElement {
-  const url = fileContentUrl(project.id, preview.path, chatId);
+function PreviewContent({ preview, project, chatId, workspacePath, openProjectFile }: { preview: Json; project: Json; chatId?: number | null; workspacePath?: string; openProjectFile: (path: string) => void }): React.ReactElement {
+  const url = projectFileContentUrl(project.id, preview.path, chatId);
   if (!preview.previewable) return <p className="muted">{preview.reason || "미리볼 수 없는 파일입니다."}</p>;
   if (preview.kind === "markdown") {
     const linkBasePath = preview.path.split("/").slice(0, -1).join("/");
-    return <div className="file-preview-markdown"><MessageBody content={preview.content || ""} projectId={project.id} projectPath={project.path} linkBasePath={linkBasePath} onOpenProjectFile={openProjectFile} />{preview.truncated && <p className="preview-truncated">일부만 표시됨</p>}</div>;
+    return <div className="file-preview-markdown"><MessageBody content={preview.content || ""} projectId={project.id} projectPath={project.path} workspacePath={workspacePath} chatId={chatId} linkBasePath={linkBasePath} onOpenProjectFile={openProjectFile} />{preview.truncated && <p className="preview-truncated">일부만 표시됨</p>}</div>;
   }
   if (preview.kind === "html") return <iframe className="file-preview-frame" src={url} sandbox="" title={`${preview.path} HTML 미리보기`} />;
   if (preview.kind === "image") return <img className="file-preview-media" src={url} alt={preview.path} />;
@@ -211,7 +206,7 @@ export function FilesView({ project, chat, target, onNavigate }: { project: Json
         className={`file-row ${entry.directory ? "file-folder" : "file-item"}${preview?.path === relativePath ? " active" : ""}`}
       >
         <button type="button" className="file-row-open" title={entry.name} aria-label={`${entry.directory ? "폴더 열기" : "파일 미리보기"}: ${entry.name}`} onClick={() => openEntry(entry, relativePath)}>
-          {image && <span className="file-thumb"><img src={fileContentUrl(project.id, relativePath, chat?.id)} alt={entry.name} loading="lazy" /></span>}
+          {image && <span className="file-thumb"><img src={projectFileContentUrl(project.id, relativePath, chat?.id)} alt={entry.name} loading="lazy" /></span>}
           {!image && <span className="file-row-icon">{entry.directory ? <FolderOpen aria-hidden="true" /> : <FileIcon path={relativePath} />}</span>}
           <b>{entry.name}</b>
         </button>
@@ -234,7 +229,7 @@ export function FilesView({ project, chat, target, onNavigate }: { project: Json
           <button type="button" disabled={saving} onClick={() => { if (!confirmDiscard()) return; setDraft(null); setEditStatus(""); }}>취소</button>
           {editStatus && <span className="inline-status">{editStatus}</span>}
         </div>
-      </> : preview && project ? <><PreviewContent preview={preview} project={project} chatId={chat?.id} openProjectFile={(path) => { if (!confirmDiscard()) return; onNavigate?.(path); void revealPath(path); }} />
+      </> : preview && project ? <><PreviewContent preview={preview} project={project} chatId={chat?.id} workspacePath={chat?.worktree_path} openProjectFile={(path) => { if (!confirmDiscard()) return; onNavigate?.(path); void revealPath(path); }} />
         {editStatus && <p className="inline-status">{editStatus}</p>}
       </> : <p className="muted">파일을 선택하면 형식에 맞는 미리보기가 표시됩니다.</p>}
     </aside>}</div>

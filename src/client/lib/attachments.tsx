@@ -1,10 +1,11 @@
 import React, { useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { projectFilePathFromHref } from "./file-links";
+import { projectFileContentUrl, projectFilePathFromHref } from "./file-links";
 
 // 업로드 첨부 참조 표시("[첨부: 경로]")와 이미지 확장자 판정에 쓰는 공통 규칙.
 const ATTACHMENT_MARKER = /\[첨부: ([^\]]+)\]/g;
+const STORED_ATTACHMENT_PATH = /^\.(?:web-agent-manager|myagent)-uploads\/[1-9]\d*\/[^/]+$/;
 const IMAGE_EXTENSION = /\.(png|jpe?g|gif|webp|bmp)$/i;
 
 // 첨부 경로가 브라우저가 바로 그릴 수 있는 이미지 형식인지 확인한다.
@@ -17,12 +18,30 @@ export function attachmentUrl(projectId: number, path: string, download = false)
   return `/api/projects/${projectId}/attachments/content?path=${encodeURIComponent(path)}${download ? "&download=1" : ""}`;
 }
 
-// 메시지 본문의 "[첨부: 경로]"를 이미지 썸네일 또는 파일 탭 링크로 변환한다.
-function substituteAttachments(content: string, projectId?: number): string {
+// 현재 작업공간과 공유 프로젝트 루트 중 하나에 속하는 메시지 파일 경로를 상대경로로 바꾼다.
+function messageProjectFile(path: string | undefined, projectPath?: string, workspacePath?: string, relativeTo = ""): string | null {
+  const workspaceFile = projectFilePathFromHref(path, workspacePath || projectPath, relativeTo);
+  if (workspaceFile !== null) return workspaceFile;
+  return workspacePath && workspacePath !== projectPath ? projectFilePathFromHref(path, projectPath, relativeTo) : null;
+}
+
+// 마크다운 링크 목적지에서 공백·괄호 등이 문법으로 오인되지 않도록 경로 세그먼트를 인코딩한다.
+function markdownFileHref(filePath: string): string {
+  return filePath.split("/").map(encodeURIComponent).join("/");
+}
+
+// 메시지 본문의 "[첨부: 경로]"를 저장 첨부 API 또는 프로젝트 파일 미리보기로 변환한다.
+function substituteAttachments(content: string, projectId?: number, projectPath?: string, workspacePath?: string, relativeTo = ""): string {
   if (!projectId) return content;
-  return content.replace(ATTACHMENT_MARKER, (_match, attachedPath) => isImagePath(attachedPath)
-    ? `![${attachedPath}](${attachmentUrl(projectId, attachedPath)})`
-    : `[첨부: ${attachedPath}](${attachmentUrl(projectId, attachedPath, true)})`);
+  return content.replace(ATTACHMENT_MARKER, (marker, attachedPath: string) => {
+    if (STORED_ATTACHMENT_PATH.test(attachedPath)) return isImagePath(attachedPath)
+      ? `![${attachedPath}](${attachmentUrl(projectId, attachedPath)})`
+      : `[첨부: ${attachedPath}](${attachmentUrl(projectId, attachedPath, true)})`;
+    const projectFile = messageProjectFile(attachedPath, projectPath, workspacePath, relativeTo);
+    if (projectFile === null) return marker;
+    const href = markdownFileHref(projectFile);
+    return isImagePath(projectFile) ? `![${attachedPath}](${href})` : `[첨부: ${attachedPath}](${href})`;
+  });
 }
 
 // AI 응답을 마크다운으로 렌더링한다(GFM: 표·취소선·작업 목록 포함). 일반 프로젝트 이미지는 파일
@@ -50,25 +69,26 @@ function isAttachmentUrl(src: string, projectId: number | undefined): boolean {
 }
 
 // Markdown 링크 중 현재 프로젝트 파일만 파일 탭으로 보내고 외부 링크는 새 탭으로 유지한다.
-export function MessageBody({ content, projectId, projectPath, linkBasePath = "", onOpenProjectFile }: { content: string; projectId?: number; projectPath?: string; linkBasePath?: string; onOpenProjectFile?: (path: string) => void }): React.ReactElement {
+export function MessageBody({ content, projectId, projectPath, workspacePath, chatId, linkBasePath = "", onOpenProjectFile }: { content: string; projectId?: number; projectPath?: string; workspacePath?: string; chatId?: number | null; linkBasePath?: string; onOpenProjectFile?: (path: string) => void }): React.ReactElement {
   return <div className="message-body markdown-body">
     <ReactMarkdown
       remarkPlugins={[remarkGfm]}
       components={{
         img: ({ src, alt }) => {
-          const source = String(src);
-          const projectFile = isAttachmentUrl(source, projectId) ? null : projectFilePathFromHref(source, projectPath, linkBasePath);
-          return <AttachmentImage src={source} alt={alt} projectFile={projectFile} onOpenProjectFile={onOpenProjectFile} />;
+          const source = String(src ?? "");
+          const projectFile = isAttachmentUrl(source, projectId) ? null : messageProjectFile(source, projectPath, workspacePath, linkBasePath);
+          const imageSource = projectFile !== null && projectId ? projectFileContentUrl(projectId, projectFile, chatId) : source;
+          return <AttachmentImage src={imageSource} alt={alt} projectFile={projectFile} onOpenProjectFile={onOpenProjectFile} />;
         },
         a: ({ href, children }) => {
-          const projectFile = href && isAttachmentUrl(href, projectId) ? null : projectFilePathFromHref(href, projectPath, linkBasePath);
+          const projectFile = href && isAttachmentUrl(href, projectId) ? null : messageProjectFile(href, projectPath, workspacePath, linkBasePath);
           return projectFile !== null && onOpenProjectFile
             ? <a href={href} className="project-file-link" onClick={(event) => { event.preventDefault(); onOpenProjectFile(projectFile); }}>{children}</a>
             : <a href={href} target="_blank" rel="noreferrer">{children}</a>;
         },
       }}
     >
-      {substituteAttachments(content, projectId)}
+      {substituteAttachments(content, projectId, projectPath, workspacePath, linkBasePath)}
     </ReactMarkdown>
   </div>;
 }

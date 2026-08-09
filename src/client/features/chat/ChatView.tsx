@@ -56,13 +56,13 @@ function preferredEffortOption(options: Json, selectedChat: Json): Json | null {
 
 // 일반 응답은 바로 표시하고 도구·diff 상세는 접힌 상태로 렌더링한다. 본문에 첨부 표시가 있으면
 // 사람이 올렸든(파일 첨부) 세션이 검증용으로 남겼든 구분 없이 실제 이미지 썸네일로 바꿔 보여준다.
-function MessageCard({ message, showDetails, project, onOpenProjectFile }: { message: Json; showDetails: boolean; project?: Json; onOpenProjectFile?: (path: string) => void }): React.ReactElement | null {
+function MessageCard({ message, showDetails, project, chat, onOpenProjectFile }: { message: Json; showDetails: boolean; project?: Json; chat?: Json; onOpenProjectFile?: (path: string) => void }): React.ReactElement | null {
   const display = splitMessageContent(message);
   if (!display.primary && !display.details.length) return null;
   if (!display.primary && !showDetails) return null;
   return <article className={`message ${message.role} ${display.primary ? "" : "message-detail-only"}`}>
     <small>{message.role}</small>
-    {display.primary && <MessageBody content={display.primary} projectId={project?.id} projectPath={project?.path} onOpenProjectFile={onOpenProjectFile} />}
+    {display.primary && <MessageBody content={display.primary} projectId={project?.id} projectPath={project?.path} workspacePath={chat?.worktree_path} chatId={chat?.id} onOpenProjectFile={onOpenProjectFile} />}
     {/* 체크박스는 "이 상세들이 존재한다는 걸 보여줄지"만 결정한다. 전부 강제로 펼치면(open 고정)
         diff가 많은 대화에서 스크롤이 감당 안 돼서, 각 항목은 기본 접힘 상태로 두고 클릭해서
         개별로 펼치게 한다(<details>는 비제어 요소라 클릭 상태를 브라우저가 알아서 기억한다). */}
@@ -721,7 +721,7 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
           {loadingMore && <div className="load-more-indicator">이전 메시지 불러오는 중…</div>}
           <div style={{ height: rowVirtualizer.getTotalSize(), position: "relative", width: "100%" }}>
             {rowVirtualizer.getVirtualItems().map((virtualRow) => <div key={visibleMessages[virtualRow.index].id} data-index={virtualRow.index} ref={rowVirtualizer.measureElement} style={{ position: "absolute", top: 0, left: 0, width: "100%", transform: `translateY(${virtualRow.start}px)` }}>
-              <MessageCard message={visibleMessages[virtualRow.index]} showDetails={showToolDetails} project={project} onOpenProjectFile={onOpenProjectFile} />
+              <MessageCard message={visibleMessages[virtualRow.index]} showDetails={showToolDetails} project={project} chat={selectedChat} onOpenProjectFile={onOpenProjectFile} />
             </div>)}
           </div>
         </div>
