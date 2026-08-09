@@ -102,9 +102,9 @@
 | `scripts/check-public-build.mjs` | `checkPublicBuild` | 프로덕션 `dist`의 텍스트 산출물에 빌드 머신 절대 경로가 남으면 빌드를 실패 처리 |
 | `packaging/*` | 간단 설치·관리자 생성·실행 진입점 | Linux `setup.sh`, macOS `setup.command`, Windows `setup-windows.cmd` 단일 진입점과 단계별 설치·관리자 생성·실행 스크립트. Windows는 WSL2로 동일 Linux 런타임 사용 |
 | `.github/workflows/ci.yml`, `.github/dependabot.yml` | PR 검증·의존성 갱신 | 전체 npm 감사·타입·테스트·빌드를 강제하고 npm·Action·Docker 업데이트를 매주 제안 |
-| `.github/workflows/release-desktop.yml` | Electron 교차 플랫폼 빌드 | 고정 SHA Action으로 사전 검증 후 Linux·Windows와 네이티브 Intel·Apple Silicon runner별 macOS 설치 파일, 간단 설치 ZIP을 GitHub 자산 이름으로 정규화·중복 검사하고 태그 Release에 SBOM·전체 체크섬과 함께 첨부 |
+| `.github/workflows/release-desktop.yml` | Electron 교차 플랫폼 빌드 | 고정 SHA Action으로 사전 검증 후 Linux·Windows와 네이티브 Intel·Apple Silicon runner별 macOS 설치 파일, 간단 설치 ZIP을 GitHub 자산 이름으로 정규화·중복 검사하고 태그 Release에 SBOM·전체 체크섬과 함께 첨부. Release와 중복되는 Actions 중간 아티팩트는 1일 보존 |
 | `Dockerfile`, `docker-compose.yml`, `docker/entrypoint.sh` | Docker 배포 | 전용 builder 경로에서 공개 산출물을 검사하고 Node.js 22·tmux·Git·gh·고정 버전 Codex·Claude와 production 앱을 비루트 UID 10001로 실행하며 데이터·프로젝트·CLI 홈 볼륨을 영속화 |
-| `.github/workflows/docker-image.yml` | GHCR 다중 아키텍처 이미지 | `main`·태그·수동 실행에서 linux/amd64·linux/arm64 이미지를 공개 `web-agent-manager-app` 패키지에 provenance·SBOM 증명과 함께 게시 |
+| `.github/workflows/docker-image.yml` | GHCR 다중 아키텍처 이미지 | `main`·태그·수동 실행에서 linux/amd64·linux/arm64 이미지를 공개 `web-agent-manager-app` 패키지에 provenance·SBOM 증명과 함께 게시. 저장 공간을 제한하기 위해 Buildx 기록 아티팩트를 끄고 최종 이미지 레이어 중심 `mode=min` Actions 캐시 사용 |
 | `skills/web-agent-manager-session-context/SKILL.md` | 세션 조회 스킬 | “채팅 160 참고” 같은 번호·프로젝트 요청을 구조화 문맥 조회로 변환하고 MCP가 없으면 CLI 사용 |
 | `skills/web-agent-manager-delegate/SKILL.md` | 작업 전달 스킬 | 원본 문맥을 확인하고 대상 채팅 또는 새 반대 공급자 자식 채팅에 멱등 전달한 뒤 완료 결과를 회수·검토. 명시적 위임과 이점이 분명한 복잡한 교차검증에만 제한적으로 사용 |
 | `scripts/check-usage-tui.ts` | 실제 TUI 검증 | Codex·Claude 사용량 화면 통합 테스트 |
