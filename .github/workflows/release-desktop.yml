@@ -71,6 +71,7 @@ jobs:
             release/desktop/*.exe
             release/archives/*
           if-no-files-found: error
+          retention-days: 1
 
   release:
     if: startsWith(github.ref, 'refs/tags/')

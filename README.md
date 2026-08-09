@@ -104,7 +104,7 @@ docker compose up -d --build
 
 Compose는 WAM DB·로그를 `wam-data`, clone 프로젝트를 `wam-projects`, 세 CLI의 사용자 설정을 `wam-home` 볼륨에 보존한다. 호스트 프로젝트를 직접 노출하려면 `wam-projects:/workspace`를 `/호스트/경로:/workspace` bind mount로 바꾸되 컨테이너 서비스 UID `10001`의 읽기·쓰기 권한을 준비해야 한다. Docker socket과 `privileged` 권한은 사용하지 않는다. 외부 주소로 서비스할 때는 `WEB_AGENT_MANAGER_PUBLIC_URL`을 실제 HTTPS origin으로 지정한다.
 
-태그와 `main` push는 `.github/workflows/docker-image.yml`에서 linux/amd64·linux/arm64 이미지를 빌드해 `ghcr.io/<소유자>/web-agent-manager-app`에 게시한다. builder는 런타임 `/app`과 구분되는 전용 경로를 사용해 공개 산출물의 빌드 머신 절대 경로 검사를 유지한다.
+태그와 `main` push는 `.github/workflows/docker-image.yml`에서 linux/amd64·linux/arm64 이미지를 빌드해 `ghcr.io/<소유자>/web-agent-manager-app`에 게시한다. builder는 런타임 `/app`과 구분되는 전용 경로를 사용해 공개 산출물의 빌드 머신 절대 경로 검사를 유지한다. Actions 저장 공간이 빌드마다 누적되지 않도록 Docker 캐시는 최종 이미지 레이어 중심의 `mode=min`으로 내보내고 별도 Buildx 기록 아티팩트는 만들지 않는다.
 
 ### v0.3.0 압축 배포
 
@@ -128,7 +128,7 @@ npm run desktop
 npm run desktop:package
 ```
 
-설치 파일은 `release/desktop/`에 생성된다. `.github/workflows/release-desktop.yml`은 태그 또는 수동 실행 시 Linux x64 AppImage·deb, macOS Intel x64·Apple Silicon arm64 dmg·zip, Windows x64 NSIS·portable을 각 운영체제 runner에서 빌드한다. macOS는 네이티브 모듈 아키텍처를 보장하기 위해 Intel과 Apple Silicon runner를 분리하며, 태그 빌드는 GitHub 자산 이름에 맞게 공백을 점으로 정규화하고 파일명의 중복을 검사한 뒤 해당 GitHub Release에 산출물과 전체 체크섬을 자동 첨부한다. Windows Electron은 네이티브 tmux 백엔드를 포함하지 않으므로 `setup-windows.cmd`로 실행한 WSL2 서버 또는 `WEB_AGENT_MANAGER_SERVER_URL`로 지정한 기존 서버를 여는 데스크톱 셸이다. 현재 데스크톱 산출물에는 플랫폼 코드 서명을 적용하지 않으므로 운영체제의 미확인 게시자 경고가 표시될 수 있다.
+설치 파일은 `release/desktop/`에 생성된다. `.github/workflows/release-desktop.yml`은 태그 또는 수동 실행 시 Linux x64 AppImage·deb, macOS Intel x64·Apple Silicon arm64 dmg·zip, Windows x64 NSIS·portable을 각 운영체제 runner에서 빌드한다. macOS는 네이티브 모듈 아키텍처를 보장하기 위해 Intel과 Apple Silicon runner를 분리하며, 태그 빌드는 GitHub 자산 이름에 맞게 공백을 점으로 정규화하고 파일명의 중복을 검사한 뒤 해당 GitHub Release에 산출물과 전체 체크섬을 자동 첨부한다. Release에 복사된 뒤 중복이 되는 Actions 중간 아티팩트는 1일만 보존한다. Windows Electron은 네이티브 tmux 백엔드를 포함하지 않으므로 `setup-windows.cmd`로 실행한 WSL2 서버 또는 `WEB_AGENT_MANAGER_SERVER_URL`로 지정한 기존 서버를 여는 데스크톱 셸이다. 현재 데스크톱 산출물에는 플랫폼 코드 서명을 적용하지 않으므로 운영체제의 미확인 게시자 경고가 표시될 수 있다.
 
 ### 소스 설치
 
