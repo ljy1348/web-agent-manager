@@ -71,7 +71,30 @@ else
   require_command tmux tmux "Debian/Ubuntu 사용 시: sudo apt install tmux"
 fi
 require_command git git "Debian/Ubuntu 사용 시: sudo apt install git"
-require_command gh gh "Debian/Ubuntu 사용 시: sudo apt install gh (또는 https://cli.github.com/ 참고)"
+# Debian/Ubuntu 기본 apt 저장소의 gh는 오래된 경우가 많아, 앱이 쓰는 최신 플래그
+# (예: gh auth login --skip-ssh-key)를 못 알아듣고 실패한다(실측). --help 출력으로
+# 지원 여부를 확인해, 없으면 GitHub 공식 apt 저장소를 등록하고 최신 버전을 설치한다.
+ensure_gh() {
+  if command -v gh >/dev/null 2>&1 && gh auth login --help 2>&1 | grep -q -- "--skip-ssh-key"; then
+    return
+  fi
+  if can_apt_install; then
+    printf '%s\n' "gh가 없거나 오래되어 GitHub 공식 저장소로 자동 설치합니다."
+    apt-get install -y --no-install-recommends ca-certificates curl wget gnupg >/dev/null
+    install -d -m 755 /etc/apt/keyrings
+    wget -qO /etc/apt/keyrings/githubcli-archive-keyring.gpg https://cli.github.com/packages/githubcli-archive-keyring.gpg
+    chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list
+    apt-get update -qq
+    apt-get install -y --no-install-recommends gh >/dev/null
+  fi
+  if ! command -v gh >/dev/null 2>&1; then
+    printf '%s\n' "GitHub CLI(gh)를 설치하세요: https://cli.github.com/" >&2
+    exit 1
+  fi
+}
+ensure_gh
 # node-pty 등 네이티브 모듈은 이 환경용 prebuild가 없으면 npm이 그 자리에서 컴파일을
 # 시도한다(실측: linux-x64인데도 prebuild 미존재로 빌드 전환). 미리 확인해 gyp 에러
 # 대신 명확한 안내를 주거나(가능하면) 바로 설치한다.

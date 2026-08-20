@@ -1,6 +1,6 @@
 import type { IPty } from "node-pty";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AppConfig } from "../src/server/core/config";
 import type { RealtimeHub } from "../src/server/services/realtime";
 import { CliAuthManager, type CliAuthRuntime } from "../src/server/services/cli-auth";
@@ -91,6 +91,24 @@ describe("CLI 인증 상태 캐시", () => {
     expect((await grokStatus("You are not authenticated.\n\nDefault model: grok-4.6")).authenticated).toBe(false);
   });
 
+  // claude도 grok과 같은 함정이 있다: "auth status --json"이 로그인하지 않아도 exit 0으로 정상
+  // 종료하고 본문에만 loggedIn: false를 찍는다(실사용 보고: 앱이 항상 "인증됨"으로 오판).
+  it("claude도 종료 코드가 아니라 loggedIn 값으로 로그인 여부를 판정한다", async () => {
+    const build = (output: string): CliAuthRuntime => ({
+      findExecutable: (command) => `/usr/local/bin/${command}`,
+      commandSucceeds: async () => true,
+      commandOutput: async (command) => (path.basename(command) === "claude" ? output : ""),
+      spawn: () => { throw new Error("호출되면 안 됩니다."); },
+    });
+    const claudeStatus = async (output: string) => {
+      const manager = new CliAuthManager(config(), realtime([]), accounts(), build(output));
+      const status = await manager.status();
+      return status.providers.find((provider) => provider.provider === "claude")!;
+    };
+    expect((await claudeStatus('{\n  "loggedIn": true,\n  "authMethod": "claude.ai"\n}')).authenticated).toBe(true);
+    expect((await claudeStatus('{\n  "loggedIn": false,\n  "authMethod": "none"\n}')).authenticated).toBe(false);
+  });
+
   it("로그인 PTY 종료 뒤 해당 공급자만 한 번 재검사한다", async () => {
     const calls: string[] = [];
     const authenticated = new Set(["codex", "gh"]);
@@ -120,5 +138,36 @@ describe("CLI 인증 상태 캐시", () => {
     });
     expect(calls.filter((command) => command === "claude")).toHaveLength(2);
     expect(events).toContainEqual({ type: "cli_auth_changed", payload: { provider: "claude", accountId: 1, exitCode: 0 } });
+  });
+
+  // 로그인이 성공해도 CLI가 스스로 종료하지 않는 경우가 있다(실측: 기기 코드 인증 완료 뒤 codex TUI가
+  // 같은 화면에 계속 떠 있음). onExit만 기다리면 인증 상태가 영원히 안 바뀌어 보이므로, PTY가 살아있는
+  // 동안에도 주기적으로 다시 확인해야 한다.
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+  it("로그인 PTY가 안 끝나도 살아있는 동안 주기적으로 재확인해 인증 완료를 반영한다", async () => {
+    vi.useFakeTimers();
+    const events: Array<{ type: string; payload: unknown }> = [];
+    const authenticated = new Set(["gh"]);
+    const runtime: CliAuthRuntime = {
+      findExecutable: (command) => `/usr/local/bin/${command}`,
+      commandSucceeds: async (command) => authenticated.has(path.basename(command)),
+      spawn: () => terminal(() => undefined),
+    };
+    const manager = new CliAuthManager(config(), realtime(events), accounts(), runtime);
+    await manager.initialize();
+
+    manager.start("codex", 2);
+    let status = await manager.status();
+    expect(status.providers.find((provider) => provider.provider === "codex")).toMatchObject({ authenticated: false, running: true });
+
+    // 로그인 PTY는 아직 살아있는 채로(onExit 없이) 실제 로그인만 뒤늦게 완료된 상황을 흉내낸다.
+    authenticated.add("codex");
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    status = await manager.status();
+    expect(status.providers.find((provider) => provider.provider === "codex")).toMatchObject({ authenticated: true, running: true });
+    expect(events).toContainEqual({ type: "cli_auth_changed", payload: { provider: "codex", accountId: 2, exitCode: null } });
   });
 });

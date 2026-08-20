@@ -31,6 +31,7 @@ interface AuthTerminalSession {
   output: string;
   running: boolean;
   exitCode: number | null;
+  pollTimer?: ReturnType<typeof setInterval>;
 }
 
 export interface CliAuthRuntime {
@@ -53,7 +54,10 @@ const AUTH_COMMANDS: Record<CliAuthProvider, { executable: string; args: string[
 // 상태 명령이 0으로 끝나 종료 코드만 보면 항상 "로그인됨"으로 잘못 표시된다).
 const STATUS_COMMANDS: Record<CliAuthProvider, { executable: string; args: string[]; unauthenticatedPattern?: RegExp }> = {
   codex: { executable: "codex", args: ["login", "status"] },
-  claude: { executable: "claude", args: ["auth", "status", "--json"] },
+  // claude도 grok과 같은 함정이 있다: 로그인하지 않아도 "auth status --json"이 정상 종료(exit 0)하고
+  // 본문에 loggedIn: false만 찍는다(실측: 종료 코드만 보던 앱이 항상 "인증됨"으로 오판). JSON 본문의
+  // loggedIn 값으로 판정한다.
+  claude: { executable: "claude", args: ["auth", "status", "--json"], unauthenticatedPattern: /"loggedIn"\s*:\s*false/ },
   grok: { executable: "grok", args: ["models"], unauthenticatedPattern: /not authenticated|not logged in/i },
   github: { executable: "gh", args: ["auth", "status", "--hostname", "github.com"] },
 };
@@ -209,8 +213,23 @@ export class CliAuthManager {
     child.onExit(({ exitCode }) => {
       session.running = false;
       session.exitCode = exitCode;
+      if (session.pollTimer) clearInterval(session.pollTimer);
       void this.refreshAfterExit(target, exitCode);
     });
+    // 로그인이 성공해도 CLI 프로세스가 스스로 안 끝나는 경우가 있다(실측: 기기 코드 인증 완료 뒤
+    // codex TUI가 같은 화면에 계속 떠 있음). onExit만 믿으면 인증 상태가 영원히 안 바뀌어 보이므로,
+    // PTY가 살아있는 동안에도 주기적으로 실제 로그인 여부를 다시 확인해 갱신한다.
+    session.pollTimer = setInterval(() => {
+      void (async () => {
+        const previous = this.statuses.get(key)?.authenticated ?? false;
+        const status = await this.inspectTarget(target);
+        this.statuses.set(key, status);
+        if (status.authenticated && !previous) {
+          this.realtime.broadcast("cli_auth_changed", { provider: target.provider, accountId: target.accountId, exitCode: null });
+        }
+      })();
+    }, 5_000);
+    session.pollTimer.unref();
   }
 
   // 요청한 공급자·계정 조합이 실제로 등록된 대상인지 확인한다.
