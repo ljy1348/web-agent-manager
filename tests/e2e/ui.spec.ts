@@ -1477,12 +1477,12 @@ test("채팅과 GitHub 탭에서 채팅별 브랜치와 worktree를 전환한다
   await expect(page.getByRole("heading", { name: "파일 diff" })).toBeVisible();
   await expect(page.getByText("변경 파일을 선택하면", { exact: false })).toBeVisible();
   expect(diffRequests).toHaveLength(0);
-  await page.getByRole("checkbox", { name: /src\/selected\.ts/ }).check();
+  await page.getByRole("checkbox", { name: /^selected\.ts/ }).check();
   await expect(page.getByRole("heading", { name: "선택 파일 diff (1)" })).toBeVisible();
   await expect(page.getByText("selected change", { exact: false })).toBeVisible();
   expect(diffRequests).toHaveLength(1);
   expect(new URLSearchParams(diffRequests[0]).getAll("file")).toEqual(["src/selected.ts"]);
-  await page.getByRole("checkbox", { name: /src\/deleted\.ts/ }).check();
+  await page.getByRole("checkbox", { name: /^deleted\.ts/ }).check();
   await expect(page.getByRole("heading", { name: "선택 파일 diff (2)" })).toBeVisible();
   await expect(page.getByText("deleted change", { exact: false })).toBeVisible();
   expect(diffRequests).toHaveLength(2);
