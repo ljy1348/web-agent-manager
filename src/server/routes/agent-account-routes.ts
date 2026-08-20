@@ -9,7 +9,7 @@ import type { UsageMonitor } from "../services/usage-monitor";
 import type { SessionManager } from "../services/session-manager";
 import type { AgentAccountSummary, Provider, UsageMonitorScope } from "../../shared/types";
 
-const PROVIDERS = new Set<Provider>(["codex", "claude"]);
+const PROVIDERS = new Set<Provider>(["codex", "claude", "grok"]);
 const SCOPES = new Set<UsageMonitorScope>(["default", "all"]);
 
 // 계정 슬롯 관리와 사용량 조회 범위 설정 API를 구성한다.

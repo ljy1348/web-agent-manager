@@ -9,6 +9,7 @@ import { CodexAdapter } from "../src/server/providers/codex";
 import { ClaudeAdapter } from "../src/server/providers/claude";
 import { HistoryCache } from "../src/server/services/history-cache";
 import { SessionBackupService } from "../src/server/services/session-backups";
+import { TokenUsageLedger } from "../src/server/services/token-usage-ledger";
 
 const cleanup: Array<() => void> = [];
 
@@ -60,10 +61,11 @@ function prepareService(provider: "codex" | "claude") {
   cleanup.push(() => fs.rmSync(historyRoot, { recursive: true, force: true }));
   const adapter = provider === "codex" ? testAdapter(new CodexAdapter(), historyRoot) : testAdapter(new ClaudeAdapter("", {}), historyRoot);
   const historyCache = new HistoryCache();
-  const service = new SessionBackupService(config, database, [adapter], historyCache);
+  const tokenUsage = new TokenUsageLedger(database);
+  const service = new SessionBackupService(config, database, [adapter], historyCache, tokenUsage);
   database.prepare("INSERT INTO projects(name, path, source) VALUES ('project', ?, 'manual')").run(projectPath);
   const project = database.prepare("SELECT id FROM projects WHERE path = ?").get(projectPath) as { id: number };
-  return { database, projectPath, historyRoot, historyCache, service, projectId: project.id, adapter };
+  return { database, projectPath, historyRoot, historyCache, service, tokenUsage, projectId: project.id, adapter };
 }
 
 // Codex JSONL fixture를 작성한다.
@@ -76,6 +78,7 @@ function writeCodexHistory(historyRoot: string, cwd: string): string {
     { type: "turn_context", payload: { model: "gpt-5.5", effort: "high" } },
     { type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "코덱스 백업 테스트" }] }, timestamp: "2026-07-07T00:00:01.000Z" },
     { type: "response_item", payload: { type: "message", id: "a1", role: "assistant", content: [{ type: "output_text", text: "복원 가능합니다." }] }, timestamp: "2026-07-07T00:00:02.000Z" },
+    { type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { input_tokens: 100, cached_input_tokens: 25, output_tokens: 20, reasoning_output_tokens: 5, total_tokens: 120 } } }, timestamp: "2026-07-07T00:00:03.000Z" },
   ];
   fs.writeFileSync(file, lines.map((line) => JSON.stringify(line)).join("\n"));
   return file;
@@ -88,7 +91,7 @@ function writeClaudeHistory(historyRoot: string, cwd: string): string {
   const file = path.join(dir, "claude-session-1.jsonl");
   const lines = [
     { type: "user", sessionId: "claude-session-1", cwd, message: { content: "클로드 백업 테스트" }, timestamp: "2026-07-07T00:00:00.000Z" },
-    { type: "assistant", sessionId: "claude-session-1", cwd, message: { content: [{ type: "text", text: "복원 가능합니다." }], model: "claude-sonnet-5" }, timestamp: "2026-07-07T00:00:01.000Z" },
+    { type: "assistant", sessionId: "claude-session-1", cwd, message: { content: [{ type: "text", text: "복원 가능합니다." }], model: "claude-sonnet-5", usage: { input_tokens: 100, cache_creation_input_tokens: 10, cache_read_input_tokens: 20, output_tokens: 30 } }, timestamp: "2026-07-07T00:00:01.000Z" },
   ];
   fs.writeFileSync(file, lines.map((line) => JSON.stringify(line)).join("\n"));
   return file;
@@ -105,7 +108,7 @@ function insertChat(database: AppDatabase, projectId: number, provider: "codex" 
 
 describe("세션 백업/삭제/복원", () => {
   it("Codex JSONL 세션을 백업하고 삭제한 뒤 복원한다", () => {
-    const { database, projectPath, historyRoot, historyCache, service, projectId, adapter } = prepareService("codex");
+    const { database, projectPath, historyRoot, historyCache, service, tokenUsage, projectId, adapter } = prepareService("codex");
     const historyFile = writeCodexHistory(historyRoot, projectPath);
     const chatId = insertChat(database, projectId, "codex", historyFile, "codex-session-1");
 
@@ -116,6 +119,13 @@ describe("세션 백업/삭제/복원", () => {
     service.deleteChat(chatId, 1);
     expect(fs.existsSync(historyFile)).toBe(false);
     expect(database.prepare("SELECT id FROM chats WHERE id = ?").get(chatId)).toBeUndefined();
+    const deletedUsage = tokenUsage.aggregate({ groupBy: "chat", days: null, timezoneOffsetMinutes: 540 }) as any;
+    expect(deletedUsage.rows[0]).toMatchObject({ label: "codex 세션", totalTokens: 120, deleted: true });
+    // 기능 도입 전 삭제를 흉내 내 원장을 비운 뒤에도 남아 있는 백업에서 다시 수집해야 한다.
+    database.prepare("DELETE FROM token_usage_events").run();
+    expect(service.backfillTokenUsage()).toBe(1);
+    const backfilledUsage = tokenUsage.aggregate({ groupBy: "chat", days: null, timezoneOffsetMinutes: 540 }) as any;
+    expect(backfilledUsage.rows[0]).toMatchObject({ label: "codex 세션", totalTokens: 120, deleted: true });
 
     const restored = service.restoreBackup(backup.id, 1);
     expect(restored.chat.provider).toBe("codex");

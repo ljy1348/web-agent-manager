@@ -2,9 +2,10 @@ import React, { useState } from "react";
 import { approvalActions, approvalSummary, askUserQuestionPayload } from "../lib/approvals";
 import type { Json } from "../types";
 
-// 승인 요청 하나를 표시한다. "닫기"는 웹 목록에서만 정리하는 안전한 동작이다 — AI가 이 요청에 대한
-// 응답을 아직 실제로 기다리고 있으면 서버가 에러를 던지고 실패하며, 그 경우엔 실제 답변/거부로만 끝낼
-// 수 있다(살아있는 작업을 조용히 끊어버리지 않기 위함). AskUserQuestion 도구 호출은 "실행 허용"이
+// 승인 요청 하나를 표시한다. "닫기"는 이미 지나간 요청이면 웹 목록에서만 정리하고, AI가 아직 실제로
+// 기다리는 중이면 취소로 전달해 즉시 풀어준다 — 어느 쪽이든 카드는 반드시 닫히므로 사용자가 답변을
+// 강요당해 갇히는 일이 없고, 살아있는 작업도 조용히 끊기는 대신 취소를 명시적으로 전달받는다.
+// AskUserQuestion 도구 호출은 "실행 허용"이
 // 아니라 실제 사용자 답변이 필요하므로 질문·선택지를 그대로 보여주고, 고른 답을 decline의 message로
 // 실어 보내 터미널 조작 없이 웹에서 바로 답변을 완료시킨다.
 export function ApprovalCard({ item, decide }: { item: Json; decide: (id: string, decision: string, answer?: string) => Promise<void> }): React.ReactElement {
@@ -37,7 +38,7 @@ export function ApprovalCard({ item, decide }: { item: Json; decide: (id: string
       {error && <p className="approval-error">{error}</p>}
       <div className="approval-question-buttons">
         <button type="button" className="primary" onClick={submit} disabled={!canSubmit}>답변 전송</button>
-        <button type="button" onClick={dismiss} title="AI가 아직 실제로 기다리고 있으면 실패합니다(웹 목록에서만 정리, 작업엔 영향 없음)">닫기</button>
+        <button type="button" onClick={dismiss} title="목록에서 정리합니다. AI가 아직 기다리는 중이면 취소로 전달합니다">닫기</button>
       </div>
     </article>;
   }
@@ -48,7 +49,7 @@ export function ApprovalCard({ item, decide }: { item: Json; decide: (id: string
     {error && <p className="approval-error">{error}</p>}
     <div>
       {approvalActions(item).map((action) => <button key={action.decision} className={action.className} onClick={() => { setError(""); void decide(item.id, action.decision).catch((caught: any) => setError(caught?.message || "처리하지 못했습니다.")); }}>{action.label}</button>)}
-      <button type="button" onClick={dismiss} title="AI가 아직 실제로 기다리고 있으면 실패합니다(웹 목록에서만 정리, 작업엔 영향 없음)">닫기</button>
+      <button type="button" onClick={dismiss} title="목록에서 정리합니다. AI가 아직 기다리는 중이면 취소로 전달합니다">닫기</button>
     </div>
   </article>;
 }

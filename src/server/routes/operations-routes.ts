@@ -98,9 +98,26 @@ export function createOperationsRouter(
   router.get("/usage", (_request, response) => response.json({ usage: usage.list() }));
   router.post("/usage/:provider/refresh", (request, response, next) => {
     try {
-      const provider = getProvider(request.params.provider);
+      const provider = getProvider(String(request.params.provider));
       usage.refresh(provider);
       response.status(202).json({ accepted: true });
+    } catch (error) {
+      next(error);
+    }
+  });
+  // 가치가 있는 초기화권 소모는 관리자만 가능하며, 서비스가 실제 잔여량과 중복 요청을 다시 검증한다.
+  router.post("/usage/:provider/reset-credit/redeem", requireAdmin, async (request: AuthenticatedRequest, response, next) => {
+    try {
+      const provider = getProvider(String(request.params.provider));
+      const accountId = Number(request.body?.accountId);
+      if (!Number.isInteger(accountId) || accountId < 1) throw new Error("유효한 Codex 계정을 지정해주세요.");
+      const result = await usage.redeemResetCredit(provider, accountId);
+      writeAudit(database, request.authUser!.id, "usage.reset_credit.redeem", "provider", provider, {
+        accountId,
+        outcome: result.outcome,
+        remainingCount: result.after?.availableCount ?? null,
+      });
+      response.json({ outcome: result.outcome, credits: result.after });
     } catch (error) {
       next(error);
     }

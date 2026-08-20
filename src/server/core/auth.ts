@@ -7,6 +7,8 @@ import type { AuthUser } from "../../shared/types";
 export interface AuthenticatedRequest extends Request {
   authUser?: AuthUser;
   authSession?: { id: number; csrfToken: string };
+  networkOriginTrusted?: boolean;
+  appTrusted?: boolean;
   trustedNetwork?: boolean;
 }
 
@@ -17,12 +19,17 @@ export function createSessionLoader(database: AppDatabase) {
     const token = cookies.web_agent_manager_session ?? cookies.myagent_session;
     if (!token) return next();
     const row = database.prepare(`
-      SELECT s.id AS session_id, s.csrf_token, u.id, u.username, u.role, u.last_project_id, u.last_chat_id, u.chat_view_mode
+      SELECT s.id AS session_id, s.csrf_token, s.mobile_trusted_device_id, d.active AS mobile_device_active,
+        u.id, u.username, u.role, u.last_project_id, u.last_chat_id, u.chat_view_mode
       FROM web_sessions s JOIN users u ON u.id = s.user_id
+      LEFT JOIN mobile_trusted_devices d
+        ON d.id = s.mobile_trusted_device_id AND d.user_id = s.user_id
       WHERE s.token_hash = ? AND s.expires_at > datetime('now')
     `).get(hashToken(token)) as {
       session_id: number;
       csrf_token: string;
+      mobile_trusted_device_id: string | null;
+      mobile_device_active: number | null;
       id: number;
       username: string;
       role: "admin" | "user";
@@ -33,6 +40,8 @@ export function createSessionLoader(database: AppDatabase) {
     if (row) {
       request.authUser = { id: row.id, username: row.username, role: row.role, last_project_id: row.last_project_id, last_chat_id: row.last_chat_id, chat_view_mode: row.chat_view_mode };
       request.authSession = { id: row.session_id, csrfToken: row.csrf_token };
+      request.appTrusted = Boolean(row.mobile_trusted_device_id && row.mobile_device_active === 1);
+      if (request.appTrusted) request.trustedNetwork = true;
     }
     next();
   };
@@ -66,6 +75,35 @@ export function requireCsrf(request: AuthenticatedRequest, response: Response, n
   next();
 }
 
+// 확인된 사용자와 선택적 앱 기기를 묶어 만료 가능한 웹 세션을 생성한다.
+export function createWebSession(
+  database: AppDatabase,
+  config: AppConfig,
+  userId: number,
+  mobileTrustedDeviceId: string | null = null,
+): { user: AuthUser; token: string; csrfToken: string } | null {
+  const row = database.prepare("SELECT id, username, role, last_project_id, last_chat_id, chat_view_mode FROM users WHERE id = ?").get(userId) as AuthUser | undefined;
+  if (!row) return null;
+  const token = createToken();
+  const csrfToken = createToken(24);
+  database.prepare(`
+    INSERT INTO web_sessions(user_id, token_hash, csrf_token, mobile_trusted_device_id, expires_at)
+    VALUES (?, ?, ?, ?, datetime('now', ?))
+  `).run(row.id, hashToken(token), csrfToken, mobileTrustedDeviceId, `+${config.sessionTtlHours} hours`);
+  return { user: row, token, csrfToken };
+}
+
+// 비밀번호·기기 서명 로그인에 동일한 HttpOnly 웹 세션 쿠키 정책을 적용한다.
+export function setWebSessionCookie(response: Response, config: AppConfig, token: string): void {
+  response.cookie("web_agent_manager_session", token, {
+    httpOnly: true,
+    secure: config.publicUrl.startsWith("https://"),
+    sameSite: "strict",
+    path: "/",
+    maxAge: config.sessionTtlHours * 60 * 60 * 1000,
+  });
+}
+
 // 사용자 자격 증명을 검증하고 새 웹 세션을 생성한다.
 export async function login(
   database: AppDatabase,
@@ -73,24 +111,10 @@ export async function login(
   username: string,
   password: string,
 ): Promise<{ user: AuthUser; token: string; csrfToken: string } | null> {
-  const row = database.prepare("SELECT id, username, role, password_hash, last_project_id, last_chat_id, chat_view_mode FROM users WHERE username = ?").get(username) as {
-    id: number;
-    username: string;
-    role: "admin" | "user";
-    password_hash: string;
-    last_project_id: number | null;
-    last_chat_id: number | null;
-    chat_view_mode: "chat" | "terminal";
-  } | undefined;
+  const row = database.prepare("SELECT id, password_hash FROM users WHERE username = ?").get(username) as { id: number; password_hash: string } | undefined;
   const passwordMatches = await verifyPassword(password, row?.password_hash ?? dummyPasswordHash());
   if (!row || !passwordMatches) return null;
-  const token = createToken();
-  const csrfToken = createToken(24);
-  database.prepare(`
-    INSERT INTO web_sessions(user_id, token_hash, csrf_token, expires_at)
-    VALUES (?, ?, ?, datetime('now', ?))
-  `).run(row.id, hashToken(token), csrfToken, `+${config.sessionTtlHours} hours`);
-  return { user: { id: row.id, username: row.username, role: row.role, last_project_id: row.last_project_id, last_chat_id: row.last_chat_id, chat_view_mode: row.chat_view_mode }, token, csrfToken };
+  return createWebSession(database, config, row.id);
 }
 
 // 현재 웹 세션을 데이터베이스에서 제거한다.

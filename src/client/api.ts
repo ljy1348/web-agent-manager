@@ -47,3 +47,24 @@ export async function api(path: string, options: RequestInit = {}): Promise<any>
   if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
   return data;
 }
+
+// fetch는 업로드 진행률을 알려주지 않아 큰 파일은 진행 상황 없이 멈춘 것처럼 보인다.
+// XMLHttpRequest의 upload.onprogress로 퍼센트를 받아 onProgress에 전달한다.
+export function uploadFile(path: string, form: FormData, onProgress?: (fraction: number) => void): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `/api${path}`);
+    xhr.setRequestHeader("x-csrf-token", csrfToken);
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable) onProgress?.(event.loaded / event.total);
+    };
+    xhr.onerror = () => reject(new Error("네트워크 오류로 업로드에 실패했습니다."));
+    xhr.onload = () => {
+      let data: any = {};
+      try { data = xhr.responseText ? JSON.parse(xhr.responseText) : {}; } catch { /* 빈 응답 등은 무시 */ }
+      if (xhr.status >= 200 && xhr.status < 300) resolve(data);
+      else reject(new Error(data.error || `HTTP ${xhr.status}`));
+    };
+    xhr.send(form);
+  });
+}

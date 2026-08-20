@@ -26,6 +26,20 @@ interface AgentBridgeDependencies {
   adapters: ProviderAdapter[];
   historyCache: HistoryCache;
   sessions: Pick<SessionManager, "start" | "sendPrompt">;
+  // 실험실을 에이전트에게 노출한다. 주입하지 않으면 experiment.* 메서드는 사용할 수 없다.
+  experiments?: {
+    repository: {
+      listFixtures(): unknown;
+      createFixture(input: unknown): { id: string };
+      listExperiments(projectId: number): unknown;
+      listRunPlans(experimentId: string): unknown;
+    };
+    summary(experimentId: string): unknown;
+    suiteSummary(suiteId: string): unknown;
+    cleanupWorkspaces(filter: { experimentId?: string; suiteId?: string }): Promise<unknown>;
+    startRunPlan(experimentId: string, input: Record<string, unknown>): unknown;
+    cancelRunPlan(planId: string): unknown;
+  };
   socketPath: string;
 }
 
@@ -47,6 +61,7 @@ interface BridgeDelegation {
   source_chat_id: number | null;
   target_chat_id: number;
   prompt: string;
+  history_prompt: string | null;
   status: string;
   error: string | null;
   baseline_message_count: number;
@@ -61,6 +76,24 @@ export class AgentBridge {
 
   constructor(private readonly dependencies: AgentBridgeDependencies) {
     this.adapterById = new Map(dependencies.adapters.map((adapter) => [adapter.id, adapter]));
+  }
+
+  // 실험실이 붙어 있지 않은 배포에서 experiment.* 호출을 명확히 거부한다.
+  private requireExperiments(): NonNullable<AgentBridgeDependencies["experiments"]> {
+    const experiments = this.dependencies.experiments;
+    if (!experiments) throw new Error("이 서버에는 실험실이 연결되어 있지 않습니다.");
+    return experiments;
+  }
+
+  private requireString(value: unknown, label: string): string {
+    if (typeof value !== "string" || !value.trim()) throw new Error(`${label}이 필요합니다.`);
+    return value.trim();
+  }
+
+  private requireNumber(value: unknown, label: string): number {
+    const parsed = Number(value);
+    if (!Number.isInteger(parsed) || parsed < 1) throw new Error(`${label}이 필요합니다.`);
+    return parsed;
   }
 
   // 소유자 전용 권한의 Unix 소켓을 열고 오래된 소켓 파일을 정리한다.
@@ -141,6 +174,20 @@ export class AgentBridge {
       case "delegation.send_wait": return this.sendDelegationAndWait(params);
       case "delegation.wait": return this.waitForDelegation(params);
       case "delegation.status": return this.getDelegation(params);
+      case "experiment.fixtures": return this.requireExperiments().repository.listFixtures();
+      case "experiment.fixture_create": return this.requireExperiments().repository.createFixture(params.fixture ?? params);
+      case "experiment.list": return this.requireExperiments().repository.listExperiments(this.requireNumber(params.projectId, "projectId"));
+      case "experiment.summary": return this.requireExperiments().summary(this.requireString(params.experimentId, "experimentId"));
+      case "experiment.suite_summary": return this.requireExperiments().suiteSummary(this.requireString(params.suiteId, "suiteId"));
+      case "experiment.cleanup": return this.requireExperiments().cleanupWorkspaces({
+        experimentId: typeof params.experimentId === "string" ? params.experimentId : undefined,
+        suiteId: typeof params.suiteId === "string" ? params.suiteId : undefined,
+      });
+      case "experiment.plans": return this.requireExperiments().repository.listRunPlans(this.requireString(params.experimentId, "experimentId"));
+      case "experiment.plan_start": return this.requireExperiments().startRunPlan(this.requireString(params.experimentId, "experimentId"), {
+        stage: params.stage, repetitions: params.repetitions,
+      });
+      case "experiment.plan_cancel": return this.requireExperiments().cancelRunPlan(this.requireString(params.planId, "planId"));
       default: throw new Error(`지원하지 않는 브리지 메서드입니다: ${request.method}`);
     }
   }
@@ -325,10 +372,10 @@ export class AgentBridge {
       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
     `).run(id, idempotencyKey, parentDelegationId, lineage.depth, validSourceChatId, target.id, prompt, baselineMessageCount);
     try {
-      await this.dependencies.sessions.sendPrompt(target.id, prompt, null);
+      const deliveredPrompt = await this.dependencies.sessions.sendPrompt(target.id, prompt, null);
       this.dependencies.database.prepare(
-        "UPDATE delegations SET status = 'sent', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-      ).run(id);
+        "UPDATE delegations SET status = 'sent', history_prompt = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+      ).run(typeof deliveredPrompt === "string" ? deliveredPrompt : prompt, id);
       writeAudit(this.dependencies.database, null, "agent.delegate", "chat", target.id, { delegationId: id, sourceChatId: sourceChatId || null });
     } catch (error) {
       this.dependencies.database.prepare(
@@ -370,7 +417,7 @@ export class AgentBridge {
   // 저장된 기준 메시지 이후의 실제 사용자 프롬프트와 완료 응답을 찾아 완료 상태로 확정한다.
   private resolveDelegationResult(delegationId: string): unknown | null {
     const delegation = this.dependencies.database.prepare(`
-      SELECT id, source_chat_id, target_chat_id, prompt, status, error,
+      SELECT id, source_chat_id, target_chat_id, prompt, history_prompt, status, error,
              baseline_message_count, result_json, completed_at
       FROM delegations WHERE id = ?
     `).get(delegationId) as BridgeDelegation | undefined;
@@ -381,7 +428,7 @@ export class AgentBridge {
     const chat = this.resolveChat({ chatId: delegation.target_chat_id });
     const messages = this.historyMessages(chat);
     const added = messages.slice(Math.min(delegation.baseline_message_count, messages.length));
-    const expectedPrompt = delegation.prompt.replace(/\r\n/g, "\n").trim();
+    const expectedPrompt = (delegation.history_prompt ?? delegation.prompt).replace(/\r\n/g, "\n").trim();
     const promptIndex = added.findIndex((message) => message.role === "user"
       && message.content.replace(/\r\n/g, "\n").trim() === expectedPrompt);
     const resultMessages = promptIndex >= 0 ? added.slice(promptIndex + 1) : [];

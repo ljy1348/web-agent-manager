@@ -19,7 +19,7 @@ describe("tmux 입력 전달", () => {
     const bufferName = spawnSync.mock.calls[0][1][2];
     expect(spawnSync.mock.calls).toEqual([
       ["tmux", ["load-buffer", "-b", bufferName, "-"], { input: "안녕\n두 번째 줄", encoding: "utf8" }],
-      ["tmux", ["paste-buffer", "-t", "web_agent_manager_chat_44", "-b", bufferName], { encoding: "utf8" }],
+      ["tmux", ["paste-buffer", "-p", "-t", "web_agent_manager_chat_44", "-b", bufferName], { encoding: "utf8" }],
       ["tmux", ["delete-buffer", "-b", bufferName], { stdio: "ignore" }],
       ["tmux", ["send-keys", "-t", "web_agent_manager_chat_44", "Enter"], { encoding: "utf8" }],
     ]);

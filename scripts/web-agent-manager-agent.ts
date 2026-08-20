@@ -128,6 +128,75 @@ const TOOL_DEFINITIONS = [
       additionalProperties: false,
     },
   },
+  {
+    name: "web_agent_manager_experiment_summary",
+    description: "실험의 Variant별 지표와 조건부 권고(확증·잠정·무차별)를 조회합니다.",
+    inputSchema: {
+      type: "object",
+      properties: { experimentId: { type: "string" } },
+      required: ["experimentId"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "web_agent_manager_experiment_list",
+    description: "프로젝트의 실험과 Variant·최근 실행 목록을 조회합니다.",
+    inputSchema: {
+      type: "object",
+      properties: { projectId: { type: "number" } },
+      required: ["projectId"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "web_agent_manager_experiment_plan_start",
+    description: "실험의 Variant를 arm 교차 순서로 펼친 실행 계획을 만들고 순차 실행을 시작합니다.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        experimentId: { type: "string" },
+        stage: { type: "string", enum: ["screening", "grid", "confirmation"] },
+        repetitions: { type: "number" },
+        cleanup: { type: "boolean" },
+      },
+      required: ["experimentId"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "web_agent_manager_experiment_plans",
+    description: "실험의 실행 계획과 항목별 진행 상태를 조회합니다.",
+    inputSchema: {
+      type: "object",
+      properties: { experimentId: { type: "string" } },
+      required: ["experimentId"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "web_agent_manager_experiment_suite_summary",
+    description: "여러 상황(셀)을 묶은 스위트의 셀별 집계와 셀을 가로지르는 조건부 권고를 조회합니다.",
+    inputSchema: {
+      type: "object",
+      properties: { suiteId: { type: "string" } },
+      required: ["suiteId"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "web_agent_manager_experiment_cleanup",
+    description: "끝난 실험·스위트의 격리 작업공간과 스킬 bundle을 지금 정리합니다. 평가가 걸린 run은 남깁니다.",
+    inputSchema: {
+      type: "object",
+      properties: { experimentId: { type: "string" }, suiteId: { type: "string" } },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "web_agent_manager_experiment_fixtures",
+    description: "등록된 저장소 fixture와 적격성 게이트 상태를 조회합니다.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
 ] as const;
 
 const TOOL_METHODS: Record<string, string> = {
@@ -139,6 +208,13 @@ const TOOL_METHODS: Record<string, string> = {
   web_agent_manager_delegate_and_wait: "delegation.send_wait",
   web_agent_manager_wait_delegation: "delegation.wait",
   web_agent_manager_delegation_status: "delegation.status",
+  web_agent_manager_experiment_summary: "experiment.summary",
+  web_agent_manager_experiment_list: "experiment.list",
+  web_agent_manager_experiment_plan_start: "experiment.plan_start",
+  web_agent_manager_experiment_plans: "experiment.plans",
+  web_agent_manager_experiment_fixtures: "experiment.fixtures",
+  web_agent_manager_experiment_suite_summary: "experiment.suite_summary",
+  web_agent_manager_experiment_cleanup: "experiment.cleanup",
 };
 
 // 새·기존 환경변수와 설치·소스 경로 후보에서 실행 중인 web-agent-manager Unix 소켓을 찾는다.

@@ -102,6 +102,14 @@ export class RealtimeHub {
     }
   }
 
+  // 종료 시 열린 실시간 연결과 업그레이드 서버를 닫는다. 승격된 WebSocket 소켓이 남아 있으면 http 서버의
+  // close 콜백이 끝내 호출되지 않아 프로세스가 종료되지 못하므로, 정상 종료 핸드셰이크를 기다리지 않고 바로 끊는다.
+  close(): void {
+    for (const client of this.clients) client.socket.terminate();
+    this.clients.clear();
+    this.server.close();
+  }
+
   // 세션 Cookie로 WebSocket 요청 사용자를 확인한다.
   private authenticate(request: IncomingMessage): AuthUser | null {
     const cookies = parseCookies(request.headers.cookie);

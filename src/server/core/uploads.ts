@@ -39,8 +39,17 @@ function assertUploadCapacity(request: IncomingMessage, limits: MultipartUploadL
 
 // 여러 파일 multipart 요청의 총량·개수·시간·동시성을 제한하고 모든 파일 처리를 완료한다.
 export async function processMultipartFiles(request: IncomingMessage, limits: MultipartUploadLimits, handleFile: MultipartFileHandler): Promise<void> {
-  if (activeUploadRequests >= MAX_CONCURRENT_UPLOAD_REQUESTS) throw new Error("동시에 처리할 수 있는 업로드 요청 수를 초과했습니다.");
-  assertUploadCapacity(request, limits);
+  // 조기 거부 시 요청 바디를 그대로 두면 클라이언트가 계속 전송 중인 소켓이 정체되어 응답이 전달되지 않고 pending 상태로 남는다 — 즉시 소켓을 끊어 클라이언트가 실패를 바로 알 수 있게 한다.
+  if (activeUploadRequests >= MAX_CONCURRENT_UPLOAD_REQUESTS) {
+    request.destroy();
+    throw new Error("동시에 처리할 수 있는 업로드 요청 수를 초과했습니다.");
+  }
+  try {
+    assertUploadCapacity(request, limits);
+  } catch (error) {
+    request.destroy();
+    throw error;
+  }
   activeUploadRequests += 1;
   try {
     await new Promise<void>((resolve, reject) => {

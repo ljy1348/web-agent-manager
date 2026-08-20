@@ -6,7 +6,7 @@ import type { RealtimeHub } from "./realtime";
 import { findExecutable } from "./agent-integration";
 import { CONFIG_DIR_ENV, type AgentAccountService } from "./agent-accounts";
 
-export type CliAuthProvider = "codex" | "claude" | "github";
+export type CliAuthProvider = "codex" | "claude" | "grok" | "github";
 
 export interface CliAuthStatus {
   provider: CliAuthProvider;
@@ -36,18 +36,25 @@ interface AuthTerminalSession {
 export interface CliAuthRuntime {
   findExecutable(command: string): string | null;
   commandSucceeds(command: string, args: string[], cwd: string, env?: Record<string, string>): Promise<boolean>;
+  // 종료 코드만으로는 인증 여부를 알 수 없는 CLI를 위한 경로다(grok은 로그인하지 않아도 상태 명령이
+  // 정상 종료하고 본문에만 "You are not authenticated."를 찍는다). 출력은 판정에만 쓰고 밖으로 넘기지 않는다.
+  commandOutput?(command: string, args: string[], cwd: string, env?: Record<string, string>): Promise<string>;
   spawn(command: string, args: string[], options: Parameters<typeof pty.spawn>[2]): IPty;
 }
 
 const AUTH_COMMANDS: Record<CliAuthProvider, { executable: string; args: string[] }> = {
   codex: { executable: "codex", args: ["login", "--device-auth"] },
   claude: { executable: "claude", args: ["auth", "login", "--claudeai"] },
+  grok: { executable: "grok", args: ["login"] },
   github: { executable: "gh", args: ["auth", "login", "--hostname", "github.com", "--git-protocol", "https", "--web", "--skip-ssh-key"] },
 };
 
-const STATUS_COMMANDS: Record<CliAuthProvider, { executable: string; args: string[] }> = {
+// unauthenticatedPattern이 있는 공급자는 종료 코드 대신 출력으로 판정한다(grok은 미인증 상태에서도
+// 상태 명령이 0으로 끝나 종료 코드만 보면 항상 "로그인됨"으로 잘못 표시된다).
+const STATUS_COMMANDS: Record<CliAuthProvider, { executable: string; args: string[]; unauthenticatedPattern?: RegExp }> = {
   codex: { executable: "codex", args: ["login", "status"] },
   claude: { executable: "claude", args: ["auth", "status", "--json"] },
+  grok: { executable: "grok", args: ["models"], unauthenticatedPattern: /not authenticated|not logged in/i },
   github: { executable: "gh", args: ["auth", "status", "--hostname", "github.com"] },
 };
 
@@ -59,7 +66,16 @@ function commandSucceeds(command: string, args: string[], cwd: string, env?: Rec
   });
 }
 
-const DEFAULT_RUNTIME: CliAuthRuntime = { findExecutable, commandSucceeds, spawn: pty.spawn };
+// 상태 명령의 출력만 읽어온다. 호출부가 미인증 문구만 확인하고 버리며, 응답·로그로는 내보내지 않는다.
+function commandOutput(command: string, args: string[], cwd: string, env?: Record<string, string>): Promise<string> {
+  return new Promise((resolve) => {
+    execFile(command, args, { cwd, timeout: 15_000, maxBuffer: 256 * 1024, env: { ...process.env, ...env } }, (error, stdout, stderr) => {
+      resolve(error && !stdout && !stderr ? "" : `${stdout ?? ""}\n${stderr ?? ""}`);
+    });
+  });
+}
+
+const DEFAULT_RUNTIME: CliAuthRuntime = { findExecutable, commandSucceeds, commandOutput, spawn: pty.spawn };
 
 // Codex·Claude·GitHub 공식 로그인 흐름을 관리자 전용 PTY로 제공한다.
 // Codex·Claude는 계정 슬롯마다 설정 디렉터리가 달라 로그인도 계정별로 따로 진행한다.
@@ -83,7 +99,7 @@ export class CliAuthManager {
   // 로그인 대상 목록을 만든다. Codex·Claude는 등록된 계정 슬롯마다 하나씩, GitHub은 하나뿐이다.
   private targets(): Array<{ provider: CliAuthProvider; accountId: number | null; accountLabel: string | null; configDir: string | null }> {
     const list: Array<{ provider: CliAuthProvider; accountId: number | null; accountLabel: string | null; configDir: string | null }> = [];
-    for (const provider of ["codex", "claude"] as const) {
+    for (const provider of ["codex", "claude", "grok"] as const) {
       for (const account of this.accounts.list(provider)) {
         list.push({ provider, accountId: account.id, accountLabel: account.label, configDir: account.config_dir });
       }
@@ -133,10 +149,18 @@ export class CliAuthManager {
       accountLabel: target.accountLabel,
       key: authSessionKey(target.provider, target.accountId),
       installed: !!executable,
-      authenticated: executable
-        ? await this.runtime.commandSucceeds(executable, statusCommand.args, this.config.homeDir, this.targetEnvironment(target))
-        : false,
+      authenticated: executable ? await this.isAuthenticated(executable, statusCommand, target) : false,
     };
+  }
+
+  // 상태 명령으로 로그인 여부를 판정한다. 미인증 문구가 정의된 공급자는 종료 코드가 아니라 그 문구로 본다.
+  private async isAuthenticated(executable: string, statusCommand: (typeof STATUS_COMMANDS)[CliAuthProvider], target: { provider: CliAuthProvider; configDir: string | null }): Promise<boolean> {
+    const environment = this.targetEnvironment(target);
+    if (statusCommand.unauthenticatedPattern && this.runtime.commandOutput) {
+      const output = await this.runtime.commandOutput(executable, statusCommand.args, this.config.homeDir, environment);
+      return !!output.trim() && !statusCommand.unauthenticatedPattern.test(output);
+    }
+    return this.runtime.commandSucceeds(executable, statusCommand.args, this.config.homeDir, environment);
   }
 
   // 계정 슬롯의 설정 디렉터리를 환경변수로 만든다. 기본 계정과 GitHub은 주입하지 않는다.

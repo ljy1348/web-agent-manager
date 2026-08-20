@@ -4,6 +4,7 @@ import { Router } from "express";
 import { ZipArchive } from "archiver";
 import type { AppDatabase } from "../core/database";
 import { requireAdmin, type AuthenticatedRequest } from "../core/auth";
+import { requireTrustedNetwork } from "../core/network";
 import { safeBasename } from "../core/security";
 import { writeAudit } from "../core/audit";
 import { assertNonSensitiveRelativePath, chatWorkspacePath, resolveNonSensitiveProjectPath, resolveProjectPath, writeFileAtomic } from "./helpers";
@@ -58,6 +59,55 @@ function listDirectory(root: string, relativePath: string, access: { allowHidden
       return { name: entry.name, directory: entry.isDirectory(), size: stat.size, modifiedAt: stat.mtime.toISOString() };
     })
     .sort((a, b) => Number(b.directory) - Number(a.directory) || String(a.name).localeCompare(String(b.name)));
+}
+
+// 이름 검색이 무의미하게 오래 걸리지 않도록 재귀 탐색에서 건너뛸 무거운 디렉터리(민감 경로가 아니라 크기 때문).
+const SEARCH_SKIP_DIRS = new Set(["node_modules", "dist", "build", ".next", "target", "vendor", "__pycache__", ".venv", "venv", "coverage"]);
+const FILE_SEARCH_RESULT_LIMIT = 40;
+const FILE_SEARCH_MAX_SCANNED = 20000;
+
+interface FileSearchMatch {
+  path: string;
+  directory: boolean;
+}
+
+// 채팅 입력창의 "@파일" 자동완성을 위해 프로젝트 트리를 이름 부분일치로 얕게 탐색한다. 폴더도
+// 이름이 일치하면 결과에 포함하되(선택하면 파일 탭에서 그 폴더를 바로 열 수 있게) 계속 재귀는 한다.
+// listDirectory와 동일한 민감 경로 정책을 항목마다 적용하고, 결과·스캔 수 상한으로 큰 트리에서도 응답이 늦어지지 않게 한다.
+function searchFiles(root: string, query: string, access: { allowHidden: boolean }): FileSearchMatch[] {
+  const needle = query.trim().toLowerCase();
+  const matches: FileSearchMatch[] = [];
+  let scanned = 0;
+  const stack: string[] = [""];
+  while (stack.length && matches.length < FILE_SEARCH_RESULT_LIMIT && scanned < FILE_SEARCH_MAX_SCANNED) {
+    const relativeDir = stack.pop()!;
+    const directory = relativeDir ? path.join(root, relativeDir) : root;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(directory, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (entry.isSymbolicLink()) continue;
+      scanned += 1;
+      if (scanned > FILE_SEARCH_MAX_SCANNED) break;
+      const relativePath = relativeDir ? `${relativeDir}/${entry.name}` : entry.name;
+      try {
+        assertNonSensitiveRelativePath(relativePath, access);
+      } catch {
+        continue;
+      }
+      const isDirectory = entry.isDirectory();
+      if (isDirectory && SEARCH_SKIP_DIRS.has(entry.name)) continue;
+      if (!needle || relativePath.toLowerCase().includes(needle)) {
+        matches.push({ path: relativePath, directory: isDirectory });
+        if (matches.length >= FILE_SEARCH_RESULT_LIMIT) break;
+      }
+      if (isDirectory) stack.push(relativePath);
+    }
+  }
+  return matches.sort((a, b) => a.path.length - b.path.length || a.path.localeCompare(b.path));
 }
 
 // 파일 전체를 읽지 않고 형식 판별에 필요한 앞부분만 읽는다.
@@ -154,6 +204,16 @@ export function createFileRouter(database: AppDatabase, workspaces?: GitWorkspac
       const root = rootFor(request, Number(request.params.id));
       const relativePath = typeof request.query.path === "string" ? request.query.path : "";
       response.json({ path: relativePath, entries: listDirectory(root, relativePath, fileAccess(request)), hiddenFilesVisible: request.trustedNetwork === true });
+    } catch (error) {
+      next(error);
+    }
+  });
+  // 채팅 입력창의 "@파일" 멘션 자동완성이 쓰는 이름 검색. 목록 조회와 같은 권한(로그인 사용자)으로 연다.
+  router.get("/projects/:id/files/search", (request: AuthenticatedRequest, response, next) => {
+    try {
+      const root = rootFor(request, Number(request.params.id));
+      const query = typeof request.query.q === "string" ? request.query.q : "";
+      response.json({ query, matches: searchFiles(root, query, fileAccess(request)) });
     } catch (error) {
       next(error);
     }
@@ -316,6 +376,25 @@ export function createFileRouter(database: AppDatabase, workspaces?: GitWorkspac
       writeFileAtomic(target, content);
       writeAudit(database, request.authUser!.id, "file.write", "project", projectId, { path: relativePath, bytes: size });
       response.json({ saved: true, size });
+    } catch (error) {
+      next(error);
+    }
+  });
+  // 파일·폴더 삭제는 되돌릴 수 없어 다른 파괴적 작업(채팅·프로젝트 삭제 등)과 같은 정책으로
+  // 관리자·신뢰 네트워크에서만 허용한다. 요청이 신뢰 네트워크라도 숨김·민감 경로(.git 등)는 이 API로는
+  // 절대 지울 수 없게 access를 강제로 비워둔다 — 목록·미리보기와 달리 삭제는 실수 한 번의 대가가 크다.
+  router.delete("/projects/:id/files", requireAdmin, requireTrustedNetwork, (request: AuthenticatedRequest, response, next) => {
+    try {
+      const projectId = Number(request.params.id);
+      const relativePath = String(request.query.path ?? "").trim();
+      if (!relativePath) throw new Error("삭제할 경로가 필요합니다.");
+      const target = resolveNonSensitiveProjectPath(rootFor(request, projectId), relativePath, true, {});
+      const stat = fs.lstatSync(target);
+      if (stat.isSymbolicLink()) throw new Error("symlink는 이 화면에서 삭제할 수 없습니다.");
+      const directory = stat.isDirectory();
+      fs.rmSync(target, { recursive: true, force: false });
+      writeAudit(database, request.authUser!.id, "file.delete", "project", projectId, { path: relativePath, directory });
+      response.status(204).end();
     } catch (error) {
       next(error);
     }

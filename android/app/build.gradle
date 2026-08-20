@@ -1,0 +1,37 @@
+plugins {
+    id "com.android.application"
+}
+
+// Firebase 설정 파일이 있을 때만 Google Services 리소스를 생성해 인증 정보 없이도 기본 APK를 빌드한다.
+if (file("google-services.json").exists()) {
+    apply plugin: "com.google.gms.google-services"
+}
+
+android {
+    namespace "com.webagentmanager.android"
+    compileSdk 36
+
+    defaultConfig {
+        applicationId "com.webagentmanager.android"
+        minSdk 23
+        targetSdk 36
+        versionCode 7
+        versionName "0.5.0"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    implementation "com.google.firebase:firebase-messaging:25.1.1"
+}

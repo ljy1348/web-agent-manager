@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { CodexAdapter } from "../src/server/providers/codex";
 import { ClaudeAdapter } from "../src/server/providers/claude";
-import { detectUsageRegression, reconcileStaleClaudeSessionWindow } from "../src/server/services/usage-monitor";
+import { detectUsageKeepaliveReason, detectUsageKeepaliveTrigger, detectUsageRegression, isSameUsageKeepaliveWindow, isUsageDetailsDue, isUsageKeepaliveDue, mergeCodexResetCredits, reconcileStaleClaudeSessionWindow, shouldAdoptRejectedUsage } from "../src/server/services/usage-monitor";
 
 const codex = new CodexAdapter();
 const claude = new ClaudeAdapter("/tmp/claude-settings.json", {});
@@ -32,6 +32,19 @@ Each column = 1 week · tallest 62.2M
     expect(parsed.used_percent).toBe(25);
     expect(parsed.reset_at).toBe("19:05 on 9 Jul");
     expect(details.activity).toHaveLength(2);
+  });
+
+  it("Codex 초기화권 상세 화면의 개수와 기한도 함께 구조화한다", () => {
+    const screen = `Weekly limit: 94% left (resets 09:17 on 18 Aug)
+Usage limit resets
+1 usage limit reset available.
+1. Full reset  Expires 02:28 on 13 Aug 2026.`;
+    const parsed = codex.parseUsage(screen);
+    const credits = JSON.parse(parsed.details_json!).rateLimitResetCredits;
+
+    expect(credits.availableCount).toBe(1);
+    expect(new Date(credits.expiresAt).getHours()).toBe(2);
+    expect(new Date(credits.expiresAt).getMinutes()).toBe(28);
   });
 
   it("Claude /usage의 현재 모델명이 달라도 모든 구간을 추출한다", () => {
@@ -171,6 +184,49 @@ Resets Jul 2, 12:59am (Asia/Seoul)`;
   });
 });
 
+describe("Codex 초기화권 사용량 상세 병합", () => {
+  it("상세 조회는 최초 1회와 24시간이 지난 뒤에만 수행한다", () => {
+    const now = Date.parse("2026-08-11T02:00:00.000Z");
+    expect(isUsageDetailsDue(undefined, now)).toBe(true);
+    expect(isUsageDetailsDue(now - 23 * 60 * 60_000, now)).toBe(false);
+    expect(isUsageDetailsDue(now - 24 * 60 * 60_000, now)).toBe(true);
+  });
+
+  it("새 초기화권 정보를 기존 사용량 창과 함께 저장한다", () => {
+    const merged = mergeCodexResetCredits(
+      JSON.stringify({ windows: [{ id: "weekly" }] }),
+      { availableCount: 2, expiresAt: "2026-08-12T17:28:18.000Z" },
+    );
+
+    expect(JSON.parse(merged!)).toEqual({
+      windows: [{ id: "weekly" }],
+      rateLimitResetCredits: { availableCount: 2, expiresAt: "2026-08-12T17:28:18.000Z" },
+    });
+  });
+
+  it("일시 조회 실패 시 직전 초기화권 정보를 유지한다", () => {
+    const previous = JSON.stringify({ rateLimitResetCredits: { availableCount: 1, expiresAt: "2026-08-12T17:28:18.000Z" } });
+    const merged = mergeCodexResetCredits(JSON.stringify({ windows: [] }), null, previous);
+
+    expect(JSON.parse(merged!).rateLimitResetCredits).toEqual({ availableCount: 1, expiresAt: "2026-08-12T17:28:18.000Z" });
+  });
+
+  it("새 응답이 같은 개수만 주면 TUI 또는 직전 정상 기한을 보존한다", () => {
+    const previous = JSON.stringify({ rateLimitResetCredits: { availableCount: 1, expiresAt: "2026-08-12T17:28:18.000Z" } });
+    const current = JSON.stringify({ windows: [], rateLimitResetCredits: { availableCount: 1, expiresAt: null } });
+    const merged = mergeCodexResetCredits(current, { availableCount: 1, expiresAt: null }, previous);
+
+    expect(JSON.parse(merged!).rateLimitResetCredits).toEqual({ availableCount: 1, expiresAt: "2026-08-12T17:28:18.000Z" });
+  });
+
+  it("초기화권 개수가 바뀌면 이전 개수의 기한은 이어받지 않는다", () => {
+    const previous = JSON.stringify({ rateLimitResetCredits: { availableCount: 1, expiresAt: "2026-08-12T17:28:18.000Z" } });
+    const merged = mergeCodexResetCredits(JSON.stringify({ windows: [] }), { availableCount: 0, expiresAt: null }, previous);
+
+    expect(JSON.parse(merged!).rateLimitResetCredits).toEqual({ availableCount: 0, expiresAt: null });
+  });
+});
+
 describe("reconcileStaleClaudeSessionWindow", () => {
   // 실제 운영 중 재현된 문제: 세션 리셋 시각이 지나도 Claude CLI가 "Current session" 블록을 통째로
   // 안 보여주는 게 아니라, 리셋 전 마지막 스냅샷(옛 퍼센트·옛 리셋 시각)을 계속 그대로 돌려준다.
@@ -256,5 +312,64 @@ Current week (all models)
 Resets Jul 11, 12:59am (Asia/Seoul)`, now);
     expect(parsed.data_status).toBe("fresh");
     expect(reconcileStaleClaudeSessionWindow(parsed, now)).toEqual(parsed);
+  });
+});
+
+describe("연속 거부 탈출", () => {
+  it("짧은 거부는 마지막 정상값을 지키고 5회부터 최신값을 채택한다", () => {
+    expect(shouldAdoptRejectedUsage(1)).toBe(false);
+    expect(shouldAdoptRejectedUsage(4)).toBe(false);
+    expect(shouldAdoptRejectedUsage(5)).toBe(true);
+    expect(shouldAdoptRejectedUsage(27)).toBe(true);
+  });
+});
+
+describe("빈 사용량 창 최소 턴 판정", () => {
+  it("Claude 세션 창이 없거나 0%면 활성화한다", () => {
+    const weeklyOnly = details([{ id: "weekly_all", usedPercent: 22, resetAt: "Aug 15, 1am" }]);
+    const zeroSession = details([{ id: "session", usedPercent: 0, resetAt: "5:00pm" }]);
+
+    expect(detectUsageKeepaliveReason("claude", null, weeklyOnly)).toBe("claude_session_missing");
+    expect(detectUsageKeepaliveReason("claude", null, zeroSession)).toBe("claude_session_zero");
+    expect(detectUsageKeepaliveReason("claude", null, details([{ id: "session", usedPercent: 1, resetAt: "5:00pm" }]))).toBeNull();
+  });
+
+  it("Claude 세션이 사라지면 직전 초기화 시각에서 현재 창 키를 복원한다", () => {
+    const now = new Date("2026-08-11T13:41:00.000Z");
+    const previous = details([{ id: "session", usedPercent: 1, resetAt: "10:40pm (Asia/Seoul)" }]);
+    const weeklyOnly = details([{ id: "weekly_all", usedPercent: 22, resetAt: "Aug 15, 1am (Asia/Seoul)" }]);
+
+    const trigger = detectUsageKeepaliveTrigger("claude", previous, weeklyOnly, now);
+
+    expect(trigger?.reason).toBe("claude_session_missing");
+    expect(JSON.parse(trigger!.windowKey!)).toEqual([{ id: "session", resetAt: "2026-08-11T18:40:00.000Z" }]);
+  });
+
+  it("Codex는 양수에서 0%로 바뀐 경우에만 활성화한다", () => {
+    const before = details([{ id: "five_hour", usedPercent: 18, resetAt: "12:00" }]);
+    const reset = details([{ id: "five_hour", usedPercent: 0, resetAt: "17:00" }]);
+
+    expect(detectUsageKeepaliveReason("codex", before, reset)).toBe("codex_reset_zero");
+    expect(detectUsageKeepaliveReason("codex", reset, reset)).toBeNull();
+    expect(detectUsageKeepaliveReason("codex", null, reset)).toBeNull();
+  });
+
+  it("같은 초기화 창은 막고 다른 창은 5시간 안이어도 허용한다", () => {
+    const now = new Date("2026-08-11T10:00:00.000Z");
+    const previousWindow = JSON.stringify([{ id: "session", resetAt: "2026-08-11T13:40:00.000Z" }]);
+    const sameWindowWithDisplayDrift = JSON.stringify([{ id: "session", resetAt: "2026-08-11T13:49:00.000Z" }]);
+    const nextWindow = JSON.stringify([{ id: "session", resetAt: "2026-08-11T18:40:00.000Z" }]);
+
+    expect(isSameUsageKeepaliveWindow(previousWindow, sameWindowWithDisplayDrift)).toBe(true);
+    expect(isUsageKeepaliveDue(null, null, previousWindow, now)).toBe(true);
+    expect(isUsageKeepaliveDue("2026-08-11T04:00:00.000Z", previousWindow, sameWindowWithDisplayDrift, now)).toBe(false);
+    expect(isUsageKeepaliveDue("2026-08-11T09:59:00.000Z", previousWindow, nextWindow, now)).toBe(true);
+  });
+
+  it("창을 식별할 수 없을 때만 기존 5시간 제한을 사용한다", () => {
+    const now = new Date("2026-08-11T10:00:00.000Z");
+
+    expect(isUsageKeepaliveDue("2026-08-11T05:00:01.000Z", null, null, now)).toBe(false);
+    expect(isUsageKeepaliveDue("2026-08-11T05:00:00.000Z", null, null, now)).toBe(true);
   });
 });

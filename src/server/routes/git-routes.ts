@@ -124,6 +124,20 @@ function forceRefresh(request: Request): boolean {
   return request.query.refresh === "1";
 }
 
+// 목록 조회 개수를 쿼리에서 읽는다. 잘못된 값은 기본값으로 되돌리고, "더 보기"를 계속 눌러도
+// 한 번의 CLI 호출이 무한정 무거워지지 않도록 상한을 둔다.
+function listLimit(value: unknown, fallback: number, max = 500): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) return fallback;
+  return Math.min(parsed, max);
+}
+
+// 요청 개수보다 하나 더 읽어 온 목록을 잘라 내고 뒤에 더 있는지 알려준다.
+// git·gh 모두 전체 개수를 주지 않아, 개수를 세는 추가 호출 없이 다음 페이지 유무만 판단하려는 방법이다.
+function withHasMore<T>(items: T[], limit: number): { items: T[]; hasMore: boolean } {
+  return { items: items.slice(0, limit), hasMore: items.length > limit };
+}
+
 // 조회 대상 작업공간을 정한다. 화면에서 worktree를 직접 고르면 그 경로를(목록과 대조해 검증한 뒤),
 // 아니면 요청의 chatId에 연결된 worktree를, 그것도 없으면 프로젝트 공유 checkout을 쓴다.
 async function requestWorkspacePath(database: AppDatabase, workspaces: GitWorkspaceService | undefined, request: Request, projectId: number): Promise<string> {
@@ -157,13 +171,18 @@ export function createGitRouter(database: AppDatabase, workspaces?: GitWorkspace
       // 조회 전용으로 브랜치를 고른 경우, 실제 checkout은 그대로 두고 커밋 내역만 그 ref 기준으로 읽는다.
       const ref = typeof request.query.ref === "string" && request.query.ref ? request.query.ref : null;
       if (ref) assertGitBranch(ref);
-      const cached = await cache.read(`git:${ref ?? ""}`, projectId, cwd, async () => {
+      // 화면에서 "더 보기"를 누른 만큼 커밋을 더 읽는다. 늘어난 개수도 캐시 키에 넣어야 앞 페이지만
+      // 담긴 옛 결과가 그대로 돌아오지 않는다.
+      const commitLimit = listLimit(request.query.commits, 30);
+      const cached = await cache.read(`git:${ref ?? ""}:${commitLimit}`, projectId, cwd, async () => {
         const [status, log, remotes] = await Promise.all([
           run("git", ["status", "--short", "--branch"], cwd),
-          run("git", ["log", "-10", "--pretty=format:%h%x09%an%x09%ad%x09%s", "--date=iso-strict", ...(ref ? [ref] : [])], cwd).catch(() => ""),
+          run("git", ["log", `-${commitLimit + 1}`, "--pretty=format:%h%x09%an%x09%ad%x09%s", "--date=iso-strict", ...(ref ? [ref] : [])], cwd).catch(() => ""),
           run("git", ["remote", "-v"], cwd).catch(() => ""),
         ]);
-        return { status, log, commits: parseLog(log), remotes, ref };
+        const page = withHasMore(log.split("\n").filter(Boolean), commitLimit);
+        const pageLog = page.items.join("\n");
+        return { status, log: pageLog, commits: parseLog(pageLog), hasMoreCommits: page.hasMore, remotes, ref };
       }, forceRefresh(request));
       response.json({ ...cached.value, cachedAt: new Date(cached.cachedAt).toISOString() });
     } catch (error) {
@@ -186,7 +205,8 @@ export function createGitRouter(database: AppDatabase, workspaces?: GitWorkspace
     try {
       const cwd = await requestWorkspacePath(database, workspaces, request, Number(request.params.id));
       const files = queryFiles(request.query.file);
-      for (const file of files) resolveProjectPath(cwd, file);
+      // 삭제된 파일도 정상적인 Git pathspec이므로 존재는 요구하지 않고 프로젝트 경계만 검증한다.
+      for (const file of files) resolveProjectPath(cwd, file, false);
       // untracked(??) 파일은 HEAD와 비교할 대상 자체가 없어 `git diff HEAD`로는 절대 안 잡힌다 — 파일
       // 목록(상태 조회)에는 뜨는데 diff만 항상 비어 보이는 원인이었다. 상태를 다시 조회해 untracked만
       // 골라 파일별로 --no-index(전부 추가된 것으로) diff를 만들어 tracked 변경분 뒤에 이어 붙인다.
@@ -341,6 +361,29 @@ export function createGitRouter(database: AppDatabase, workspaces?: GitWorkspace
       next(error);
     }
   });
+  // 선택한 파일·폴더의 커밋되지 않은 변경을 되돌린다(롤백). git status로 선택 경로를 다시 나눠 추적
+  // 파일은 HEAD 기준으로 복원하고(수정·삭제·스테이지된 신규 파일 모두 포함), untracked 파일은 git이
+  // 되돌릴 원본이 없어 삭제한다. 커밋 손실과 같은 급으로 되돌릴 수 없는 작업이라 신뢰 네트워크로 제한한다.
+  router.post("/projects/:id/git/discard", requireAdmin, requireTrustedNetwork, async (request: AuthenticatedRequest, response, next) => {
+    try {
+      const projectId = Number(request.params.id);
+      const cwd = await requestWorkspacePath(database, workspaces, request, projectId);
+      const files = Array.isArray(request.body?.files) ? request.body.files.filter((item: unknown) => typeof item === "string") as string[] : [];
+      if (!files.length) throw new Error("되돌릴 파일을 선택해주세요.");
+      for (const file of files) resolveProjectPath(cwd, file, false);
+      const statusOutput = await run("git", ["status", "--porcelain=v1", "-z", "--", ...files], cwd);
+      const untrackedFiles = parseStatus(statusOutput)
+        .filter((change) => change.indexStatus === "?" && change.worktreeStatus === "?")
+        .map((change) => change.path);
+      const trackedFiles = files.filter((file) => !untrackedFiles.includes(file));
+      if (trackedFiles.length) await run("git", ["restore", "--source=HEAD", "--staged", "--worktree", "--", ...trackedFiles], cwd);
+      if (untrackedFiles.length) await run("git", ["clean", "-fd", "--", ...untrackedFiles], cwd);
+      writeAudit(database, request.authUser!.id, "git.discard", "project", projectId, { files, untrackedFiles });
+      response.status(204).end();
+    } catch (error) {
+      next(error);
+    }
+  });
   router.post("/projects/:id/git/push", requireAdmin, async (request: AuthenticatedRequest, response, next) => {
     try {
       if (request.body?.confirm !== true) throw new Error("push 확인이 필요합니다.");
@@ -360,23 +403,46 @@ export function createGitRouter(database: AppDatabase, workspaces?: GitWorkspace
     try {
       const projectId = Number(request.params.id);
       const cwd = await requestWorkspacePath(database, workspaces, request, projectId);
-      const cached = await cache.read("github", projectId, cwd, async () => {
-        const [repository, issues, pullRequests, runs] = await Promise.all([
+      // 탭별로 "더 보기"를 누른 만큼 따로 늘어나므로 개수를 각각 받고, 캐시 키에도 함께 넣는다.
+      const issueLimit = listLimit(request.query.issues, 50);
+      const pullLimit = listLimit(request.query.pulls, 50);
+      const cached = await cache.read(`github:${issueLimit}:${pullLimit}`, projectId, cwd, async () => {
+        // 워크플로는 여기서 같이 부르지 않는다 — `gh run list`가 셋 중 가장 느린데(WSS-Server에서 1.4초,
+        // 이슈 0.8초·PR 0.7초) 병렬 조회는 가장 느린 것에 맞춰지므로, 덜 보는 Actions 때문에 탭 진입이
+        // 매번 붙잡혔다. Actions 탭을 실제로 열 때 `/github/runs`로 따로 조회한다.
+        const [repository, issues, pullRequests] = await Promise.all([
           ghJson<GhObject | null>(cwd, ["repo", "view", "--json", "nameWithOwner,url,defaultBranchRef"], null),
-          ghJson<GhObject[]>(cwd, ["issue", "list", "--state", "all", "--limit", "50", "--json", "number,title,state,url,updatedAt,author,labels,assignees"], []),
+          ghJson<GhObject[]>(cwd, ["issue", "list", "--state", "all", "--limit", String(issueLimit + 1), "--json", "number,title,state,url,updatedAt,author,labels,assignees"], []),
           // statusCheckRollup은 PR마다 별도 체크 상태 API 호출이 더 필요해 gh pr list 응답이 크게
           // 느려지는데(체감상 원인이었던 조회 지연, 2026-07-23 확인), 화면 어디에도 쓰지 않으므로 뺀다.
-          ghJson<GhObject[]>(cwd, ["pr", "list", "--state", "all", "--limit", "50", "--json", "number,title,state,url,headRefName,baseRefName,updatedAt,author,isDraft"], []),
-          ghJson<GhObject[]>(cwd, ["run", "list", "--limit", "20", "--json", "databaseId,name,status,conclusion,url,updatedAt"], []),
+          ghJson<GhObject[]>(cwd, ["pr", "list", "--state", "all", "--limit", String(pullLimit + 1), "--json", "number,title,state,url,headRefName,baseRefName,updatedAt,author,isDraft"], []),
         ]);
         if (!repository.value) throw new Error(repository.error || "GitHub 저장소 정보를 조회할 수 없습니다.");
+        const issuePage = withHasMore(issues.value, issueLimit);
+        const pullPage = withHasMore(pullRequests.value, pullLimit);
         return {
           repository: repository.value,
-          issues: issues.value,
-          pullRequests: pullRequests.value,
-          runs: runs.value,
-          errors: { issues: issues.error, pullRequests: pullRequests.error, runs: runs.error },
+          issues: issuePage.items,
+          pullRequests: pullPage.items,
+          hasMore: { issues: issuePage.hasMore, pullRequests: pullPage.hasMore },
+          errors: { issues: issues.error, pullRequests: pullRequests.error },
         };
+      }, forceRefresh(request));
+      response.json({ ...cached.value, cachedAt: new Date(cached.cachedAt).toISOString() });
+    } catch (error) {
+      next(error);
+    }
+  });
+  // Actions 탭 전용 조회. 목록에서 분리해 두어야 이슈·PR만 볼 때 워크플로 조회를 기다리지 않는다.
+  router.get("/projects/:id/github/runs", async (request, response, next) => {
+    try {
+      const projectId = Number(request.params.id);
+      const cwd = await requestWorkspacePath(database, workspaces, request, projectId);
+      const runLimit = listLimit(request.query.runs, 20);
+      const cached = await cache.read(`github-runs:${runLimit}`, projectId, cwd, async () => {
+        const runs = await ghJson<GhObject[]>(cwd, ["run", "list", "--limit", String(runLimit + 1), "--json", "databaseId,name,status,conclusion,url,updatedAt"], []);
+        const page = withHasMore(runs.value, runLimit);
+        return { runs: page.items, hasMore: page.hasMore, error: runs.error };
       }, forceRefresh(request));
       response.json({ ...cached.value, cachedAt: new Date(cached.cachedAt).toISOString() });
     } catch (error) {
@@ -385,10 +451,16 @@ export function createGitRouter(database: AppDatabase, workspaces?: GitWorkspace
   });
   router.get("/projects/:id/github/issue/:number", async (request, response, next) => {
     try {
-      const cwd = await requestWorkspacePath(database, workspaces, request, Number(request.params.id));
+      const projectId = Number(request.params.id);
+      const cwd = await requestWorkspacePath(database, workspaces, request, projectId);
       const number = issueNumber(request.params.number);
-      const output = await run("gh", ["issue", "view", String(number), "--comments", "--json", "number,title,state,url,body,author,labels,assignees,comments,createdAt,updatedAt,closedAt"], cwd);
-      response.json({ issue: parseGhJson(output) });
+      // 목록과 같은 캐시를 태운다. gh를 한 번 부르는 데만 0.5초 이상 드는데(프로세스 시작 + GraphQL),
+      // 같은 항목을 다시 열 때마다 그 비용을 내고 있었다. 댓글·닫기 같은 쓰기 뒤에는 라우터 앞단
+      // 미들웨어가 프로젝트 캐시를 통째로 버리므로 오래된 상세가 남지 않는다.
+      const cached = await cache.read(`github-issue:${number}`, projectId, cwd, async () => ({
+        issue: parseGhJson(await run("gh", ["issue", "view", String(number), "--comments", "--json", "number,title,state,url,body,author,labels,assignees,comments,createdAt,updatedAt,closedAt"], cwd)),
+      }), forceRefresh(request));
+      response.json({ ...cached.value, cachedAt: new Date(cached.cachedAt).toISOString() });
     } catch (error) {
       next(error);
     }
@@ -491,11 +563,15 @@ export function createGitRouter(database: AppDatabase, workspaces?: GitWorkspace
   });
   router.get("/projects/:id/github/pr/:number", async (request, response, next) => {
     try {
-      const cwd = await requestWorkspacePath(database, workspaces, request, Number(request.params.id));
+      const projectId = Number(request.params.id);
+      const cwd = await requestWorkspacePath(database, workspaces, request, projectId);
       const number = issueNumber(request.params.number);
+      // 이슈 상세와 같은 이유로 캐시를 태운다.
       // 목록과 같은 이유로 statusCheckRollup은 빼 조회 속도를 개선한다(화면에서 안 씀).
-      const output = await run("gh", ["pr", "view", String(number), "--comments", "--json", "number,title,state,url,body,author,comments,reviews,headRefName,baseRefName,isDraft,mergeable,mergedAt,createdAt,updatedAt,closedAt"], cwd);
-      response.json({ pullRequest: parseGhJson(output) });
+      const cached = await cache.read(`github-pr:${number}`, projectId, cwd, async () => ({
+        pullRequest: parseGhJson(await run("gh", ["pr", "view", String(number), "--comments", "--json", "number,title,state,url,body,author,comments,reviews,headRefName,baseRefName,isDraft,mergeable,mergedAt,createdAt,updatedAt,closedAt"], cwd)),
+      }), forceRefresh(request));
+      response.json({ ...cached.value, cachedAt: new Date(cached.cachedAt).toISOString() });
     } catch (error) {
       next(error);
     }

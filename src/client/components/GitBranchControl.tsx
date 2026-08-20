@@ -46,6 +46,16 @@ export function GitBranchControl({ projectId, chat, canManage, variant = "bar", 
   }
 
   useEffect(() => { setEditing(false); void load(); }, [projectId, chat?.id]);
+  // 채팅 터미널 안에서 AI가 직접 git checkout -b 등으로 브랜치를 바꾸면 이 앱의 브랜치 전환 API를
+  // 거치지 않아 이 위젯은 그 사실을 알 방법이 없다(실사용 보고: 채팅에서 새 브랜치로 전환해도 GitHub
+  // 탭 배지·diff가 예전 브랜치에 계속 머묾). 짧은 주기로 다시 읽어 자연히 따라잡되, 지금 메뉴를
+  // 펼쳐 고르는 중이거나 전환 요청이 진행 중이면 화면이 발밑에서 바뀌지 않도록 건너뛴다.
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      if (!editing && !busy && document.visibilityState === "visible") void load();
+    }, 20_000);
+    return () => window.clearInterval(timer);
+  }, [projectId, chat?.id, editing, busy]);
 
   // 기존 또는 새 브랜치를 선택한 공유·전용 작업공간에 적용한다.
   async function switchBranch(target: string, create: boolean): Promise<void> {

@@ -95,4 +95,24 @@ describe("Git diff: untracked 파일도 diff 내용을 보여준다", () => {
     expect(data.diff).toContain("diff --git a/tracked.txt b/tracked.txt");
     expect(data.diff).toContain("diff --git a/새파일.md b/새파일.md");
   });
+
+  it("수정 파일과 삭제 파일을 함께 선택해도 두 diff를 모두 반환한다", async () => {
+    const { database, repoPath, baseUrl } = createHarness();
+    const project = database.prepare("SELECT id FROM projects WHERE path = ?").get(repoPath) as { id: number };
+    fs.writeFileSync(path.join(repoPath, "second.txt"), "두 번째 원본\n");
+    execFileSync("git", ["add", "second.txt"], { cwd: repoPath });
+    execFileSync("git", ["commit", "-q", "-m", "second"], { cwd: repoPath });
+    fs.writeFileSync(path.join(repoPath, "second.txt"), "두 번째 수정\n");
+    fs.rmSync(path.join(repoPath, "tracked.txt"));
+    const query = new URLSearchParams();
+    query.append("file", "second.txt");
+    query.append("file", "tracked.txt");
+
+    const response = await fetch(`${baseUrl}/api/projects/${project.id}/git/diff?${query}`);
+    const data = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(data.diff).toContain("diff --git a/second.txt b/second.txt");
+    expect(data.diff).toContain("diff --git a/tracked.txt b/tracked.txt");
+  });
 });

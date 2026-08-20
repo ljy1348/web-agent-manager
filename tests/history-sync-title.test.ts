@@ -171,4 +171,34 @@ describe("history-sync 제목 자동 업그레이드와 수동 잠금", () => {
     fs.rmSync(projectDir, { recursive: true, force: true });
     fs.rmSync(dataDir, { recursive: true, force: true });
   });
+
+  // setStatus는 오류 시 busy를 내리지만 곧바로 이 동기화가 다시 올려 `error + busy=1`이 남았다.
+  // 그 조합에서는 사용자가 작업중 표시를 보면서도 전송이 계속 실패해 스스로 복구할 수 없었다.
+  it("오류 상태로 남은 채팅은 새 도구 호출 기록이 쌓여도 busy로 올리지 않는다", () => {
+    cwdDir = fs.mkdtempSync(path.join(os.tmpdir(), "web-agent-manager-error-cwd-"));
+    projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "web-agent-manager-error-proj-"));
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "web-agent-manager-error-data-"));
+    const config = { dataDir, allowedRoots: [cwdDir] } as unknown as AppConfig;
+    const sessionId = "error-stuck";
+    const file = writeSessionFixture(sessionId, null);
+    const { database, sync } = buildSynchronizer(config);
+    sync.syncAll(false);
+    const chat = database.prepare("SELECT id FROM chats WHERE provider_session_id = ?").get(sessionId) as any;
+
+    // waitUntilReady가 15초 안에 프롬프트를 못 찾아 오류를 남긴 뒤에도 CLI는 계속 도구를 돌린다.
+    database.prepare("UPDATE chats SET status = 'error', busy = 1 WHERE id = ?").run(chat.id);
+    fs.appendFileSync(file, `\n${JSON.stringify({
+      type: "assistant",
+      sessionId,
+      cwd: cwdDir,
+      message: { content: [{ type: "tool_use", id: "tool-1", name: "Bash", input: { command: "ls" } }] },
+      timestamp: "2026-08-14T00:00:05.000Z",
+    })}`);
+    sync.syncAll(false);
+
+    const after = database.prepare("SELECT status, busy FROM chats WHERE id = ?").get(chat.id) as any;
+    expect(after).toEqual({ status: "error", busy: 0 });
+    fs.rmSync(projectDir, { recursive: true, force: true });
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
 });

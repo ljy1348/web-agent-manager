@@ -4,7 +4,7 @@ import { requireAdmin, type AuthenticatedRequest } from "../core/auth";
 import { writeAudit } from "../core/audit";
 import { type CliAuthProvider, CliAuthManager } from "../services/cli-auth";
 
-const PROVIDERS = new Set<CliAuthProvider>(["codex", "claude", "github"]);
+const PROVIDERS = new Set<CliAuthProvider>(["codex", "claude", "grok", "github"]);
 
 // CLI 인증 상태 조회와 관리자 전용 로그인 PTY 제어 API를 구성한다.
 export function createCliAuthRouter(database: AppDatabase, manager: CliAuthManager): Router {

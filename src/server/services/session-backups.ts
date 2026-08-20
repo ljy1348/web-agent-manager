@@ -8,6 +8,7 @@ import { writeAudit } from "../core/audit";
 import type { Provider } from "../../shared/types";
 import type { ProviderAdapter, HistorySession } from "../providers/provider";
 import type { HistoryCache } from "./history-cache";
+import { tokenUsageSnapshotForChat, type TokenUsageLedger, type TokenUsageSnapshot } from "./token-usage-ledger";
 
 interface ChatBackupMetadata {
   version: 1;
@@ -16,6 +17,10 @@ interface ChatBackupMetadata {
   providerSessionId: string;
   title: string;
   projectPath: string;
+  projectName?: string;
+  projectId?: number;
+  accountId?: number | null;
+  accountLabel?: string | null;
   historyRelativePath: string;
   model: string | null;
   originalChatId: number;
@@ -41,6 +46,9 @@ interface ChatWithProject {
   created_at: string;
   updated_at: string;
   project_path: string;
+  project_name: string;
+  account_id: number | null;
+  account_label: string | null;
 }
 
 // 파일명이 경로 구분자로 해석되지 않도록 백업 ID 형식을 제한한다.
@@ -76,6 +84,7 @@ export class SessionBackupService {
     private readonly database: AppDatabase,
     adapters: ProviderAdapter[],
     private readonly historyCache: HistoryCache,
+    private readonly tokenUsage?: TokenUsageLedger,
   ) {
     this.adapters = new Map(adapters.map((adapter) => [adapter.id, adapter]));
     this.root = path.join(config.dataDir, "session-backups");
@@ -102,6 +111,10 @@ export class SessionBackupService {
       providerSessionId: chat.provider_session_id,
       title: chat.title,
       projectPath: chat.project_path,
+      projectName: chat.project_name,
+      projectId: chat.project_id,
+      accountId: chat.account_id,
+      accountLabel: chat.account_label,
       historyRelativePath: path.relative(root, historyFile),
       model: chat.model,
       originalChatId: chat.id,
@@ -111,6 +124,7 @@ export class SessionBackupService {
     };
     fs.copyFileSync(historyFile, path.join(directory, "session.jsonl"));
     fs.writeFileSync(path.join(directory, "metadata.json"), JSON.stringify(metadata, null, 2), { mode: 0o600 });
+    this.recordChatUsage(chat, false);
     writeAudit(this.database, userId, "chat.backup", "chat", chatId, { backupId: id, provider: chat.provider });
     return { ...metadata, chatExists: true };
   }
@@ -152,6 +166,8 @@ export class SessionBackupService {
       throw new Error("백업 세션 기록을 해석할 수 없습니다.");
     }
     const chat = this.upsertRestoredChat(session, metadata, target, projectPath);
+    const snapshot = tokenUsageSnapshotForChat(this.database, Number(chat.id));
+    if (snapshot) this.tokenUsage?.recordSession(session, snapshot);
     writeAudit(this.database, userId, "chat.restore", "chat", Number(chat.id), { backupId: id, provider: metadata.provider });
     return { chat: chat as Record<string, unknown>, backup: { ...metadata, chatExists: true } };
   }
@@ -168,6 +184,8 @@ export class SessionBackupService {
   deleteChat(chatId: number, userId: number): void {
     const chat = this.getChat(chatId);
     const adapter = this.getAdapter(chat.provider);
+    this.recordChatUsage(chat, true);
+    this.tokenUsage?.markChatDeleted(chatId);
     if (chat.history_file && fs.existsSync(chat.history_file)) {
       const root = fs.realpathSync(adapter.historyRoot);
       const historyFile = fs.realpathSync(chat.history_file);
@@ -181,7 +199,10 @@ export class SessionBackupService {
 
   private getChat(chatId: number): ChatWithProject {
     const chat = this.database.prepare(`
-      SELECT c.*, p.path AS project_path FROM chats c JOIN projects p ON p.id = c.project_id WHERE c.id = ?
+      SELECT c.*, p.path AS project_path, p.name AS project_name, a.label AS account_label
+      FROM chats c JOIN projects p ON p.id = c.project_id
+      LEFT JOIN agent_accounts a ON a.id = c.account_id
+      WHERE c.id = ?
     `).get(chatId) as ChatWithProject | undefined;
     if (!chat) throw new Error("채팅을 찾을 수 없습니다.");
     return chat;
@@ -215,6 +236,52 @@ export class SessionBackupService {
   private chatExists(provider: Provider, sessionId: string): boolean {
     const row = this.database.prepare("SELECT id FROM chats WHERE provider = ? AND provider_session_id = ?").get(provider, sessionId);
     return !!row;
+  }
+
+  // 남아 있는 모든 백업 JSONL을 읽어 과거 삭제 채팅의 토큰 이벤트를 원장에 역수집한다.
+  backfillTokenUsage(): number {
+    if (!this.tokenUsage || !fs.existsSync(this.root)) return 0;
+    let recorded = 0;
+    for (const entry of fs.readdirSync(this.root, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      try {
+        const metadata = this.readMetadata(entry.name);
+        if (!metadata) continue;
+        const file = path.join(this.backupDir(entry.name), "session.jsonl");
+        if (!fs.existsSync(file)) continue;
+        const session = this.getAdapter(metadata.provider).parseHistoryFile(file);
+        if (!session) continue;
+        const currentChat = this.database.prepare("SELECT id FROM chats WHERE provider = ? AND provider_session_id = ?")
+          .get(metadata.provider, metadata.providerSessionId) as { id: number } | undefined;
+        const currentSnapshot = currentChat ? tokenUsageSnapshotForChat(this.database, currentChat.id) : null;
+        const project = this.database.prepare("SELECT id, name FROM projects WHERE path = ?").get(metadata.projectPath) as { id: number; name: string } | undefined;
+        const account = this.database.prepare("SELECT id, label FROM agent_accounts WHERE provider = ? AND is_default = 1")
+          .get(metadata.provider) as { id: number; label: string } | undefined;
+        const snapshot: TokenUsageSnapshot = currentSnapshot ?? {
+          accountId: metadata.accountId ?? account?.id ?? null,
+          accountLabel: metadata.accountLabel ?? account?.label ?? null,
+          projectId: metadata.projectId ?? project?.id ?? null,
+          projectName: metadata.projectName ?? project?.name ?? path.basename(metadata.projectPath),
+          projectPath: metadata.projectPath,
+          chatId: metadata.originalChatId,
+          chatTitle: metadata.title,
+          model: metadata.model,
+          chatDeleted: true,
+        };
+        recorded += this.tokenUsage.recordSession(session, snapshot);
+      } catch {
+        // 손상되거나 지원하지 않는 예전 백업 하나 때문에 서버 시작 전체가 실패하지 않게 건너뛴다.
+      }
+    }
+    return recorded;
+  }
+
+  // 삭제·백업 직전 현재 JSONL을 다시 파싱해 최신 토큰 이벤트를 빠짐없이 보존한다.
+  private recordChatUsage(chat: ChatWithProject, chatDeleted: boolean): void {
+    if (!this.tokenUsage || !chat.history_file || !fs.existsSync(chat.history_file)) return;
+    const session = this.historyCache.get(this.getAdapter(chat.provider), chat.history_file);
+    const snapshot = tokenUsageSnapshotForChat(this.database, chat.id, chatDeleted);
+    if (session && snapshot) this.tokenUsage.recordSession(session, snapshot);
   }
 
   private upsertRestoredChat(session: HistorySession, metadata: ChatBackupMetadata, historyFile: string, projectPath: string): Record<string, unknown> {

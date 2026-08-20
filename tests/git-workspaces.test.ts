@@ -207,6 +207,19 @@ describe("GitWorkspaceService", () => {
     await expect(service.switchBranch(projectId, { chatId: chatIds[0], branch: "main", mode: "shared" })).rejects.toThrow("미커밋 변경사항");
   });
 
+  it("외부 worktree가 쓰는 브랜치는 브랜치 지정만으로 붙일 수 없고 경로 지정으로 공유한다", async () => {
+    const { root, repo, service, projectId, chatIds } = createHarness();
+    const external = path.join(root, "agent-created-worktree");
+    execFileSync("git", ["worktree", "add", "-q", "-b", "feature/agent", external], { cwd: repo });
+
+    // 브랜치만 넘기면 앱 관리 경로에 새로 만들려다 Git이 중복 체크아웃을 막는다.
+    await expect(service.switchBranch(projectId, { chatId: chatIds[0], branch: "feature/agent", mode: "worktree" })).rejects.toThrow();
+    // 채팅 없는 worktree 묶음에서 새 채팅을 시작할 수 있도록, 경로를 직접 지정하면 그 폴더를 그대로 쓴다.
+    const attached = await service.attachWorktree(projectId, chatIds[1], external);
+    expect(attached.path).toBe(external);
+    expect(attached.branch).toBe("feature/agent");
+  });
+
   it("실행 중 채팅 또는 미커밋 변경이 있는 worktree 전환을 차단한다", async () => {
     const { database, service, projectId, chatIds } = createHarness();
     database.prepare("UPDATE chats SET status = 'running' WHERE id = ?").run(chatIds[0]);

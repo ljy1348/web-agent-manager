@@ -92,6 +92,29 @@ describe("파일 API", () => {
     fs.rmSync(outside, { recursive: true, force: true });
   });
 
+  it("파일 검색은 하위 폴더까지 이름으로 찾되 무거운 디렉터리와 민감 경로는 건너뛴다", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "web-agent-manager-files-"));
+    fs.mkdirSync(path.join(root, "src", "client"), { recursive: true });
+    fs.writeFileSync(path.join(root, "src", "client", "main.tsx"), "");
+    fs.mkdirSync(path.join(root, "node_modules", "some-pkg"), { recursive: true });
+    fs.writeFileSync(path.join(root, "node_modules", "some-pkg", "main.tsx"), "");
+    fs.writeFileSync(path.join(root, ".env"), "TOKEN=secret");
+    const database = {
+      prepare: () => ({ get: () => ({ path: root }), run: () => undefined }),
+    } as unknown as AppDatabase;
+    const baseUrl = await startFileApi(database, false);
+
+    const fileMatch = await (await fetch(`${baseUrl}/projects/1/files/search?q=main`)).json();
+    expect(fileMatch.matches).toEqual([{ path: "src/client/main.tsx", directory: false }]);
+
+    const folderMatch = await (await fetch(`${baseUrl}/projects/1/files/search?q=client`)).json();
+    expect(folderMatch.matches).toEqual([
+      { path: "src/client", directory: true },
+      { path: "src/client/main.tsx", directory: false },
+    ]);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
   it("외부망에서는 점 파일과 민감 설정을 숨기고 내부망에서는 모두 보여준다", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "web-agent-manager-files-"));
     fs.mkdirSync(path.join(root, ".vscode"));
@@ -325,6 +348,42 @@ describe("파일 API", () => {
     expect(fs.readFileSync(path.join(root, "icon.png")).length).toBe(8);
     expect((await save({ path: "sub", content: "폴더 저장 시도" })).status).toBe(400);
     expect((await save({ path: "note.txt" })).status).toBe(400);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it("파일·폴더 삭제는 내부망에서만 허용하고 .git 등 민감 경로는 신뢰 네트워크라도 거부한다", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "web-agent-manager-files-"));
+    fs.writeFileSync(path.join(root, "note.txt"), "지울 파일");
+    fs.mkdirSync(path.join(root, "sub", "nested"), { recursive: true });
+    fs.writeFileSync(path.join(root, "sub", "nested", "inner.txt"), "안");
+    fs.mkdirSync(path.join(root, ".git"));
+    fs.writeFileSync(path.join(root, ".git", "HEAD"), "ref: refs/heads/main");
+    const database = {
+      prepare: () => ({ get: () => ({ path: root }), run: () => undefined }),
+    } as unknown as AppDatabase;
+
+    // 외부망(신뢰 네트워크 아님)에서는 삭제 자체가 403.
+    const externalUrl = await startFileApi(database, false);
+    const externalDelete = await fetch(`${externalUrl}/projects/1/files?path=note.txt`, { method: "DELETE" });
+    expect(externalDelete.status).toBe(403);
+    expect(fs.existsSync(path.join(root, "note.txt"))).toBe(true);
+    await closeServer?.();
+    closeServer = undefined;
+
+    // 내부망(신뢰 네트워크)이어도 .git 같은 민감 경로는 삭제 API로 절대 지울 수 없다.
+    const internalUrl = await startFileApi(database, true);
+    const gitDelete = await fetch(`${internalUrl}/projects/1/files?path=.git`, { method: "DELETE" });
+    expect(gitDelete.status).toBe(400);
+    expect(fs.existsSync(path.join(root, ".git", "HEAD"))).toBe(true);
+
+    // 일반 파일과 폴더(하위 내용 포함)는 내부망에서 삭제된다.
+    const fileDelete = await fetch(`${internalUrl}/projects/1/files?path=note.txt`, { method: "DELETE" });
+    expect(fileDelete.status).toBe(204);
+    expect(fs.existsSync(path.join(root, "note.txt"))).toBe(false);
+    const folderDelete = await fetch(`${internalUrl}/projects/1/files?path=sub`, { method: "DELETE" });
+    expect(folderDelete.status).toBe(204);
+    expect(fs.existsSync(path.join(root, "sub"))).toBe(false);
+
     fs.rmSync(root, { recursive: true, force: true });
   });
 

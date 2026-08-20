@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { AGENT_SKILL_NAMES } from "../src/server/services/agent-skill-installer";
 import type { AppConfig } from "../src/server/core/config";
 import { openDatabase, type AppDatabase } from "../src/server/core/database";
 import {
@@ -20,7 +21,7 @@ function createFixture(): { config: AppConfig; database: AppDatabase; calls: Arr
   const dataDir = path.join(rootDir, "data");
   fs.mkdirSync(path.join(rootDir, "dist", "server", "scripts"), { recursive: true });
   fs.writeFileSync(path.join(rootDir, "dist", "server", "scripts", "web-agent-manager-agent.js"), "");
-  for (const name of ["web-agent-manager-session-context", "web-agent-manager-delegate"]) {
+  for (const name of AGENT_SKILL_NAMES) {
     fs.mkdirSync(path.join(rootDir, "skills", name), { recursive: true });
     fs.writeFileSync(path.join(rootDir, "skills", name, "SKILL.md"), name);
   }

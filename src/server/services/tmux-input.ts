@@ -12,13 +12,13 @@ function assertTmuxSuccess(result: TmuxResult, fallback: string): void {
   throw new Error(message || fallback);
 }
 
-// 긴 프롬프트를 tmux 버퍼로 붙여 넣어 현재 pane 입력창에 안전하게 전달한다.
+// 프롬프트를 브래킷 붙여넣기로 보내 TUI가 빠른 키 입력 burst로 오인하지 않게 한다.
 export function pastePromptToTmux(tmuxName: string, text: string): void {
   const bufferName = `web_agent_manager_prompt_${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2)}`;
   const load = spawnSync("tmux", ["load-buffer", "-b", bufferName, "-"], { input: text, encoding: "utf8" });
   assertTmuxSuccess(load, "tmux 입력 버퍼를 만들지 못했습니다.");
   try {
-    const paste = spawnSync("tmux", ["paste-buffer", "-t", tmuxName, "-b", bufferName], { encoding: "utf8" });
+    const paste = spawnSync("tmux", ["paste-buffer", "-p", "-t", tmuxName, "-b", bufferName], { encoding: "utf8" });
     assertTmuxSuccess(paste, "tmux 입력 버퍼를 붙여 넣지 못했습니다.");
   } finally {
     spawnSync("tmux", ["delete-buffer", "-b", bufferName], { stdio: "ignore" });

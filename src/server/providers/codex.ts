@@ -1,11 +1,13 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { ApprovalHint, HistoryMessage, HistorySyncContext, HistorySyncDecision, HistorySession, ModelChoice, ModelOptions, ProviderAdapter, ProviderLaunch, TmuxIO } from "./provider";
+import type { ApprovalHint, HistoryMessage, HistorySyncContext, HistorySyncDecision, HistorySession, HistoryTokenUsage, ModelChoice, ModelOptions, ProviderAdapter, ProviderLaunch, TmuxIO } from "./provider";
 import type { UsageRecord, UsageWindow } from "../../shared/types";
 import { extractContent, fallbackId } from "./history-utils";
 import { stripAnsi } from "../core/security";
 import { isExpiredResetTime } from "./usage-utils";
+import { isCodexResetCreditsScreenReady, parseCodexResetCreditsScreen } from "./codex-rate-limits";
+import { USAGE_KEEPALIVE_PROMPT } from "../../shared/usage-keepalive";
 
 // Codex가 세션 시작 시 AGENTS.md 등 프로젝트 지침을 첫 user 턴으로 자동 주입할 때 붙이는 고정 헤더.
 const PROJECT_INSTRUCTIONS_MARKER = /^#\s+[\w.-]+\.md instructions\b/i;
@@ -59,7 +61,7 @@ function firstCodexUserMessage(file: string): string | null {
       const payload = record.payload && typeof record.payload === "object" ? record.payload as Record<string, unknown> : {};
       if (payload.role !== "user") continue;
       const content = extractContent(payload.content ?? payload.output ?? payload.result);
-      if (content) return content;
+      if (content && !PROJECT_INSTRUCTIONS_MARKER.test(content) && !content.trimStart().startsWith("/")) return content;
     } catch {
       // 기록 중인 마지막 불완전 레코드는 다음 동기화에서 다시 읽는다.
     }
@@ -88,6 +90,38 @@ function parseCodexMessage(record: Record<string, unknown>, line: string): Histo
     content,
     createdAt: timestamp,
   };
+}
+
+// Codex token_count 이벤트의 마지막 모델 호출량을 채팅 공통 토큰 수치로 변환한다.
+function parseCodexTokenUsage(record: Record<string, unknown>): HistoryTokenUsage | undefined {
+  if (record.type !== "event_msg" || !record.payload || typeof record.payload !== "object") return undefined;
+  const payload = record.payload as Record<string, unknown>;
+  if (payload.type !== "token_count" || !payload.info || typeof payload.info !== "object") return undefined;
+  const info = payload.info as Record<string, unknown>;
+  if (!info.last_token_usage || typeof info.last_token_usage !== "object") return undefined;
+  const usage = info.last_token_usage as Record<string, unknown>;
+  const number = (key: string): number => typeof usage[key] === "number" && Number.isFinite(usage[key]) && Number(usage[key]) >= 0 ? Number(usage[key]) : 0;
+  const inputTokens = number("input_tokens");
+  const cachedInputTokens = number("cached_input_tokens");
+  const cacheCreationInputTokens = number("cache_write_input_tokens");
+  const outputTokens = number("output_tokens");
+  const reasoningOutputTokens = number("reasoning_output_tokens");
+  const totalTokens = number("total_tokens") || inputTokens + outputTokens;
+  if (!totalTokens) return undefined;
+  return { inputTokens, cachedInputTokens, cacheCreationInputTokens, cacheReadInputTokens: 0, outputTokens, reasoningOutputTokens, totalTokens };
+}
+
+// token_count 바로 앞의 현재 턴 assistant 메시지에 해당 모델 호출량을 연결한다.
+function attachCodexTokenUsage(messages: HistoryMessage[], tokenUsage: HistoryTokenUsage): void {
+  let latestUser = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index].role === "user") { latestUser = index; break; }
+  }
+  for (let index = messages.length - 1; index > latestUser; index -= 1) {
+    if (messages[index].role !== "assistant") continue;
+    messages[index] = { ...messages[index], tokenUsage };
+    return;
+  }
 }
 
 interface CodexHistoryState {
@@ -119,6 +153,8 @@ function applyCodexHistoryRecord(state: CodexHistoryState, record: Record<string
   }
   const message = parseCodexMessage(record, line);
   if (message) state.messages.push(message);
+  const tokenUsage = parseCodexTokenUsage(record);
+  if (tokenUsage) attachCodexTokenUsage(state.messages, tokenUsage);
 }
 
 // Codex 세션 JSONL을 프로젝트 메타데이터와 메시지로 해석한다.
@@ -279,9 +315,18 @@ export class CodexAdapter implements ProviderAdapter {
     return configDir ? path.join(configDir, "sessions") : this.historyRoot;
   }
   readonly usageCommands = ["/usage weekly", "/status"];
+  readonly usageDetails = {
+    command: "/usage",
+    openInput: "\u001b[B\r",
+    timeoutMs: 30_000,
+    isReady: isCodexResetCreditsScreenReady,
+    closeInput: "\u001b",
+  };
   // 첫 사용자 메시지는 append-only 기록에서 바뀌지 않으므로 확인된 숨김 판정을 재사용한다.
   private readonly hiddenHistoryVerdicts = new Map<string, boolean>();
   readonly promptQuirks = {
+    pasteSubmitDelayMs: 160,
+    verifyPromptSubmission: true,
     slashCommandConfirmDelayMs: 200,
     usageCommandDelayMs: 6_000,
     modelMenuInitialTimeoutMs: 800,
@@ -331,6 +376,7 @@ export class CodexAdapter implements ProviderAdapter {
     const authRequired = /(sign in|login required|not authenticated|로그인)/i.test(text);
     const windows = [parseCodexWindow(text, "weekly", "Weekly limit"), parseCodexWindow(text, "five_hour", "5h limit")].filter(Boolean) as UsageWindow[];
     const activity = text.match(/Lifetime\s+([^\n]+)|Each column\s*=\s*([^\n]+)/gi)?.map((line) => line.trim()) ?? [];
+    const rateLimitResetCredits = parseCodexResetCreditsScreen(text);
     const primary = windows[0];
     const success = windows.length > 0 && !authRequired;
     const stale = success && windows.some((window) => !!window.resetAt && isExpiredResetTime(window.resetAt, now));
@@ -340,19 +386,19 @@ export class CodexAdapter implements ProviderAdapter {
       used_percent: primary?.usedPercent ?? null,
       remaining_percent: primary?.remainingPercent ?? null,
       reset_at: primary?.resetAt ?? null,
-      details_json: success ? JSON.stringify({ windows, activity }) : null,
+      details_json: success ? JSON.stringify({ windows, activity, ...(rateLimitResetCredits ? { rateLimitResetCredits } : {}) }) : null,
       data_status: !success ? "unavailable" : stale ? "stale" : "fresh",
       error_code: authRequired ? "auth_required" : success ? null : "parse_failed",
     };
   }
 
-  // Codex 내부 승인 검토 세션은 웹 관리 대상에서 제외한다.
+  // Codex 내부 승인 검토·사용량 창 활성화 세션은 웹 관리 대상에서 제외한다.
   isHiddenHistoryFile(file: string): boolean {
     const cached = this.hiddenHistoryVerdicts.get(file);
     if (cached !== undefined) return cached;
     const firstUser = firstCodexUserMessage(file);
     if (!firstUser) return false;
-    const hidden = isApprovalReviewPrompt(firstUser);
+    const hidden = isApprovalReviewPrompt(firstUser) || firstUser === USAGE_KEEPALIVE_PROMPT;
     this.hiddenHistoryVerdicts.set(file, hidden);
     return hidden;
   }

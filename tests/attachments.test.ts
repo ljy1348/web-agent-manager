@@ -68,4 +68,32 @@ describe("첨부 이미지 판정·URL", () => {
     expect(html).not.toContain("/api/projects/7/files/content");
     expect(html).toContain("[첨부: /etc/secret.png]");
   });
+
+  it("chat: 링크는 onOpenChat이 있을 때만 채팅 이동 링크로 렌더링하고 없으면 새 탭 외부 링크로 남긴다", () => {
+    const withHandler = renderToStaticMarkup(React.createElement(MessageBody, {
+      content: "[#42 다른 채팅](chat:42)",
+      onOpenChat: () => undefined,
+    }));
+    expect(withHandler).toContain('href="chat:42"');
+    expect(withHandler).toContain('class="project-file-link"');
+
+    const withoutHandler = renderToStaticMarkup(React.createElement(MessageBody, {
+      content: "[#42 다른 채팅](chat:42)",
+    }));
+    expect(withoutHandler).toContain('href="chat:42"');
+    expect(withoutHandler).toContain('target="_blank"');
+    expect(withoutHandler).not.toContain('class="project-file-link"');
+  });
+
+  it("파일 미리보기 줄 링크(#L줄번호)는 프로젝트 파일 링크로 인식되어 새 탭이 아닌 파일 탭 이동 링크로 렌더링된다", () => {
+    const html = renderToStaticMarkup(React.createElement(MessageBody, {
+      content: "[src/client/main.tsx:3](src/client/main.tsx#L3)",
+      projectId: 7,
+      projectPath: "/home/testuser/web-agent-manager",
+      onOpenProjectFile: () => undefined,
+    }));
+    expect(html).toContain('class="project-file-link"');
+    expect(html).toContain('href="src/client/main.tsx#L3"');
+    expect(html).not.toContain('target="_blank"');
+  });
 });

@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-export const AGENT_SKILL_NAMES = ["web-agent-manager-session-context", "web-agent-manager-delegate"] as const;
+export const AGENT_SKILL_NAMES = ["web-agent-manager-session-context", "web-agent-manager-delegate", "web-agent-manager-experiment"] as const;
 const LEGACY_AGENT_SKILL_NAMES = ["myagent-session-context", "myagent-delegate"] as const;
 
 export interface SkillInstallResult {

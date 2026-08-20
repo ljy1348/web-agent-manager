@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- 평문 HTTP는 앱 코드가 사설망·로컬 호스트 주소일 때만 허용한다. 인증서 검증은 우회하지 않는다. -->
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

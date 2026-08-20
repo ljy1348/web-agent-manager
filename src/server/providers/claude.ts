@@ -1,11 +1,12 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { ApprovalHint, HistoryMessage, HistorySyncContext, HistorySyncDecision, HistorySession, ModelChoice, ModelOptions, ProviderAdapter, ProviderLaunch, TmuxIO } from "./provider";
+import type { ApprovalHint, HistoryMessage, HistorySyncContext, HistorySyncDecision, HistorySession, HistoryTokenUsage, ModelChoice, ModelOptions, ProviderAdapter, ProviderLaunch, TmuxIO } from "./provider";
 import type { UsageRecord, UsageWindow } from "../../shared/types";
 import { extractContent, fallbackId } from "./history-utils";
 import { stripAnsi } from "../core/security";
 import { isExpiredResetTime } from "./usage-utils";
+import { USAGE_KEEPALIVE_PROMPT } from "../../shared/usage-keepalive";
 
 // Claude API 프로토콜은 도구 실행 결과를 "user" 역할 턴으로 되돌려주므로,
 // 사람이 입력한 메시지와 구분하기 위해 tool_result만 담긴 턴인지 확인한다.
@@ -69,15 +70,23 @@ function isTaskNotification(content: string): boolean {
   return TASK_NOTIFICATION_PATTERN.test(content);
 }
 
-// Claude 기록에서 사람이 직접 입력한 user 턴인지 판정한다.
-function isRealUserMessage(record: Record<string, unknown>, line: string): boolean {
-  const message = parseClaudeMessage(record, line);
-  return message?.role === "user";
-}
-
 // JSONL의 원본 모델 id("claude-sonnet-5")를 기존 배너 표시 형식("Sonnet 5")과 맞춘다.
 function formatModelId(id: string): string {
   return id.replace(/^claude-/, "").split("-").map((part) => /^\d+$/.test(part) ? part : part.charAt(0).toUpperCase() + part.slice(1)).join(" ");
+}
+
+// Claude assistant 레코드의 API usage를 채팅 공통 토큰 수치로 변환한다.
+function parseClaudeTokenUsage(value: unknown): HistoryTokenUsage | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const usage = value as Record<string, unknown>;
+  const number = (key: string): number => typeof usage[key] === "number" && Number.isFinite(usage[key]) && Number(usage[key]) >= 0 ? Number(usage[key]) : 0;
+  const inputTokens = number("input_tokens");
+  const cacheCreationInputTokens = number("cache_creation_input_tokens");
+  const cacheReadInputTokens = number("cache_read_input_tokens");
+  const outputTokens = number("output_tokens");
+  const totalTokens = inputTokens + cacheCreationInputTokens + cacheReadInputTokens + outputTokens;
+  if (!totalTokens) return undefined;
+  return { inputTokens, cachedInputTokens: 0, cacheCreationInputTokens, cacheReadInputTokens, outputTokens, reasoningOutputTokens: 0, totalTokens };
 }
 
 // Claude JSONL 레코드에서 대화 메시지를 공통 형태로 변환한다.
@@ -109,6 +118,7 @@ function parseClaudeMessage(record: Record<string, unknown>, line: string): Hist
     kind: isToolResult ? "tool_result" : isTaskNotif ? "task_notification" : isLocalCmd ? "local_command" : isCompactSummary ? "compact_summary" : isToolCallStep ? "tool_call" : isTurnEndStep ? "turn_end" : String(record.subtype ?? "text"),
     content,
     createdAt: String(record.timestamp ?? new Date().toISOString()),
+    tokenUsage: type === "assistant" ? parseClaudeTokenUsage(message.usage) : undefined,
   };
 }
 
@@ -240,7 +250,7 @@ function appendClaudeHistory(file: string, previous: HistorySession, lines: stri
   };
 }
 
-// 실제 user 턴이 없는 Claude 로컬 명령 전용 기록은 웹 채팅 목록에서 숨긴다.
+// 실제 user 턴이 없거나 사용량 창 활성화 프롬프트뿐인 Claude 내부 기록은 웹 채팅 목록에서 숨긴다.
 function isClaudeInternalOnlyHistory(file: string): boolean {
   let lines: string[];
   try {
@@ -254,7 +264,8 @@ function isClaudeInternalOnlyHistory(file: string): boolean {
     try {
       const record = JSON.parse(line) as Record<string, unknown>;
       sawClaudeRecord = sawClaudeRecord || typeof record.type === "string";
-      if (isRealUserMessage(record, line)) return false;
+      const message = parseClaudeMessage(record, line);
+      if (message?.role === "user" && message.content !== USAGE_KEEPALIVE_PROMPT) return false;
     } catch {
       return false;
     }
@@ -283,6 +294,25 @@ function hasLivePromptOnlyAfter(lines: string[], anchorIndex: number): boolean {
     return false;
   }
   return true;
+}
+
+// 세션 리밋 배너 뒤에 새 대화 없이 Claude의 유휴 프롬프트와 상태줄만 남았는지 판정한다.
+function hasOnlyIdleChromeAfter(lines: string[], anchorIndex: number): boolean {
+  let sawPrompt = false;
+  for (const line of lines.slice(anchorIndex + 1)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    if (isClaudePromptLine(line)) {
+      sawPrompt = true;
+      continue;
+    }
+    if (/^Worked for\b/i.test(trimmed)) continue;
+    if (/^~?\d+[kmg]?\s+(?:un)?cached\b/i.test(trimmed)) continue;
+    if (/^(?:[⏵⏴⏸].*)?(?:(?:auto|manual|plan) mode on|accept edits on)\b/i.test(trimmed)) continue;
+    if (/^[-─]+$/.test(trimmed)) continue;
+    return false;
+  }
+  return sawPrompt;
 }
 
 // Claude 브라우저 도구 권한 선택 메뉴가 지금 화면 하단에 떠 있는지 판정한다.
@@ -362,6 +392,24 @@ function isClaudeReady(output: string): boolean {
   return !/esc to interrupt/i.test(activeArea);
 }
 
+// Claude 화면 하단 입력창에 남아 있는 미전송 텍스트를 돌려준다(입력창이 비어 있으면 빈 문자열).
+// 입력창이 아예 없는 화면(승인·선택 메뉴 등)이면 null을 돌려 그런 화면에 채팅 입력을 흘려보내지 않게 한다.
+// 선택 메뉴의 커서 줄("❯ 1. Yes")은 입력창이 아니므로 제외하고, dim 스타일 자동 제안과 "Try ..." 안내는
+// 실제로 입력된 글자가 아니라 지울 대상이 없으므로 빈 문자열로 본다.
+function readClaudePromptDraft(output: string): string | null {
+  const lines = claudeScreenLines(output);
+  for (let index = lines.length - 1; index >= 0 && index >= lines.length - 6; index -= 1) {
+    const line = lines[index];
+    const match = stripAnsi(line).replace(/ /g, " ").trim().match(/^(?:[›❯>]|\$)\s*(.*)$/);
+    if (!match) continue;
+    const draft = match[1].trim();
+    if (/^\d+[.)]\s/.test(draft)) return null;
+    if (!draft || isClaudeSuggestedPromptLine(line) || /^Try\s+"/i.test(draft)) return "";
+    return draft;
+  }
+  return null;
+}
+
 // Claude 화면의 응답 생성 중 상태 표시를 감지한다.
 // isClaudeReady와 같은 이유로 끝의 빈 줄을 먼저 제거하고, 프롬프트 줄 아래쪽 상태줄도 놓치지 않게
 // 화면 끝까지 본다(위 isClaudeReady 주석 참고).
@@ -412,7 +460,10 @@ export class ClaudeAdapter implements ProviderAdapter {
     return configDir ? path.join(configDir, "projects") : this.historyRoot;
   }
   readonly usageCommands = ["/usage"];
+  // 긴 bracketed-paste를 TUI가 반영할 시간을 준 뒤 실제 제출 상태까지 확인한다.
   readonly promptQuirks = {
+    pasteSubmitDelayMs: 160,
+    verifyPromptSubmission: true,
     usageCommandDelayMs: 8_000,
     modelMenuInitialTimeoutMs: 6_000,
   };
@@ -479,6 +530,11 @@ export class ClaudeAdapter implements ProviderAdapter {
   // Claude TUI가 응답 생성 중인지 판정한다.
   isBusy(output: string): boolean {
     return isClaudeBusy(output);
+  }
+
+  // Claude 입력창에 남은 미전송 텍스트를 읽는다(입력창이 없는 화면이면 null).
+  readPromptDraft(output: string): string | null {
+    return readClaudePromptDraft(output);
   }
 
   // Claude /usage 화면에서 사용량 상태를 구조화한다.
@@ -579,13 +635,14 @@ export class ClaudeAdapter implements ProviderAdapter {
     }
     // 선택 메뉴 없이 "한도에 걸렸다"는 배너만 지나가듯 뜨고 곧바로 idle 프롬프트로 돌아가는 경우가
     // 있다(예: "⎿  You've hit your session limit · resets 7:10pm (Asia/Seoul)"). 이 배너는 응답을
-    // 막고 있는 게 아니라서 위 프롬프트들과 달리 "뒤에 idle이 없어야 진짜"가 아니라 반대로 뒤에 idle이
-    // 있는 게 정상이다 — 그래서 staleIndex 판정은 안 쓰고, 대신 문구 자체를 훨씬 좁게 잡는다. Claude가
-    // 실제로 이 배너를 그릴 때만 줄 맨 앞(공백 제외)이 "⎿"로 시작해서, 이 기능을 설명하는 주석·커밋
-    // 메시지·터미널에 cat/git diff로 띄운 소스 코드에는(그 앞에 항상 "//"·"+"·코드 등 다른 문자가 있어)
-    // 절대 이 형태로 나타나지 않는다(위 "Enter y/n:" 오탐 사례와 같은 문제를 앵커링으로 막음).
+    // 막고 있는 게 아니라서 위 프롬프트들과 달리 뒤에 idle이 있는 게 정상이다. 다만 세션을 재개하면
+    // 기록 중간의 예전 배너도 현재 pane에 다시 그려질 수 있으므로, 배너 뒤에는 유휴 프롬프트·상태줄만
+    // 있어야 한다. 사용자 입력·도구 결과·후속 답변이 하나라도 이어졌으면 이미 해소된 배너다. 문구도
+    // 실제 배너처럼 줄 맨 앞(공백 제외)이 "⎿"로 시작하는 경우만 받아 코드·문서 출력 오탐을 막는다.
     const sessionLimitIndex = lastMatchIndex(lines, /^\s*⎿\s+You(?:'|’)ve hit your session limit\b/i);
-    if (sessionLimitIndex >= 0) return { requestType: "session_limit_notice", summary: lines[sessionLimitIndex].trim() };
+    if (sessionLimitIndex >= 0 && hasOnlyIdleChromeAfter(lines, sessionLimitIndex)) {
+      return { requestType: "session_limit_notice", summary: lines[sessionLimitIndex].trim() };
+    }
     return null;
   }
 

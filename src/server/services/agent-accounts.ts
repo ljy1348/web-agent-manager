@@ -12,6 +12,7 @@ const ACCOUNTS_DIRNAME = "agent-accounts";
 export const CONFIG_DIR_ENV: Record<Provider, string> = {
   claude: "CLAUDE_CONFIG_DIR",
   codex: "CODEX_HOME",
+  grok: "GROK_HOME",
 };
 
 // 라벨에서 디렉터리로 쓸 수 있는 slug를 만든다. 한글 라벨도 흔해 사용 가능한 문자가 하나도 안 남을 수 있어,

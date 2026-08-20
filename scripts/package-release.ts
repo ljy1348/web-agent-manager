@@ -11,16 +11,6 @@ interface ReleaseTarget {
 const rootDir = process.cwd();
 const packageJson = JSON.parse(fs.readFileSync(path.join(rootDir, "package.json"), "utf8")) as { name: string; version: string };
 const releaseDir = path.join(rootDir, "release", "archives");
-const readmeScreenshots = [
-  "ui-subagent-manager.png",
-  "ui-file-markdown-preview.png",
-  "ui-pr-diff-split.png",
-  "ui-usage-snapshot.png",
-  "ui-github-repositories.png",
-  "ui-project-create.png",
-  "ui-github-project-popup.png",
-  "ui-cli-auth-popup.png",
-];
 const targets: ReleaseTarget[] = [
   { id: "linux-x64", description: "Linux x64" },
   { id: "macos-x64", description: "macOS Intel x64" },
@@ -53,9 +43,7 @@ async function createArchive(target: ReleaseTarget): Promise<void> {
     archive.file(path.join(rootDir, "docker-compose.yml"), { name: "docker-compose.yml" });
     archive.file(path.join(rootDir, ".dockerignore"), { name: ".dockerignore" });
     archive.directory(path.join(rootDir, "docker"), "docker");
-    for (const screenshot of readmeScreenshots) {
-      archive.file(path.join(rootDir, "artifacts", screenshot), { name: path.join("artifacts", screenshot) });
-    }
+    archive.directory(path.join(rootDir, "artifacts"), "artifacts");
     archive.directory(path.join(rootDir, "packaging"), false);
     archive.append(`${target.description}\nweb-agent-manager v${packageJson.version}\n`, { name: "RELEASE_TARGET.txt" });
     void archive.finalize();
