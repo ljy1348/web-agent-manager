@@ -460,6 +460,10 @@ export class ClaudeAdapter implements ProviderAdapter {
     return configDir ? path.join(configDir, "projects") : this.historyRoot;
   }
   readonly usageCommands = ["/usage"];
+  // /usage 화면이 열린 채로 다음 주기에 다시 /usage를 보내면 입력이 그대로 무시돼(실측: 화면·퍼센트가
+  // 전혀 안 바뀜) 최초 조회 이후 영원히 같은 스냅샷만 재파싱하게 된다. 다음 조회 전에 Esc로 닫아야
+  // /usage가 새로 열리며 다시 최신값을 가져온다(grok의 usageScreenCloseInput과 같은 이유).
+  readonly usageScreenCloseInput = "\u001b";
   // 긴 bracketed-paste를 TUI가 반영할 시간을 준 뒤 실제 제출 상태까지 확인한다.
   readonly promptQuirks = {
     pasteSubmitDelayMs: 160,

@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$SCRIPT_DIR/package.json" ]]; then
+  ROOT_DIR="$SCRIPT_DIR"
+else
+  ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+fi
 cd "$ROOT_DIR"
 
 read -r -p "관리자 아이디: " WEB_AGENT_MANAGER_ADMIN_USERNAME

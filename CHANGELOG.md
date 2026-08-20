@@ -1,5 +1,18 @@
 # 변경 기록
 
+## 0.5.1 - 2026-08-21
+
+### 버그 수정
+
+- Claude 사용량 조회용 PTY가 `/usage` 화면을 한 번 연 뒤로는 다음 조회에서 화면이 갱신되지 않고 최초 값에 영구히 고정되던 문제를 고쳤다(Grok과 같은 방식으로 조회 전 화면을 닫도록 함).
+
+### 설치 자동화
+
+- `packaging/install.sh`·`create-admin.sh`·`run.sh`가 압축 배포본뿐 아니라 git 저장소를 그대로 실행해도 앱 루트를 올바르게 찾도록 고쳤다. 빌드된 `dist/`가 없으면 소스에서 자동으로 빌드한다.
+- Node.js(NodeSource 22.x)·git·GitHub CLI·tmux·네이티브 모듈 빌드 도구(`python3`·`make`·`g++`)가 없으면 Linux·root·apt 환경에서 자동으로 설치한다.
+- 신규 `packaging/install-systemd.sh`: 빌드부터 전용 시스템 사용자 생성·환경 파일 준비·systemd 유닛 등록·기동까지 한 번에 처리한다.
+- README의 압축 배포 파일명과 `docker-compose.yml`의 이미지 태그에 남아있던 예전 버전 번호 하드코딩을 제거했다.
+
 ## 0.5.0 - 2026-08-20
 
 ### Agent Lab(실험실)
