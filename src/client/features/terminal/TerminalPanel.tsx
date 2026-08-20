@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import type { Json } from "../../types";
+import { copyText } from "../../lib/clipboard";
 
 // 가로 폭을 바꾸면 기존 tmux 스크롤백의 줄바꿈이 깨질 수 있어 256열로 고정한다. 세로 행 수는
 // 줄바꿈에 영향을 주지 않으므로 데스크톱 패널 높이로 계산해 서버 tmux와 함께 동기화한다.
@@ -58,20 +59,6 @@ function terminalRowsForHeight(instance: Terminal, hostElement: HTMLElement): nu
   if (rendered <= 0 || available <= 0) return instance.rows;
   const cellHeight = rendered / instance.rows;
   return Math.max(TERMINAL_MIN_ROWS, Math.min(TERMINAL_MAX_ROWS, Math.floor(available / cellHeight)));
-}
-
-// HTTPS가 아닌 LAN 접속 등 비보안 컨텍스트에서는 navigator.clipboard 자체가 없어, 옛 방식(임시
-// textarea + execCommand)으로 대체한다.
-function copyText(text: string): void {
-  if (navigator.clipboard?.writeText) { void navigator.clipboard.writeText(text).catch(() => undefined); return; }
-  const area = document.createElement("textarea");
-  area.value = text;
-  area.style.position = "fixed";
-  area.style.opacity = "0";
-  document.body.appendChild(area);
-  area.select();
-  try { document.execCommand("copy"); } catch { /* 복사 실패는 조용히 무시 */ }
-  document.body.removeChild(area);
 }
 
 // 선택한 채팅의 실제 tmux PTY를 xterm 화면과 WebSocket으로 연결한다.

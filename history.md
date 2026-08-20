@@ -1416,3 +1416,29 @@
 - 사용자가 curl\|sh 한 줄 설치를 요구했으나, 아직 이 브랜치가 공개·사설 원격 어디에도 push되지 않아(로컬 커밋만 있음) 인터넷에서 바로 받아 실행하는 형태는 당장 제공할 수 없다고 판단, 대신 이미 clone된 저장소 안에서 쓸 수 있는 단일 명령(`sudo bash packaging/install-systemd.sh`)과 최신 파일을 직접 붙여넣는 방법을 안내했다. 커밋(`a6828a6`) 후 사설 원격 `origin`(web-agent-manager-private)에 `feat/agent-lab-v04`를 push해 호스트에서 `git pull`로 받을 수 있게 했다.
 - 사용자가 이어서 "위에서 수동으로 설치했던 git·gh·node도 없으면 자동으로 설치돼야 한다"고 요구해, 앞서 "Node는 버전 관리 방식이 제각각이라 자동화하지 않는다"고 판단했던 것을 뒤집었다. `git`·`gh`는 tmux와 같은 방식(apt 패키지명)으로 자동 설치 대상에 추가했다. Node는 Debian/Ubuntu 기본 apt 저장소 버전이 보통 22 미만이라(Ubuntu 24.04 기본 18) 단순 `apt install nodejs`로는 버전 요구사항을 못 맞춰, NodeSource 공식 22.x 설치 스크립트(`curl ... deb.nodesource.com/setup_22.x | bash -` 후 `apt-get install nodejs`)를 Linux·root·apt 조건에서만 자동 실행하는 `ensure_node()`로 만들었다. 이미 22 이상이 있으면 아무것도 안 하고 바로 통과한다.
 - 검증: `bash -n` 문법 통과. 이 저장소(Node 22 이미 있음)에서 다시 `bash packaging/install.sh`를 실행해 `ensure_node`가 즉시 통과하고 기존 정상 경로가 그대로 동작하는 것을 확인, devDependencies가 또 지워져 `npm ci`로 재복구했다. NodeSource 자동 설치 분기 자체(Node 없는 상태)는 이 샌드박스에 이미 Node가 있어 직접 실행 검증은 못 했다 — 로직은 기존에 사용자에게 안내했던 수동 명령과 동일해 실패 가능성은 낮다고 판단.
+- 사용자가 "공개 레포에 추가해" · "공개 레포쪽 문서들에 버전명도 맞추고"라고 요청해, 이 자동화 작업과 그 전에 고친 Claude 사용량 버그 수정을 묶어 v0.5.1 패치로 공개하기로 했다. 겸사겸사 README의 "v0.4.0 압축 배포" 절(파일명에 옛 버전이 하드코딩돼 릴리즈마다 밀리고 있었음 — 0.5.0으로 올린 뒤에도 안 고쳐진 걸 이번에 발견)을 `<버전>` 플레이스홀더로 바꾸고, `docker-compose.yml`의 `image: web-agent-manager:0.2.0` 고정 태그도 `latest`로 바꿔 같은 문제가 다시 안 생기게 했다.
+- 버전을 0.5.1로 올리고 CHANGELOG 정리, `typecheck`·`vitest run`(663개 전체)·`build` 모두 통과 확인 후 v0.5.0과 같은 방식(공개 main 기준 새 브랜치에 파일 상태 스냅샷 커밋)으로 PR #43 생성. 이 과정에서 `.agents/skills`·`.claude/skills`의 심볼릭 링크가 **사설 브랜치에서 다시** 이 머신의 절대경로를 가리키고 있는 걸 발견했다 — v0.5.0 때 공개 브랜치에서만 고치고 "사설 쪽은 이미 있던 기존 버그라 안 건드린다"고 판단했던 게 화근이라, 이번엔 사설 브랜치(`feat/agent-lab-v04`, 커밋 `0624bd9`) 자체를 상대경로로 고쳐 재발을 막았다.
+- CI 3체크(`verify`·`android`·`ui`) 모두 통과 확인 후 사용자에게 PR 링크 전달, 사용자가 머지 완료를 확인해줘서 머지 커밋(`c51664a`)에 `v0.5.1` 태그를 만들어 push하고 GitHub Release를 발행했다: https://github.com/ljy1348/web-agent-manager/releases/tag/v0.5.1
+
+## 2026-08-20 Claude - v0.5.1 설치 후 실사용 중 발견한 추가 버그 2건 진단·수정
+
+- `WEB_AGENT_MANAGER_HOST=0.0.0.0` 미반영처럼 보인 문제: 사용자가 env 파일에 값을 append/치환했는데도 시작 로그가 계속 `http://127.0.0.1:4317`을 찍어 "안 먹힌다"고 보고했다. `/proc/<PID>/environ`을 직접 열어보게 해 실제로는 `WEB_AGENT_MANAGER_HOST=0.0.0.0`이 프로세스에 정상 전달된 걸 확인 — 원인은 버그가 아니라, 시작 로그가 `HOST`가 아니라 별도 `PUBLIC_URL`(`.env.example`에 `http://127.0.0.1:4317`로 고정값 기재됨)을 찍어서 헷갈린 것이었다. `PUBLIC_URL`을 비우면 `http://${HOST}:${PORT}`로 자동 계산됨을 안내. 코드 변경 없이 오인 해소로 마무리.
+- `gh 인증하기` 클릭 시 `unknown flag: --skip-ssh-key` 실패: `src/server/services/cli-auth.ts:49`의 `AUTH_COMMANDS.github`가 `gh auth login`에 `--skip-ssh-key`를 하드코딩하는데, Debian/Ubuntu 기본 apt 저장소의 `gh`는 이 플래그보다 오래된 버전이라 못 알아들었다(`git log -S`로 확인: v0.2.0 최초 구현부터 있던 플래그, 버전 호환성은 처음부터 고려 안 됨). 사용자에게 즉시 우회용 GitHub 공식 apt 저장소 등록 명령을 안내하는 한편, `packaging/install.sh`의 `require_command gh gh ...`를 `ensure_gh()`로 바꿔 `gh auth login --help` 출력에 `--skip-ssh-key`가 없으면 자동으로 공식 저장소(cli.github.com/packages)를 등록하고 최신 gh로 설치하도록 근본적으로 고쳤다(Node의 NodeSource 자동 설치와 같은 패턴).
+- 검증: `bash -n` 통과, 이 샌드박스(gh 2.97.0, 이미 `--skip-ssh-key` 지원)에서 `install.sh` 재실행해 `ensure_gh`가 빠르게 통과하고 정상 경로가 유지되는 것 확인, devDependencies 재복구.
+
+## 2026-08-20 Claude - myagent CLI 인증 화면의 실제 버그 2건 진단·수정
+
+- 작업 시작: 사용자가 실사용 중 두 가지를 보고했다 — (1) codex 기기 코드 로그인을 브라우저에서 완료했는데도 myagent의 로그인 화면·파싱이 그대로 "로그인이 필요합니다"에 멈춰있다. (2) claude는 화면에 "인증됨"으로 뜨는데 실제 채팅 터미널을 실행하면 다시 로그인하라고 뜬다.
+- Claude 원인 확정: `claude auth status --json`을 이 샌드박스(실제 로그인된 계정)에서 직접 실행해 종료 코드가 **0**임을 확인했고, 사용자가 자기 컨테이너(미로그인 상태)에서 같은 명령을 돌려 `{"loggedIn": false, ...}`를 JSON 본문으로 반환한 것도 확인시켜줬다 — 즉 이 명령은 로그인 여부와 무관하게 항상 exit 0이고, 로그인 여부는 JSON 본문의 `loggedIn` 필드로만 판정할 수 있다. `src/server/services/cli-auth.ts`의 `STATUS_COMMANDS.claude`가 이걸 놓치고 grok처럼 종료 코드만 보고 있어서(grok은 이미 `unauthenticatedPattern`으로 이 함정을 피해가고 있었는데 claude는 빠져 있었음), 한 번이라도 정상 실행되면 실제 로그인 여부와 무관하게 항상 "인증됨"으로 오판했다. `unauthenticatedPattern: /"loggedIn"\s*:\s*false/`를 추가해 grok과 같은 방식(exit code 대신 출력 내용)으로 판정하게 고쳤다.
+- Codex 원인 확정(설계 결함): `start()`가 로그인 PTY의 `onExit` 콜백에서만 `refreshAfterExit`(재검사)를 부르는 구조라, codex TUI가 기기 코드 인증 성공 후에도 스스로 프로세스를 종료하지 않으면(이번 버전에서 실측된 현상) 인증 상태가 영원히 갱신되지 않는다. PTY가 살아있는 동안에도 5초 주기로 `inspectTarget`을 다시 돌려, 미인증→인증으로 바뀌면 `cli_auth_changed`를 브로드캐스트하도록 `setInterval` 폴링을 추가했다(`onExit`에서 타이머 정리). 실제 codex 프로세스를 강제로 죽이거나 화면을 건드리지는 않고, 백그라운드 상태 재확인만 추가한 최소 변경이다.
+- 검증: `tests/cli-auth.test.ts`에 회귀 테스트 2건 추가 — (1) claude가 `loggedIn: true/false` JSON 본문으로 정확히 판정되는지, (2) `vi.useFakeTimers()`로 5초를 진행시켜 PTY가 `running: true`로 살아있는 채로도 폴링이 인증 완료를 감지·브로드캐스트하는지. 전체 테스트 665개(신규 2건 포함) 통과, `typecheck`·`build` 통과.
+- 남은 확인 필요: codex TUI가 실제로 왜 자동 종료하지 않는지(업스트림 CLI 자체 동작 변경인지, 이 컨테이너 네트워크 환경 특이사항인지)는 근본 원인까지는 못 밝혔다 — 이번 수정은 "PTY가 안 끝나도 앱이 스스로 회복한다"는 완화책이지, codex 자체의 행동을 고친 건 아니다.
+
+## 2026-08-21 Claude - CLI 인증 터미널의 Ctrl+C·Ctrl+V 처리 추가
+
+- 작업 시작: 사용자가 Claude 인증 코드를 붙여넣기가 제대로 안 되는 것 같다며 Ctrl+C·Ctrl+V가 동작하도록 요청했다. `src/client/features/terminal/AuthTerminal.tsx`(CLI 인증 팝업 전용 xterm)를 메인 터미널(`TerminalPanel.tsx`)과 비교해 두 가지 차이를 발견했다.
+- (1) `instance.focus()` 호출이 빠져 있었다 — 포커스가 안 잡히면 브라우저가 이 터미널의 숨은 입력창에 키 입력(붙여넣기 포함)을 안 보낼 수 있다. TerminalPanel은 이미 호출하고 있었다.
+- (2) Ctrl+C 선택 복사 처리가 없었다 — 인증 코드를 선택하고 Ctrl+C를 누르면 복사가 아니라 그대로 SIGINT로 전달돼 진행 중이던 로그인이 취소될 수 있는 상태였다. TerminalPanel의 `attachCustomKeyEventHandler` 패턴(선택이 있을 때만 Ctrl+C를 가로채 복사)을 그대로 적용했다.
+- 중복 체크: `copyText`(클립보드 쓰기, HTTPS 아닌 환경 폴백 포함) 함수가 TerminalPanel.tsx에 비공개로 있던 걸 `src/client/lib/clipboard.ts` 공용 유틸로 뽑아 두 컴포넌트가 같이 쓰게 했다.
+- Ctrl+V는 브라우저 네이티브 paste 이벤트를 통해 xterm이 자체적으로 처리하는 방식이라(별도 clipboard 권한 불필요, HTTP에서도 동작), focus 수정만으로 해결될 가능성이 높다고 판단해 별도 커스텀 paste 핸들러는 추가하지 않았다 — 사용자 실사용 확인 후에도 여전히 안 되면 명시적 처리를 추가하기로 함.
+- 검증: `typecheck`·전체 vitest 665개·`build` 통과, 기존 e2e `CLI 인증은 페이지 레이아웃 밖의 독립 팝업으로 열린다` 재통과 확인. 실제 붙여넣기 동작 자체는 Playwright로 클립보드 권한을 흉내내기 까다로워 브라우저 실사용으로 검증을 미뤘다.
