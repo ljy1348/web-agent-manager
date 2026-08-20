@@ -41,6 +41,8 @@ describe("Claude 세션 기록 파싱", () => {
     expect(adapter.createMonitorLaunch("/tmp")).toEqual({ command: "claude", args: ["--safe-mode", "--ax-screen-reader"] });
     expect(adapter.createLaunch("/tmp").args).toEqual(["--settings", "/tmp/settings.json"]);
     expect(adapter.promptQuirks).toMatchObject({ pasteSubmitDelayMs: 160, verifyPromptSubmission: true });
+    // /usage 화면이 열린 채로 다음 주기에 다시 /usage를 보내면 무시돼 값이 영원히 굳는다(실측) — 다음 조회 전에 닫아야 한다.
+    expect(adapter.usageScreenCloseInput).toBe("\u001b");
   });
 
   it("도구 실행 결과 턴을 user가 아닌 tool 역할로 분류한다", () => {

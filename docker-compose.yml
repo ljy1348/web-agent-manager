@@ -2,7 +2,7 @@ services:
   web-agent-manager:
     build:
       context: .
-    image: web-agent-manager:0.2.0
+    image: web-agent-manager:latest
     container_name: web-agent-manager
     restart: unless-stopped
     ports:

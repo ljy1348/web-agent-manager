@@ -113,14 +113,14 @@ Compose는 WAM DB·로그를 `wam-data`, clone 프로젝트를 `wam-projects`, �
 
 태그와 `main` push는 `.github/workflows/docker-image.yml`에서 linux/amd64·linux/arm64 이미지를 빌드해 `ghcr.io/<소유자>/web-agent-manager-app`에 게시한다. builder는 런타임 `/app`과 구분되는 전용 경로를 사용해 공개 산출물의 빌드 머신 절대 경로 검사를 유지한다. Actions 저장 공간이 빌드마다 누적되지 않도록 Docker 캐시는 최종 이미지 레이어 중심의 `mode=min`으로 내보내고 별도 Buildx 기록 아티팩트는 만들지 않는다.
 
-### v0.4.0 압축 배포
+### 압축 배포
 
-`npm run release:package`는 production 빌드와 CycloneDX SBOM, SHA-256 체크섬을 포함한 다음 배포 파일을 `release/archives/`에 만든다.
+`npm run release:package`는 production 빌드와 CycloneDX SBOM, SHA-256 체크섬을 포함한 다음 배포 파일을 `release/archives/`에 만든다(`<버전>`은 `package.json`의 현재 버전, 예: `0.5.1`).
 
-- `web-agent-manager-v0.4.0-linux-x64.zip`
-- `web-agent-manager-v0.4.0-macos-x64.zip`
-- `web-agent-manager-v0.4.0-macos-arm64.zip`
-- `web-agent-manager-v0.4.0-windows-wsl-x64.zip`
+- `web-agent-manager-v<버전>-linux-x64.zip`
+- `web-agent-manager-v<버전>-macos-x64.zip`
+- `web-agent-manager-v<버전>-macos-arm64.zip`
+- `web-agent-manager-v<버전>-windows-wsl-x64.zip`
 - `web-agent-manager-sbom.cdx.json`
 - `SHA256SUMS`
 
