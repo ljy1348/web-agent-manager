@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { projectFileContentUrl, projectFilePathFromHref } from "./file-links";
 
@@ -7,6 +7,11 @@ import { projectFileContentUrl, projectFilePathFromHref } from "./file-links";
 const ATTACHMENT_MARKER = /\[첨부: ([^\]]+)\]/g;
 const STORED_ATTACHMENT_PATH = /^\.(?:web-agent-manager|myagent)-uploads\/[1-9]\d*\/[^/]+$/;
 const IMAGE_EXTENSION = /\.(png|jpe?g|gif|webp|bmp)$/i;
+// 채팅 입력창의 "#채팅" 멘션이 삽입하는 pseudo-scheme 링크(chat:번호). 프로젝트가 달라도 그 채팅으로 바로 이동시킨다.
+const CHAT_LINK = /^chat:(\d+)$/;
+// 파일 미리보기의 줄 링크가 삽입하는 "경로#L줄번호" 프래그먼트. cleanLinkedPath가 경로 판정 전에
+// 프래그먼트를 이미 잘라내므로 원본 href에서 별도로 읽어야 특정 줄로 이동시킬 수 있다.
+const LINE_FRAGMENT = /#L(\d+)$/;
 
 // 첨부 경로가 브라우저가 바로 그릴 수 있는 이미지 형식인지 확인한다.
 export function isImagePath(path: string): boolean {
@@ -54,7 +59,7 @@ function substituteAttachments(content: string, projectId?: number, projectPath?
 // 가상 스크롤 목록에서 화면 밖으로 나가 언마운트됐다가 다시 마운트되면(예: 새 메시지가 계속 쌓여 자동
 // 스크롤이 반복될 때) 컴포넌트 state로만 "실패했음"을 기억해선 매번 초기화돼 다시 흔들린다 — 로딩·
 // 성공·실패 어떤 상태든 바깥 박스 크기 자체가 절대 안 바뀌게 만들어 이 문제를 구조적으로 없앴다.
-function AttachmentImage({ src, alt, projectFile, onOpenProjectFile }: { src: string; alt?: string; projectFile?: string | null; onOpenProjectFile?: (path: string) => void }): React.ReactElement {
+function AttachmentImage({ src, alt, projectFile, onOpenProjectFile }: { src: string; alt?: string; projectFile?: string | null; onOpenProjectFile?: (path: string, line?: number) => void }): React.ReactElement {
   const [failed, setFailed] = useState(false);
   if (failed) return <span className="attachment-thumb-box attachment-thumb-broken">이미지를 불러올 수 없습니다{alt ? `: ${alt}` : ""}</span>;
   if (onOpenProjectFile && projectFile) return <button type="button" className="attachment-thumb-box attachment-thumb-link" onClick={() => onOpenProjectFile(projectFile)}>
@@ -63,16 +68,24 @@ function AttachmentImage({ src, alt, projectFile, onOpenProjectFile }: { src: st
   return <a className="attachment-thumb-box attachment-thumb-link" href={src}><img src={src} alt={alt} loading="lazy" onError={() => setFailed(true)} /></a>;
 }
 
+// react-markdown은 XSS 방지를 위해 알 수 없는 URI scheme의 href를 기본적으로 빈 문자열로 지운다
+// (defaultUrlTransform). "#채팅" 멘션이 쓰는 chat: pseudo-scheme만 예외로 통과시키고 나머지는 그대로
+// 기본 정책을 따른다.
+function urlTransform(value: string): string {
+  return CHAT_LINK.test(value) ? value : defaultUrlTransform(value);
+}
+
 // URL이 현재 프로젝트의 첨부 전용 읽기 API인지 확인한다.
 function isAttachmentUrl(src: string, projectId: number | undefined): boolean {
   return !!projectId && src.startsWith(`/api/projects/${projectId}/attachments/content?`);
 }
 
 // Markdown 링크 중 현재 프로젝트 파일만 파일 탭으로 보내고 외부 링크는 새 탭으로 유지한다.
-export function MessageBody({ content, projectId, projectPath, workspacePath, chatId, linkBasePath = "", onOpenProjectFile }: { content: string; projectId?: number; projectPath?: string; workspacePath?: string; chatId?: number | null; linkBasePath?: string; onOpenProjectFile?: (path: string) => void }): React.ReactElement {
+export function MessageBody({ content, projectId, projectPath, workspacePath, chatId, linkBasePath = "", onOpenProjectFile, onOpenChat }: { content: string; projectId?: number; projectPath?: string; workspacePath?: string; chatId?: number | null; linkBasePath?: string; onOpenProjectFile?: (path: string, line?: number) => void; onOpenChat?: (chatId: number) => void }): React.ReactElement {
   return <div className="message-body markdown-body">
     <ReactMarkdown
       remarkPlugins={[remarkGfm]}
+      urlTransform={urlTransform}
       components={{
         img: ({ src, alt }) => {
           const source = String(src ?? "");
@@ -81,9 +94,15 @@ export function MessageBody({ content, projectId, projectPath, workspacePath, ch
           return <AttachmentImage src={imageSource} alt={alt} projectFile={projectFile} onOpenProjectFile={onOpenProjectFile} />;
         },
         a: ({ href, children }) => {
+          const chatMatch = href ? href.match(CHAT_LINK) : null;
+          if (chatMatch && onOpenChat) {
+            const targetChatId = Number(chatMatch[1]);
+            return <a href={href} className="project-file-link" onClick={(event) => { event.preventDefault(); onOpenChat(targetChatId); }}>{children}</a>;
+          }
           const projectFile = href && isAttachmentUrl(href, projectId) ? null : messageProjectFile(href, projectPath, workspacePath, linkBasePath);
+          const lineMatch = href ? href.match(LINE_FRAGMENT) : null;
           return projectFile !== null && onOpenProjectFile
-            ? <a href={href} className="project-file-link" onClick={(event) => { event.preventDefault(); onOpenProjectFile(projectFile); }}>{children}</a>
+            ? <a href={href} className="project-file-link" onClick={(event) => { event.preventDefault(); onOpenProjectFile(projectFile, lineMatch ? Number(lineMatch[1]) : undefined); }}>{children}</a>
             : <a href={href} target="_blank" rel="noreferrer">{children}</a>;
         },
       }}

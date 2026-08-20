@@ -28,3 +28,34 @@ jobs:
         run: npm audit --audit-level=high
       - name: 타입·테스트·빌드 검증
         run: npm run verify
+
+  ui:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Chrome과 시스템 의존성 설치
+        run: npx playwright install --with-deps chrome
+      - name: 실제 브라우저 UI 검증
+        run: npm run test:ui
+
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0, wrapper 검증 포함
+      - name: Android API 36 설치
+        run: sdkmanager "platforms;android-36"
+      - name: Android debug·release·lint 검증
+        working-directory: android
+        run: ./gradlew --no-daemon assembleDebug assembleRelease lintDebug lintRelease

@@ -30,6 +30,7 @@ function buildApp(
   readVersion: (command: string, args: string[]) => Promise<string | null> = async (command) => `${command} 1.0.0`,
   metricsSnapshot: unknown = { latest: null, recent: [] },
   trustedNetwork = true,
+  usageMonitor = { list: () => [] } as unknown as UsageMonitor,
 ) {
   const app = express();
   app.use(express.json());
@@ -37,7 +38,7 @@ function buildApp(
   app.use(createOperationsRouter(
     stubDatabase(),
     {} as ApprovalService,
-    { list: () => [] } as unknown as UsageMonitor,
+    usageMonitor,
     { snapshot: () => metricsSnapshot } as unknown as SystemMetricsService,
     { status: () => ({}) } as unknown as SlackNotifier,
     { status: () => ({}) } as unknown as NtfyNotifier,
@@ -58,6 +59,63 @@ async function listen(app: express.Express): Promise<number> {
   closeServer = () => new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   return (server.address() as AddressInfo).port;
 }
+
+describe("초기화권 사용 API 안전장치", () => {
+  it("관리자는 Codex 초기화권 사용 결과를 받는다", async () => {
+    const calls: string[] = [];
+    const usage = {
+      list: () => [],
+      redeemResetCredit: async (provider: string, accountId?: number) => {
+        calls.push(`${provider}:${accountId}`);
+        return { outcome: "reset", before: { availableCount: 1, expiresAt: null }, after: { availableCount: 0, expiresAt: null } };
+      },
+    } as unknown as UsageMonitor;
+    const port = await listen(buildApp("admin", undefined, undefined, true, usage));
+    const response = await fetch(`http://127.0.0.1:${port}/usage/codex/reset-credit/redeem`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ accountId: 7 }),
+    });
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ outcome: "reset", credits: { availableCount: 0, expiresAt: null } });
+    expect(calls).toEqual(["codex:7"]);
+  });
+
+  it("일반 사용자는 초기화권 사용을 거부한다", async () => {
+    const usage = { list: () => [], redeemResetCredit: async () => { throw new Error("호출되면 안 됩니다."); } } as unknown as UsageMonitor;
+    const port = await listen(buildApp("user", undefined, undefined, true, usage));
+    const response = await fetch(`http://127.0.0.1:${port}/usage/codex/reset-credit/redeem`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ accountId: 7 }),
+    });
+
+    expect(response.status).toBe(403);
+  });
+
+  it("서비스의 잔여량·중복 사용 오류를 API 오류로 전달한다", async () => {
+    const usage = { list: () => [], redeemResetCredit: async () => { throw new Error("Codex 초기화권을 이미 사용 중입니다."); } } as unknown as UsageMonitor;
+    const port = await listen(buildApp("admin", undefined, undefined, true, usage));
+    const response = await fetch(`http://127.0.0.1:${port}/usage/codex/reset-credit/redeem`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ accountId: 7 }),
+    });
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({ error: "Codex 초기화권을 이미 사용 중입니다." });
+  });
+
+  it("계정 ID가 없으면 초기화권 사용을 거부한다", async () => {
+    const usage = { list: () => [], redeemResetCredit: async () => { throw new Error("호출되면 안 됩니다."); } } as unknown as UsageMonitor;
+    const port = await listen(buildApp("admin", undefined, undefined, true, usage));
+    const response = await fetch(`http://127.0.0.1:${port}/usage/codex/reset-credit/redeem`, { method: "POST" });
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({ error: "유효한 Codex 계정을 지정해주세요." });
+  });
+});
 
 describe("프로세스 종료 API 안전장치", () => {
   it("등록된 어댑터 기반 공급자 메타를 반환한다", async () => {

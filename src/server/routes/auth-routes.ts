@@ -1,7 +1,7 @@
 import { Router } from "express";
 import type { AppConfig } from "../core/config";
 import type { AppDatabase } from "../core/database";
-import { login, logout, requireAuth, requireCsrf, type AuthenticatedRequest } from "../core/auth";
+import { login, logout, requireAuth, requireCsrf, setWebSessionCookie, type AuthenticatedRequest } from "../core/auth";
 import { writeAudit } from "../core/audit";
 import { hashPassword } from "../core/security";
 import { LoginRateLimiter } from "../core/login-rate-limit";
@@ -98,13 +98,7 @@ export function createAuthRouter(database: AppDatabase, config: AppConfig): Rout
         return response.status(401).json({ error: "로그인 정보가 올바르지 않습니다." });
       }
       loginRateLimiter.resetAccount(clientAddress, username);
-      response.cookie("web_agent_manager_session", result.token, {
-        httpOnly: true,
-        secure: config.publicUrl.startsWith("https://"),
-        sameSite: "strict",
-        path: "/",
-        maxAge: config.sessionTtlHours * 60 * 60 * 1000,
-      });
+      setWebSessionCookie(response, config, result.token);
       writeAudit(database, result.user.id, "auth.login", "user", result.user.id);
       response.json({ user: result.user, csrfToken: result.csrfToken, networkTrusted: !!(request as AuthenticatedRequest).trustedNetwork });
     } catch (error) {

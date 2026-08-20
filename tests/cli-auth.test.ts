@@ -70,7 +70,25 @@ describe("CLI 인증 상태 캐시", () => {
 
     expect(first.providers.every((provider) => provider.authenticated)).toBe(true);
     expect(second).toEqual(first);
-    expect(calls.sort()).toEqual(["claude", "codex", "gh"]);
+    expect(calls.sort()).toEqual(["claude", "codex", "gh", "grok"]);
+  });
+
+  // grok은 로그인하지 않아도 상태 명령이 정상 종료하고 본문에만 미인증 문구를 찍는다. 종료 코드만
+  // 보면 항상 "로그인됨"으로 잘못 표시되므로 출력으로 판정해야 한다.
+  it("grok은 종료 코드가 아니라 상태 명령 출력으로 로그인 여부를 판정한다", async () => {
+    const build = (output: string): CliAuthRuntime => ({
+      findExecutable: (command) => `/usr/local/bin/${command}`,
+      commandSucceeds: async () => true,
+      commandOutput: async (command) => (path.basename(command) === "grok" ? output : ""),
+      spawn: () => { throw new Error("호출되면 안 됩니다."); },
+    });
+    const grokStatus = async (output: string) => {
+      const manager = new CliAuthManager(config(), realtime([]), accounts(), build(output));
+      const status = await manager.status();
+      return status.providers.find((provider) => provider.provider === "grok")!;
+    };
+    expect((await grokStatus("You are logged in with grok.com.\n\nDefault model: grok-4.6")).authenticated).toBe(true);
+    expect((await grokStatus("You are not authenticated.\n\nDefault model: grok-4.6")).authenticated).toBe(false);
   });
 
   it("로그인 PTY 종료 뒤 해당 공급자만 한 번 재검사한다", async () => {

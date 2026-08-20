@@ -15,6 +15,8 @@ import { createLogger } from "../core/logger";
 import { pastePromptToTmux, sendTmuxEnter, sendTmuxEscape, sendTmuxBackspace, sendTmuxLeft, sendTmuxRight, sendTmuxShiftTab, sendTmuxText, scrollTmuxHistory, exitTmuxCopyMode, resizeTmuxWindow } from "./tmux-input";
 import { parseResetTime } from "./rate-limit-resume";
 import { TerminalScreen } from "./terminal-screen";
+import { prepareChatPrompt } from "./chat-prompt";
+import { promptCharacterCount } from "../../shared/chat-prompt";
 
 // 가로 열 수를 바꾸면 이미 찍힌 tmux 스크롤백이 새 폭으로 다시 감기지 않아 한글·긴 줄이 깨질 수 있다.
 // 따라서 256열은 고정하고, 줄바꿈에 영향을 주지 않는 세로 행 수만 웹 패널 높이에 맞춰 동기화한다.
@@ -50,6 +52,12 @@ interface ChatWithProject extends ChatRecord {
 
 type ApprovalDecision = "accept" | "acceptForSession" | "decline" | "cancel";
 
+// 화면에 입력창이 있는지(초안이 남아 있어도 포함) 확인한다. 판정을 제공하지 않는 공급자는 false를 돌려
+// 기존 isReady 경로만 쓰게 한다.
+function hasPromptBox(adapter: ProviderAdapter, screen: string): boolean {
+  return adapter.readPromptDraft ? adapter.readPromptDraft(screen) !== null : false;
+}
+
 // tmux가 지정 세션을 보유하고 있는지 확인한다.
 function tmuxExists(name: string): boolean {
   return spawnSync("tmux", ["has-session", "-t", name], { stdio: "ignore" }).status === 0;
@@ -74,7 +82,7 @@ export class SessionManager {
 
   private readonly terminals = new Map<number, ManagedTerminal>();
   private readonly adapters: Map<Provider, ProviderAdapter>;
-  private readonly inputQueues = new Map<number, Promise<void>>();
+  private readonly inputQueues = new Map<number, Promise<unknown>>();
   // 중단 시 Claude가 자기 입력창에 복구해두는 텍스트를 정확한 길이만큼 Backspace로 지우기 위해 기억해둔다.
   private readonly lastPromptText = new Map<number, string>();
 
@@ -150,11 +158,11 @@ export class SessionManager {
 
   // 한 채팅의 질문을 직렬화해 실행 중 또는 재개된 PTY에 전달한다. user가 null이면 rate-limit-resume
   // 같은 시스템 자동화가 보낸 것으로 보고 감사 로그의 행위자를 비워둔다.
-  async sendPrompt(chatId: number, text: string, user: AuthUser | null): Promise<void> {
+  async sendPrompt(chatId: number, text: string, user: AuthUser | null): Promise<string> {
     const previous = this.inputQueues.get(chatId) ?? Promise.resolve();
     const queued = previous.then(() => this.sendPromptNow(chatId, text, user));
     this.inputQueues.set(chatId, queued.catch(() => undefined));
-    await queued;
+    return await queued;
   }
 
   // 시스템 자동 입력은 종료된 세션을 되살리지 않고, 실행 중인 실제 터미널이 있을 때만 직렬 전송한다.
@@ -253,8 +261,9 @@ export class SessionManager {
   }
 
   // 종료 상태면 정확한 세션을 재개하고 입력 가능 프롬프트 뒤 질문을 전송한다.
-  private async sendPromptNow(chatId: number, text: string, user: AuthUser | null): Promise<void> {
+  private async sendPromptNow(chatId: number, text: string, user: AuthUser | null): Promise<string> {
     const chat = this.getChat(chatId);
+    const adapter = this.getAdapter(chat.provider);
     const alreadyRunning = this.terminals.has(chatId);
     if (!alreadyRunning) {
       if (!chat.provider_session_id) throw new Error("세션 ID가 없어 자동 재개할 수 없습니다. 새 채팅을 생성해주세요.");
@@ -263,31 +272,88 @@ export class SessionManager {
     // 세션이 이미 떠 있으면 터미널에 직접 타이핑하는 것과 마찬가지로, CLI가 응답을 생성 중이어도
     // 그 입력창에 그대로 큐잉된다(Claude·Codex TUI 둘 다 지원). 여기서까지 idle 프롬프트를
     // 기다리면, 작업이 15초 넘게 걸리는 정상적인 경우에도 "CLI가 입력 가능한 상태가 되지
-    // 않았습니다" 오류로 전송 자체가 씹혀버린다 — 막 새로 시작/재개해서 아직 초기 화면조차
-    // 뜨지 않았을 때만 그 화면이 나타날 때까지 기다린다.
-    const terminal = alreadyRunning ? this.terminals.get(chatId)! : await this.waitUntilReady(chatId, chat.provider);
+    // 않았습니다" 오류로 전송 자체가 씹혀버린다. 다만 start()는 TUI 준비 전에 terminal map과
+    // running 상태를 먼저 만들므로, busy도 ready도 아닌 화면은 새 세션 초기화 중으로 보고 기다린다.
+    const existingTerminal = this.terminals.get(chatId);
+    const currentSnapshot = alreadyRunning ? this.captureSnapshot(chatId) : "";
+    // 이미 오류로 남은 채팅에서 또 idle 프롬프트를 기다리면, 매 전송이 15초를 기다렸다 실패하고 다시
+    // 오류로 덮어써 사용자가 스스로 복구할 방법이 없는 교착이 된다. 실행 중인 터미널이 있으면 터미널에
+    // 직접 타이핑하는 것과 같으므로 그대로 전송하고, 성공하면 바로 아래에서 상태를 되돌린다.
+    const canTypeDirectly = chat.busy || chat.status === "error" || adapter.isBusy(currentSnapshot) || adapter.isReady(currentSnapshot);
+    const terminal = alreadyRunning && existingTerminal && canTypeDirectly
+      ? existingTerminal
+      : await this.waitUntilReady(chatId, chat.provider);
     // waitUntilReady를 건너뛴 경우에도, 이전에 타임아웃으로 남은 오류 상태는 여기서 정상으로 되돌린다
     // (실제 전송이 되고 있다는 뜻이므로 더 이상 오류가 아니다).
     if (alreadyRunning && chat.status === "error") this.setStatus(chatId, "running", null);
+    const prepared = prepareChatPrompt(chatId, chat.project_path, chat.workspace_path, text);
+    const terminalText = prepared.terminalText;
     // 작업 중 추가 입력은 TUI 큐에 들어가므로, 중지 후 복구·정리할 원래 실행 질문을 후속 입력으로
     // 덮어쓰지 않는다.
-    if (!chat.busy) this.lastPromptText.set(chatId, text);
+    if (!chat.busy) this.lastPromptText.set(chatId, terminalText);
     // 누군가 웹에서 기록을 위로 올려둔 상태면 붙여넣기·Enter가 copy-mode에 먹히므로 먼저 되돌린다.
     this.leaveCopyMode(terminal);
-    pastePromptToTmux(terminal.tmuxName, text);
-    sendTmuxEnter(terminal.tmuxName);
+    try {
+      this.clearPromptDraft(chatId, adapter, terminal.tmuxName);
+      pastePromptToTmux(terminal.tmuxName, terminalText);
+      const pasteDelay = adapter.promptQuirks?.pasteSubmitDelayMs;
+      if (pasteDelay) await new Promise((resolve) => setTimeout(resolve, pasteDelay));
+      sendTmuxEnter(terminal.tmuxName);
+      // Codex는 "/"로 시작하는 입력에 자동완성 목록을 띄우므로, 첫 Enter는 목록 확정이고
+      // 실제 실행에는 Enter가 한 번 더 필요하다(stop()의 /exit 처리와 동일한 이유).
+      const slashDelay = adapter.promptQuirks?.slashCommandConfirmDelayMs;
+      const slashCommand = terminalText.trim().startsWith("/");
+      if (slashDelay && slashCommand) {
+        await new Promise((resolve) => setTimeout(resolve, slashDelay));
+        sendTmuxEnter(terminal.tmuxName);
+      }
+      // 유휴 Codex 일반 프롬프트는 실제 TUI 전환을 확인하고, 여전히 입력 가능하면 Enter를 한 번만 재시도한다.
+      if (!chat.busy && !slashCommand && adapter.promptQuirks?.verifyPromptSubmission) {
+        let submitted = await this.waitForPromptSubmission(chatId, adapter, 900);
+        if (!submitted) {
+          sendTmuxEnter(terminal.tmuxName);
+          submitted = await this.waitForPromptSubmission(chatId, adapter, 900);
+        }
+        if (!submitted) {
+          sendTmuxBackspace(terminal.tmuxName, promptCharacterCount(terminalText));
+          throw new Error(`${adapter.displayLabel}가 메시지 제출을 확인하지 못했습니다. 입력 내용을 복구했으니 다시 시도해주세요.`);
+        }
+      }
+    } catch (error) {
+      prepared.cleanup();
+      setChatBusy(this.database, this.realtime, chatId, false);
+      throw error;
+    }
     // 새 assistant 메시지가 JSONL에 나타나면 history-sync가 chat_busy:false로 정리한다.
     setChatBusy(this.database, this.realtime, chatId, true);
-    // Codex는 "/"로 시작하는 입력에 자동완성 목록을 띄우므로, 첫 Enter는 목록 확정이고
-    // 실제 실행에는 Enter가 한 번 더 필요하다(stop()의 /exit 처리와 동일한 이유).
-    const slashDelay = this.getAdapter(chat.provider).promptQuirks?.slashCommandConfirmDelayMs;
-    if (slashDelay && text.trim().startsWith("/")) {
-      await new Promise((resolve) => setTimeout(resolve, slashDelay));
-      sendTmuxEnter(terminal.tmuxName);
-    }
-    writeAudit(this.database, user?.id ?? null, "chat.prompt", "chat", chatId, { length: text.length });
+    writeAudit(this.database, user?.id ?? null, "chat.prompt", "chat", chatId, {
+      length: text.length,
+      deliveredLength: terminalText.length,
+      attachmentPath: prepared.attachmentPath,
+    });
     // /model 명령 뒤에는 배너가 다시 그려지므로 잠시 후 재감지해 캐시된 모델명을 갱신한다.
-    if (text.trim().startsWith("/model")) void this.detectAndStoreModel(chatId, chat.provider, 8_000);
+    if (terminalText.trim().startsWith("/model")) void this.detectAndStoreModel(chatId, chat.provider, 8_000);
+    return terminalText;
+  }
+
+  // 입력창에 남아 있던 미전송 초안을 지운다. 취소된 질문이 CLI에 복구되어 있거나 앞선 전송의 Enter가
+  // 먹지 않아 글자가 남은 상태에서 그대로 붙여넣으면 두 입력이 한 줄로 이어붙어 엉뚱한 질문이 전송된다.
+  // 웹 채팅 입력은 "지금 보낸 것"이 그대로 전송돼야 하므로 남은 초안은 새 입력으로 덮어쓴다.
+  private clearPromptDraft(chatId: number, adapter: ProviderAdapter, tmuxName: string): void {
+    const draft = adapter.readPromptDraft?.(this.captureSnapshot(chatId));
+    if (draft) sendTmuxBackspace(tmuxName, promptCharacterCount(draft));
+  }
+
+  // 제출 뒤 TUI가 작업중으로 바뀌거나 본문이 사라진 빈 입력 화면으로 돌아왔는지 확인한다.
+  private async waitForPromptSubmission(chatId: number, adapter: ProviderAdapter, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const snapshot = this.captureSnapshot(chatId);
+      // 각 어댑터의 isReady는 본문이 남은 입력창을 제외하므로 미전송 초안을 성공으로 보지 않는다.
+      if (adapter.isBusy(snapshot) || adapter.isReady(snapshot)) return true;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    return false;
   }
 
   // 시작·모델 변경 배너가 나타날 때까지 기다렸다가 감지된 모델명을 저장하고 웹에 알린다.
@@ -343,7 +409,10 @@ export class SessionManager {
     return true;
   }
 
-  // TUI 프롬프트가 화면에 나타날 때까지 제한 시간 동안 기다린다.
+  // TUI 프롬프트가 화면에 나타날 때까지 제한 시간 동안 기다린다. 입력창에 미전송 초안이 남아 있어도
+  // 입력 자체는 가능하므로 준비된 것으로 본다 — isReady는 빈 입력창만 인정해서(제출 확인이 그 성질에
+  // 의존한다) 초안이 남으면 isReady·isBusy가 동시에 false가 되고, 매 전송이 15초 뒤 실패하며 상태를
+  // 다시 error로 덮어써 사용자가 스스로 복구할 수 없는 교착이 됐다(채팅 #257에서 실제로 겪음).
   private async waitUntilReady(chatId: number, provider: Provider): Promise<ManagedTerminal> {
     const existing = this.terminals.get(chatId);
     if (existing) this.leaveCopyMode(existing);
@@ -353,7 +422,12 @@ export class SessionManager {
       const buffered = terminal ? stripAnsi(terminal.buffer).slice(-4_000) : "";
       const snapshot = terminal ? this.captureSnapshot(chatId) : "";
       const adapter = this.getAdapter(provider);
-      if (terminal && adapter.isReady(`${buffered}\n${snapshot}`)) {
+      // 승인·선택 메뉴에는 입력창이 없어, 붙여넣은 글자가 그대로 메뉴 키 입력으로 새어 들어간다.
+      // 15초를 기다렸다 원인을 알 수 없는 타임아웃을 내는 대신 곧바로 이유를 알려주고 막는다.
+      if (terminal && adapter.detectApproval(snapshot)) {
+        throw new Error("지금은 승인 요청이 떠 있어 입력을 보낼 수 없습니다. 승인 카드에서 먼저 처리해주세요.");
+      }
+      if (terminal && (adapter.isReady(`${buffered}\n${snapshot}`) || hasPromptBox(adapter, snapshot))) {
         const current = this.database.prepare("SELECT status FROM chats WHERE id = ?").get(chatId) as { status: string } | undefined;
         if (current?.status === "error") this.setStatus(chatId, "running", null);
         return terminal;
@@ -447,7 +521,7 @@ export class SessionManager {
     // 길이만큼만 Backspace를 보내 지운다.
     await new Promise((resolve) => setTimeout(resolve, 300));
     const lastText = this.lastPromptText.get(chatId);
-    if (lastText) sendTmuxBackspace(terminal.tmuxName, lastText.length);
+    if (lastText) sendTmuxBackspace(terminal.tmuxName, promptCharacterCount(lastText));
     for (let attempt = 0; attempt < 4; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 400));
       if (this.getAdapter(chat.provider).isReady(this.captureSnapshot(chatId))) {
@@ -726,9 +800,17 @@ export class SessionManager {
     const terminal = this.terminals.get(chatId);
     const chat = this.getChat(chatId);
     const adapter = this.adapters.get(chat.provider);
-    const input = requestType === "rate_limit_options" && (decision === "accept" || decision === "acceptForSession")
-      ? adapter?.resolveRateLimitInput?.(decision, this.captureSnapshot(chatId)) ?? null
-      : adapter?.approvalInput(decision, requestType);
+    // 화면을 봐야 결정할 수 있는 공급자만 스냅샷을 뜬다(캡처 자체가 tmux 호출이라 매번 할 이유가 없다).
+    const resolveFromScreen = (): string | null => {
+      if (requestType === "rate_limit_options" && (decision === "accept" || decision === "acceptForSession")) {
+        return adapter?.resolveRateLimitInput?.(decision, this.captureSnapshot(chatId)) ?? null;
+      }
+      if (adapter?.resolveApprovalInput) return adapter.resolveApprovalInput(decision, requestType, this.captureSnapshot(chatId));
+      return null;
+    };
+    const needsScreen = (requestType === "rate_limit_options" && (decision === "accept" || decision === "acceptForSession"))
+      || !!adapter?.resolveApprovalInput;
+    const input = needsScreen ? resolveFromScreen() : adapter?.approvalInput(decision, requestType);
     if (!terminal || !input) return;
     // 웹에서 기록을 위로 올려둔 상태면 승인 키가 copy-mode에 먹히므로 먼저 실시간 화면으로 되돌린다.
     this.leaveCopyMode(terminal);

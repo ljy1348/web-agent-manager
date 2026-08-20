@@ -5,7 +5,7 @@ import { LoadingState } from "../../components/LoadingState";
 import type { Json } from "../../types";
 
 type ToolKind = "commands" | "skills" | "marketplace" | "mcp";
-type ProviderFilter = "codex" | "claude";
+type ProviderFilter = "codex" | "claude" | "grok";
 
 const KINDS: Array<{ id: ToolKind; label: string }> = [
   { id: "commands", label: "Commands" },
@@ -17,6 +17,7 @@ const KINDS: Array<{ id: ToolKind; label: string }> = [
 const PROVIDERS: Array<{ id: ProviderFilter; label: string }> = [
   { id: "claude", label: "Claude" },
   { id: "codex", label: "Codex" },
+  { id: "grok", label: "Grok" },
 ];
 
 const STATUS_LABELS: Record<string, string> = {

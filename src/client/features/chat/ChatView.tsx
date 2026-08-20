@@ -1,7 +1,7 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Bot } from "lucide-react";
-import { api } from "../../api";
+import { api, uploadFile } from "../../api";
 import { SubagentManager } from "../../components/SubagentManager";
 import { GitBranchControl } from "../../components/GitBranchControl";
 import { TerminalPanel } from "../terminal/TerminalPanel";
@@ -12,6 +12,9 @@ import { usageWindows } from "../../lib/format";
 import { attachmentUrl, isImagePath, MessageBody } from "../../lib/attachments";
 import { DiffView, looksLikeDiff } from "../../lib/diff-view";
 import type { Json } from "../../types";
+import { LONG_PROMPT_CHARACTER_THRESHOLD, promptCharacterCount } from "../../../shared/chat-prompt";
+import { CHAT_ATTACHMENT_MAX_FILES, CHAT_ATTACHMENT_MAX_FILE_BYTES, CHAT_ATTACHMENT_MAX_TOTAL_BYTES } from "../../../shared/chat-attachments";
+import { tokenUsageLabel } from "../../lib/token-usage";
 
 // 맨 위에서 이 픽셀 이내로 스크롤하면 이전 대화를 더 불러온다.
 const TOP_LOAD_THRESHOLD_PX = 200;
@@ -32,6 +35,14 @@ function effortFromModelLabel(provider: string | null | undefined, value: string
   const match = text.match(/\b(extra[- ]high|xhigh|max|high|medium|low)\b/);
   const labels = EFFORT_LABELS_BY_PROVIDER[String(provider ?? "")] ?? {};
   return match ? labels[match[1].replace(/\s+/, " ")] ?? labels[match[1]] ?? null : null;
+}
+
+// 입력창 캐럿 기준으로 "@파일" "#채팅" 멘션 트리거를 감지한다. 트리거 문자 앞은 공백이나 문장
+// 시작이어야 하고, 트리거 이후 캐럿까지 공백이 없어야(=아직 같은 토큰을 입력 중) 멘션으로 본다.
+function detectMention(value: string, caret: number): { type: "file" | "chat"; start: number; query: string } | null {
+  const match = value.slice(0, caret).match(/(?:^|\s)([@#])([^\s@#]*)$/);
+  if (!match) return null;
+  return { type: match[1] === "@" ? "file" : "chat", start: caret - match[2].length - 1, query: match[2] };
 }
 
 // 모델 옵션 중 선택된 채팅의 저장 모델명과 가장 잘 맞는 항목을 고른다.
@@ -56,22 +67,24 @@ function preferredEffortOption(options: Json, selectedChat: Json): Json | null {
 
 // 일반 응답은 바로 표시하고 도구·diff 상세는 접힌 상태로 렌더링한다. 본문에 첨부 표시가 있으면
 // 사람이 올렸든(파일 첨부) 세션이 검증용으로 남겼든 구분 없이 실제 이미지 썸네일로 바꿔 보여준다.
-function MessageCard({ message, showDetails, project, chat, onOpenProjectFile }: { message: Json; showDetails: boolean; project?: Json; chat?: Json; onOpenProjectFile?: (path: string) => void }): React.ReactElement | null {
+function MessageCard({ message, showDetails, project, chat, onOpenProjectFile, onOpenChat }: { message: Json; showDetails: boolean; project?: Json; chat?: Json; onOpenProjectFile?: (path: string, line?: number) => void; onOpenChat?: (chatId: number) => void }): React.ReactElement | null {
   const display = splitMessageContent(message);
+  const usageLabel = tokenUsageLabel(message.tokenUsage);
   if (!display.primary && !display.details.length) return null;
   if (!display.primary && !showDetails) return null;
   return <article className={`message ${message.role} ${display.primary ? "" : "message-detail-only"}`}>
     <small>{message.role}</small>
-    {display.primary && <MessageBody content={display.primary} projectId={project?.id} projectPath={project?.path} workspacePath={chat?.worktree_path} chatId={chat?.id} onOpenProjectFile={onOpenProjectFile} />}
+    {display.primary && <MessageBody content={display.primary} projectId={project?.id} projectPath={project?.path} workspacePath={chat?.worktree_path} chatId={chat?.id} onOpenProjectFile={onOpenProjectFile} onOpenChat={onOpenChat} />}
     {/* 체크박스는 "이 상세들이 존재한다는 걸 보여줄지"만 결정한다. 전부 강제로 펼치면(open 고정)
         diff가 많은 대화에서 스크롤이 감당 안 돼서, 각 항목은 기본 접힘 상태로 두고 클릭해서
         개별로 펼치게 한다(<details>는 비제어 요소라 클릭 상태를 브라우저가 알아서 기억한다). */}
     {showDetails && display.details.map((detail, index) => <details className="message-details" key={`${message.id}:detail:${index}`}><summary>{display.detailLabel}</summary>{looksLikeDiff(detail) ? <DiffView diff={detail} /> : <pre>{detail}</pre>}</details>)}
+    {usageLabel && <div className="message-token-usage" title="이 응답의 공급자 JSONL 토큰 사용량">{usageLabel}</div>}
   </article>;
 }
 
 // 채팅 내역, 입력창, 실제 터미널, 종료·승인 동작을 제공한다.
-export function ChatView({ user, chatViewMode, changeChatViewMode, providers, accounts, project, projects, setProject, addProject, deleteProject, chats, selectedChat, setSelectedChat, refreshChats, createChat, send, stop, interrupt, cycleMode, startChat, messages, hasMoreMessages, loadMoreMessages, usage, busy, socket, approvals, decide, scrollState, sessionBackups, backupChat, deleteChat, restoreBackup, deleteBackup, onOpenProjectFile }: Json): React.ReactElement {
+export function ChatView({ user, chatViewMode, changeChatViewMode, providers, accounts, project, projects, setProject, addProject, deleteProject, chats, selectedChat, setSelectedChat, refreshChats, createChat, send, stop, interrupt, cycleMode, startChat, messages, hasMoreMessages, loadMoreMessages, usage, busy, socket, approvals, decide, scrollState, sessionBackups, backupChat, deleteChat, restoreBackup, deleteBackup, onOpenProjectFile, onOpenChat, composerPrefill }: Json): React.ReactElement {
   const [text, setText] = useState("");
   // 업로드한 이미지 첨부를 전송 전 입력창 위에 썸네일로 미리 보여준다.
   const [attachmentPreviews, setAttachmentPreviews] = useState<Array<{ path: string; name: string }>>([]);
@@ -105,6 +118,13 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
   const [commandItems, setCommandItems] = useState<Json[]>([]);
   const [commandIndex, setCommandIndex] = useState(0);
   const [dismissedCommandText, setDismissedCommandText] = useState("");
+  // 입력창에 "@파일"·"#채팅" 링크 멘션을 넣는 자동완성 상태. 파일은 현재 프로젝트 안에서 서버 검색으로,
+  // 채팅은 전체 프로젝트 목록을 한 번 불러와 제목·번호로 클라이언트에서 걸러 보여준다.
+  const [mention, setMention] = useState<{ type: "file" | "chat"; start: number; query: string } | null>(null);
+  const [mentionIndex, setMentionIndex] = useState(0);
+  const [fileMentionResults, setFileMentionResults] = useState<Json[]>([]);
+  const [chatMentionSource, setChatMentionSource] = useState<Json[] | null>(null);
+  const chatMentionLoadedRef = useRef(false);
   useEffect(() => { setEditingTitle(false); }, [selectedChat?.id]);
   const modelOptionsCache = useRef<Record<number, Json>>({});
   // 중지 시 방금 보낸 질문을 입력창에 복구해주기 위해 채팅별로 마지막 전송 텍스트를 기억해둔다.
@@ -116,7 +136,16 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
   useEffect(() => { if (!busy) setInterrupting(false); }, [busy]);
   // 채팅을 전환하면 이전 채팅에서 입력하던 글·오류바·첨부 상태가 새 채팅에 그대로 남아 보이던 문제를
   // 막기 위해, 선택된 채팅이 바뀔 때마다 composer의 임시 상태를 초기화한다.
-  useEffect(() => { setText(""); setAttachmentPreviews([]); setAttachmentStatus(""); setSendError(""); setSessionActionStatus(""); setShowBackups(false); }, [selectedChat?.id]);
+  useEffect(() => { setText(""); setAttachmentPreviews([]); setAttachmentStatus(""); setSendError(""); setSessionActionStatus(""); setShowBackups(false); setMention(null); }, [selectedChat?.id]);
+  // 파일 미리보기의 줄 링크로 걸어둔 참조("[경로:줄](...)")를 이 채팅 입력창에 한 번만 채워 넣는다.
+  // 위 초기화 effect보다 아래에 있어야, 채팅 전환과 동시에 온 요청이 초기화에 덮이지 않고 반영된다.
+  const appliedPrefillRequestRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!composerPrefill || appliedPrefillRequestRef.current === composerPrefill.requestId) return;
+    appliedPrefillRequestRef.current = composerPrefill.requestId;
+    setText((current) => `${current}${current.trim() ? "\n" : ""}${composerPrefill.text} `);
+    requestAnimationFrame(() => textarea.current?.focus());
+  }, [composerPrefill]);
   useEffect(() => {
     let active = true;
     const params = project?.id ? `?projectId=${project.id}` : "";
@@ -125,6 +154,41 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
     }).catch(() => { if (active) setCommandItems([]); });
     return () => { active = false; };
   }, [project?.id]);
+  // "@파일" 멘션은 입력할 때마다(살짝 debounce해서) 현재 프로젝트 안을 서버에서 이름으로 검색한다.
+  useEffect(() => {
+    if (mention?.type !== "file" || !project?.id) { setFileMentionResults([]); return; }
+    let active = true;
+    const timer = window.setTimeout(() => {
+      const chatQuery = selectedChat?.id ? `&chatId=${selectedChat.id}` : "";
+      void api(`/projects/${project.id}/files/search?q=${encodeURIComponent(mention.query)}${chatQuery}`).then((data) => {
+        if (active) setFileMentionResults(data.matches || []);
+      }).catch(() => { if (active) setFileMentionResults([]); });
+    }, 150);
+    return () => { active = false; window.clearTimeout(timer); };
+  }, [mention?.type, mention?.query, project?.id, selectedChat?.id]);
+  // "#채팅" 멘션은 전체 프로젝트 채팅 목록을 멘션이 열릴 때 한 번만 불러오고, 이후 글자 입력은
+  // 클라이언트에서 제목·번호·공급자로 걸러 매 키 입력마다 다시 조회하지 않는다.
+  useEffect(() => {
+    if (mention?.type !== "chat") { chatMentionLoadedRef.current = false; return; }
+    if (chatMentionLoadedRef.current) return;
+    chatMentionLoadedRef.current = true;
+    let active = true;
+    void api("/chats").then((data) => { if (active) setChatMentionSource(data.chats || []); }).catch(() => { if (active) setChatMentionSource([]); });
+    return () => { active = false; };
+  }, [mention?.type]);
+  useEffect(() => { setMentionIndex(0); }, [mention?.type, mention?.query]);
+  // 화살표로 하이라이트가 목록 스크롤 밖으로 벗어나도 화면엔 그대로라 "화살표가 안 먹는 것"처럼
+  // 보였다(실사용 보고) — 인덱스가 바뀔 때마다 그 행을 스크롤 컨테이너 안에서 보이게 당겨온다.
+  const activeMentionRowRef = useRef<HTMLElement | null>(null);
+  useEffect(() => { activeMentionRowRef.current?.scrollIntoView({ block: "nearest" }); }, [mentionIndex, mention?.type, mention?.query]);
+  const chatMentionResults = useMemo(() => {
+    if (mention?.type !== "chat" || !chatMentionSource) return [];
+    const needle = mention.query.trim().toLowerCase();
+    return chatMentionSource
+      .filter((item: Json) => !needle || String(item.id).includes(needle) || String(item.title || "").toLowerCase().includes(needle) || String(item.provider || "").toLowerCase().includes(needle))
+      .slice(0, 30);
+  }, [chatMentionSource, mention?.type, mention?.query]);
+  const mentionResults: Json[] = mention?.type === "file" ? fileMentionResults : mention?.type === "chat" ? chatMentionResults : [];
   const fileInput = useRef<HTMLInputElement>(null);
   const textarea = useRef<HTMLTextAreaElement>(null);
   // placeholder 문구 때문에 빈 입력창이 항상 여러 줄 자리를 차지하지 않도록, 안내문은 짧게 두고 대신
@@ -149,6 +213,20 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
   // 것으로 착각해 잘못 응답하면서 의도치 않은 세션에 입력이 들어감). chats는 이미 현재 프로젝트로
   // 필터된 목록이므로 그 chat_id 집합으로 한 번 더 좁힌다.
   const projectChatIds = useMemo(() => new Set(chats.map((item: Json) => item.id)), [chats]);
+  // 프로젝트의 실제 worktree 목록. 채팅 목록만으로 그룹을 만들면 아직 채팅이 없는 worktree는
+  // 화면에서 아예 사라져, 워크트리가 지워진 것인지 채팅만 없는 것인지 구분할 수 없었다.
+  const [projectWorktrees, setProjectWorktrees] = useState<Json[]>([]);
+  useEffect(() => {
+    if (!project?.id) { setProjectWorktrees([]); return; }
+    let active = true;
+    // 밖에서 만든 worktree도 곧 보이도록 주기적으로 다시 읽는다(Git 저장소가 아니면 빈 목록).
+    const load = (): void => { void api(`/projects/${project.id}/git/workspaces`).then((data) => {
+      if (active) setProjectWorktrees(data.workspaces || []);
+    }).catch(() => { if (active) setProjectWorktrees([]); }); };
+    load();
+    const timer = window.setInterval(load, 30_000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [project?.id]);
   // 채팅을 작업공간별로 묶는다. 프로젝트 공유 checkout 채팅과 worktree별 채팅을 따로 보기 위함이다.
   const chatGroups = useMemo(() => {
     const groups = new Map<string, { key: string; label: string; branch: string | null; worktreePath: string | null; chats: Json[] }>();
@@ -160,13 +238,27 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
       group.chats.push(item);
       groups.set(key, group);
     }
+    // 채팅이 하나도 없는 worktree도 빈 묶음으로 넣어둔다. 공유 checkout(main)은 "프로젝트 채팅"과
+    // 같은 폴더라 중복이므로 제외한다.
+    for (const item of projectWorktrees) {
+      const worktreePath = String(item.path || "");
+      if (!worktreePath || item.main || groups.has(worktreePath)) continue;
+      const branch = (item.branch || null) as string | null;
+      groups.set(worktreePath, {
+        key: worktreePath,
+        label: `${branch || worktreePath.split("/").filter(Boolean).pop() || "worktree"} 워크트리`,
+        branch,
+        worktreePath,
+        chats: [],
+      });
+    }
     // 프로젝트 채팅을 항상 위에 두고 worktree는 브랜치 이름순으로 정렬한다.
     return [...groups.values()].sort((a, b) => {
       if (!a.worktreePath) return -1;
       if (!b.worktreePath) return 1;
       return a.label.localeCompare(b.label);
     });
-  }, [chats]);
+  }, [chats, projectWorktrees]);
   const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({});
   const [groupBusy, setGroupBusy] = useState("");
 
@@ -176,9 +268,19 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
     if (!group.worktreePath) { await createChat(provider, accountId); return; }
     setGroupBusy(`${provider}:${group.worktreePath}`);
     try {
+      // 이미 있는 폴더를 그대로 지정한다. 브랜치만 넘기면 앱 관리 경로에만 worktree를 만들려 해서,
+      // 밖에서 만든 worktree 묶음에서는 "이미 체크아웃된 브랜치"로 실패한다.
       const data = await api("/chats/worktree", {
         method: "POST",
-        body: JSON.stringify({ projectId: project.id, provider, accountId: accountId ?? null, branch: group.branch, create: false, title: `${group.branch} 작업` }),
+        body: JSON.stringify({
+          projectId: project.id,
+          provider,
+          accountId: accountId ?? null,
+          branch: group.branch,
+          worktreePath: group.worktreePath,
+          create: false,
+          ...(group.branch ? { title: `${group.branch} 작업` } : {}),
+        }),
       });
       await refreshChats();
       if (data.chat) setSelectedChat(data.chat);
@@ -541,12 +643,33 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
   // 이미지면 보낸 뒤가 아니라 지금 바로 확인할 수 있도록 입력창 위에 썸네일도 같이 쌓아둔다.
   async function uploadAttachments(files: File[]): Promise<void> {
     if (!selectedChat || !files.length) return;
-    setAttachmentStatus(`첨부 업로드 중… (${files.length}개)`);
+    // 서버 제한을 넘는 파일은 애초에 전송을 시도하지 않는다 — 큰 파일을 다 올리다가 서버 거부로
+    // 응답 없이 멈춰 보이는 것을 막고, 실패 이유를 바로 알려준다.
+    if (files.length > CHAT_ATTACHMENT_MAX_FILES) {
+      setAttachmentStatus(`한 번에 최대 ${CHAT_ATTACHMENT_MAX_FILES}개까지 첨부할 수 있습니다.`);
+      return;
+    }
+    const maxFileMb = CHAT_ATTACHMENT_MAX_FILE_BYTES / (1024 * 1024);
+    const oversizedFile = files.find((file) => file.size > CHAT_ATTACHMENT_MAX_FILE_BYTES);
+    if (oversizedFile) {
+      setAttachmentStatus(`"${oversizedFile.name || "파일"}"이(가) ${maxFileMb}MB 제한을 초과했습니다.`);
+      return;
+    }
+    const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
+    if (totalBytes > CHAT_ATTACHMENT_MAX_TOTAL_BYTES) {
+      setAttachmentStatus(`전체 파일 크기가 ${CHAT_ATTACHMENT_MAX_TOTAL_BYTES / (1024 * 1024)}MB 제한을 초과했습니다.`);
+      return;
+    }
     try {
-      for (const file of files) {
+      for (let index = 0; index < files.length; index += 1) {
+        const file = files[index];
         const form = new FormData();
         form.append("file", file, file.name || "붙여넣기.png");
-        const data = await api(`/chats/${selectedChat.id}/attachments`, { method: "POST", body: form });
+        const progressPrefix = files.length > 1 ? `첨부 업로드 중… (${index + 1}/${files.length})` : "첨부 업로드 중…";
+        setAttachmentStatus(`${progressPrefix} 0%`);
+        const data = await uploadFile(`/chats/${selectedChat.id}/attachments`, form, (fraction) => {
+          setAttachmentStatus(`${progressPrefix} ${Math.round(fraction * 100)}%`);
+        });
         const uploaded = data.uploads?.[0]?.path;
         if (uploaded) {
           setText((current: string) => `${current}${current.trim() ? "\n" : ""}[첨부: ${uploaded}]`);
@@ -563,11 +686,21 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
     setAttachmentPreviews((current) => current.filter((item) => item.path !== path));
     setText((current) => current.split("\n").filter((line) => line.trim() !== `[첨부: ${path}]`).join("\n"));
   }
+  // 파일 붙여넣기는 업로드하고, 긴 일반 텍스트도 UTF-8 첨부로 전환한다.
   function handlePaste(event: React.ClipboardEvent<HTMLTextAreaElement>): void {
     const files = Array.from(event.clipboardData?.files ?? []);
-    if (!files.length) return;
+    if (files.length) {
+      event.preventDefault();
+      void uploadAttachments(files);
+      return;
+    }
+    const pastedText = event.clipboardData?.getData("text/plain") ?? "";
+    const command = pastedText.trimStart();
+    // Codex 자체 장문 paste placeholder보다 먼저 파일화하되 슬래시·셸 명령은 원래 의미를 유지한다.
+    if (promptCharacterCount(pastedText) <= LONG_PROMPT_CHARACTER_THRESHOLD || command.startsWith("/") || command.startsWith("!")) return;
     event.preventDefault();
-    void uploadAttachments(files);
+    const file = new File([pastedText], `pasted-text-${Date.now()}.txt`, { type: "text/plain;charset=utf-8" });
+    void uploadAttachments([file]);
   }
   function handleDrop(event: React.DragEvent<HTMLElement>): void {
     event.preventDefault();
@@ -575,6 +708,39 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
   }
   // Alt+Enter 또는 Ctrl+Enter로 줄바꿈 없이 바로 전송한다(Enter는 줄바꿈으로 남겨둔다).
   function handleComposerKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>): void {
+    if (mention) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setMention(null);
+        return;
+      }
+      if (mentionResults.length) {
+        if (event.key === "ArrowDown") {
+          event.preventDefault();
+          setMentionIndex((index) => Math.min(index + 1, mentionResults.length - 1));
+          return;
+        }
+        if (event.key === "ArrowUp") {
+          event.preventDefault();
+          setMentionIndex((index) => Math.max(index - 1, 0));
+          return;
+        }
+        // Tab은 셸 자동완성처럼 폴더면 그 안으로 들어가고(파일이면 선택과 동일), Enter는 폴더든
+        // 파일이든 항상 그 항목 자체를 링크로 선택한다 — 폴더 자체를 링크로 넣고 싶을 때 쓴다.
+        if (event.key === "Tab" && !event.altKey && !event.ctrlKey) {
+          event.preventDefault();
+          const item = mentionResults[mentionIndex] ?? mentionResults[0];
+          if (mention.type === "file" && item?.directory) drillIntoFolder(item.path);
+          else selectMention(item);
+          return;
+        }
+        if (event.key === "Enter" && !event.altKey && !event.ctrlKey) {
+          event.preventDefault();
+          selectMention(mentionResults[mentionIndex] ?? mentionResults[0]);
+          return;
+        }
+      }
+    }
     if (commandMenuOpen) {
       if (event.key === "ArrowDown") {
         event.preventDefault();
@@ -610,6 +776,59 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
     setDismissedCommandText("");
     requestAnimationFrame(() => textarea.current?.focus());
   }
+  // 캐럿(또는 클릭·화살표로 옮긴 위치) 기준으로 멘션 트리거 상태를 다시 계산한다. onChange 외에도
+  // 클릭·화살표 이동으로 커서만 옮겨도 멘션 메뉴가 그 위치를 따라가거나 닫히도록 여러 이벤트에서 호출한다.
+  function syncMentionFromElement(element: HTMLTextAreaElement | null): void {
+    if (!element) return;
+    setMention(detectMention(element.value, element.selectionStart ?? element.value.length));
+  }
+  // 멘션 트리거 토큰(예: "@src/fo")을 선택한 결과로 교체하고, 뒤에 공백을 하나 붙여 캐럿을 그 다음으로 옮긴다.
+  function insertMentionText(label: string, href: string): void {
+    if (!mention) return;
+    const caret = textarea.current?.selectionStart ?? text.length;
+    const before = text.slice(0, mention.start);
+    const after = text.slice(caret);
+    const inserted = `[${label}](${href}) `;
+    setText(`${before}${inserted}${after}`);
+    setMention(null);
+    const nextCaret = before.length + inserted.length;
+    requestAnimationFrame(() => {
+      const element = textarea.current;
+      if (!element) return;
+      element.focus();
+      element.setSelectionRange(nextCaret, nextCaret);
+    });
+  }
+  // 셸 자동완성처럼 멘션 토큰을 "@폴더경로/"로 치환해 그 폴더 하위만 계속 검색하게 한다(메뉴는 유지).
+  // 검색이 전체 경로 부분일치라 "폴더경로/"를 검색어로 쓰면 그 폴더 아래 파일·하위폴더가 자연히 다 걸린다.
+  function drillIntoFolder(folderPath: string): void {
+    if (!mention) return;
+    const caret = textarea.current?.selectionStart ?? text.length;
+    const before = text.slice(0, mention.start);
+    const after = text.slice(caret);
+    const query = `${folderPath}/`;
+    const inserted = `@${query}`;
+    setText(`${before}${inserted}${after}`);
+    setMention({ type: "file", start: mention.start, query });
+    setMentionIndex(0);
+    const nextCaret = before.length + inserted.length;
+    requestAnimationFrame(() => {
+      const element = textarea.current;
+      if (!element) return;
+      element.focus();
+      element.setSelectionRange(nextCaret, nextCaret);
+    });
+  }
+  // 파일 멘션은 { path, directory } 검색 결과를, 채팅 멘션은 /chats 목록의 채팅 객체를 받는다.
+  // 폴더를 선택해도 파일과 동일하게 링크를 넣는다 — 눌렀을 때 파일 탭에서 그 폴더를 그대로 연다.
+  function selectMention(item: Json | undefined): void {
+    if (!mention || item === undefined) { setMention(null); return; }
+    if (mention.type === "file") {
+      insertMentionText(item.path, item.path.split("/").filter(Boolean).map(encodeURIComponent).join("/"));
+    } else if (mention.type === "chat") {
+      insertMentionText(`#${item.id} ${item.title || "제목 없음"}`, `chat:${item.id}`);
+    }
+  }
   const commandQuery = text.startsWith("/") && !/\s/.test(text) ? text.slice(1).toLowerCase() : "";
   const commandMenuOpen = !!selectedChat && text.startsWith("/") && !/\s/.test(text) && text !== dismissedCommandText;
   const filteredCommands = useMemo(() => {
@@ -622,6 +841,9 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
       .slice(0, 80);
   }, [commandItems, commandMenuOpen, commandQuery, selectedChat?.provider]);
   useEffect(() => { setCommandIndex(0); }, [commandQuery, selectedChat?.provider]);
+  // 멘션 메뉴와 같은 이유로, 화살표 하이라이트가 스크롤 밖으로 벗어나지 않도록 그 행을 당겨온다.
+  const activeCommandRowRef = useRef<HTMLButtonElement | null>(null);
+  useEffect(() => { activeCommandRowRef.current?.scrollIntoView({ block: "nearest" }); }, [commandIndex, commandQuery]);
   // 드롭다운에 표시하는 "(현재)"는 이 채팅의 실제 현재 모델·강도를 기준으로 계산해야 한다 —
   // modelOptions[].current는 채팅과 무관한 공용 상태 조회 PTY의 스냅샷 값이라, 모델을 바꿔도 이
   // 채팅 기준으로는 갱신되지 않고 계속 예전 값을 "(현재)"로 보여줬다(드롭다운이 실제로 어떤 값을
@@ -656,6 +878,7 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
           <div className="chat-group-actions">{createTargets.map((target) => (
             <button key={target.key} disabled={groupBusy === `${target.provider}:${group.worktreePath}`} onClick={() => void createChatInGroup(group, target.provider, target.accountId)}>+ {target.label}</button>
           ))}</div>
+          {!group.chats.length && <p className="chat-group-empty" title={group.worktreePath || ""}>채팅 없는 작업공간입니다.</p>}
           {group.chats.map((chat: Json) => { const activity = chatActivity(chat, pendingApprovals); return <button className={`chat-item ${selectedChat?.id === chat.id ? "active" : ""}`} key={chat.id} onClick={() => setSelectedChat(chat)}>
             <span className={`provider ${chat.provider}`}>{providerMeta(chat.provider).label}</span><strong>{chat.title}</strong><span className="chat-id">#{chat.id}</span><small><span className={`activity-chip ${activity.className}`}>{activity.label}</span><span className="chat-branch">{chat.git_branch || "프로젝트 공유"}</span></small>
           </button>; })}
@@ -692,7 +915,7 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
       {selectedChat && <div className="model-bar-summary">
         <b>{selectedChat.model || "감지 중…"}</b>
         {selectedActivity && <b className={`activity-text ${selectedActivity.className}`}>{selectedActivity.label}</b>}
-        {primaryUsageWindow && <span>{primaryUsageWindow.usedPercent}%</span>}
+        {primaryUsageWindow && <span className="summary-usage">사용량 {primaryUsageWindow.usedPercent}%{primaryUsageWindow.resetAt && <span className="summary-reset"> · 초기화 {primaryUsageWindow.resetAt}</span>}</span>}
         <button type="button" aria-expanded={modelBarExpanded} onClick={() => setModelBarExpanded((value) => !value)}>{modelBarExpanded ? "접기 ▴" : "자세히 ▾"}</button>
       </div>}
       {selectedChat && <div className={`model-bar${modelBarExpanded ? " expanded" : ""}`}>
@@ -721,7 +944,7 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
           {loadingMore && <div className="load-more-indicator">이전 메시지 불러오는 중…</div>}
           <div style={{ height: rowVirtualizer.getTotalSize(), position: "relative", width: "100%" }}>
             {rowVirtualizer.getVirtualItems().map((virtualRow) => <div key={visibleMessages[virtualRow.index].id} data-index={virtualRow.index} ref={rowVirtualizer.measureElement} style={{ position: "absolute", top: 0, left: 0, width: "100%", transform: `translateY(${virtualRow.start}px)` }}>
-              <MessageCard message={visibleMessages[virtualRow.index]} showDetails={showToolDetails} project={project} chat={selectedChat} onOpenProjectFile={onOpenProjectFile} />
+              <MessageCard message={visibleMessages[virtualRow.index]} showDetails={showToolDetails} project={project} chat={selectedChat} onOpenProjectFile={onOpenProjectFile} onOpenChat={onOpenChat} />
             </div>)}
           </div>
         </div>
@@ -750,11 +973,48 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
             <button type="button" className="attach-button" aria-label="파일 첨부" onClick={() => fileInput.current?.click()}>📎</button>
             <div className="composer-input-wrap">
               {commandMenuOpen && <div className="slash-menu" role="listbox" aria-label="슬래시 명령어">
-                {filteredCommands.length ? filteredCommands.map((item: Json, index: number) => <button key={item.id} type="button" role="option" aria-selected={index === commandIndex} className={index === commandIndex ? "active" : ""} onMouseDown={(event) => { event.preventDefault(); insertSlashCommand(item); }}>
+                {filteredCommands.length ? filteredCommands.map((item: Json, index: number) => <button key={item.id} ref={index === commandIndex ? activeCommandRowRef : undefined} type="button" role="option" aria-selected={index === commandIndex} className={index === commandIndex ? "active" : ""} onMouseDown={(event) => { event.preventDefault(); insertSlashCommand(item); }}>
                   <span className={`provider ${item.provider}`}>{providerMeta(item.provider).label}</span><strong>{item.name}</strong><small>{item.description}</small>
                 </button>) : <div className="slash-empty">명령을 찾을 수 없습니다.</div>}
               </div>}
-              <textarea ref={textarea} value={text} onChange={(event) => { const value = event.target.value; setText(value); if (value !== dismissedCommandText) setDismissedCommandText(""); }} onBlur={() => setDismissedCommandText(text)} onPaste={handlePaste} onKeyDown={handleComposerKeyDown} placeholder="질문을 입력하세요" rows={1} />
+              {!commandMenuOpen && mention && <div className="slash-menu mention-menu" role="listbox" aria-label={mention.type === "file" ? "프로젝트 파일 링크" : "채팅 링크"}>
+                {!mentionResults.length && <div className="slash-empty">{mention.type === "file" ? "일치하는 파일이 없습니다." : "일치하는 채팅이 없습니다."}</div>}
+                {mention.type === "file" && (mentionResults as Json[]).map((fileItem: Json, index: number) => {
+                  const filePath = String(fileItem.path);
+                  const isDirectory = !!fileItem.directory;
+                  const slashIndex = filePath.lastIndexOf("/");
+                  const baseName = slashIndex === -1 ? filePath : filePath.slice(slashIndex + 1);
+                  const dirName = slashIndex === -1 ? "" : filePath.slice(0, slashIndex);
+                  return <div key={filePath} ref={index === mentionIndex ? (el) => { activeMentionRowRef.current = el; } : undefined} className={`mention-row${index === mentionIndex ? " active" : ""}`}>
+                    {/* 폴더는 눌렀을 때 셸 자동완성처럼 그 안으로 들어가 하위 파일을 계속 보여주고,
+                        오른쪽 + 버튼으로만 폴더 자체를 링크로 넣는다(Tab/Enter도 각각 같은 구분을 따른다). */}
+                    <button type="button" role="option" aria-selected={index === mentionIndex} className="mention-row-main" onMouseDown={(event) => { event.preventDefault(); if (isDirectory) drillIntoFolder(filePath); else selectMention(fileItem); }}>
+                      <span className="mention-kind">{isDirectory ? "폴더" : "파일"}</span><strong>{baseName}{isDirectory ? "/" : ""}</strong><small>{dirName}</small>
+                    </button>
+                    {isDirectory && <button type="button" className="mention-row-pick" title="이 폴더 자체를 링크로 추가" aria-label={`${filePath} 폴더를 링크로 추가`} onMouseDown={(event) => { event.preventDefault(); selectMention(fileItem); }}>+</button>}
+                  </div>;
+                })}
+                {mention.type === "chat" && (mentionResults as Json[]).map((chatItem: Json, index: number) => <button key={chatItem.id} ref={index === mentionIndex ? (el) => { activeMentionRowRef.current = el; } : undefined} type="button" role="option" aria-selected={index === mentionIndex} className={index === mentionIndex ? "active" : ""} onMouseDown={(event) => { event.preventDefault(); selectMention(chatItem); }}>
+                  <span className={`provider ${chatItem.provider}`}>{providerMeta(chatItem.provider).label}</span><strong>{chatItem.title || `채팅 #${chatItem.id}`}</strong><small>{projects.find((item: Json) => item.id === chatItem.project_id)?.name || ""}</small>
+                </button>)}
+              </div>}
+              <textarea
+                ref={textarea}
+                value={text}
+                onChange={(event) => {
+                  const value = event.target.value;
+                  setText(value);
+                  if (value !== dismissedCommandText) setDismissedCommandText("");
+                  syncMentionFromElement(event.target);
+                }}
+                onClick={(event) => syncMentionFromElement(event.currentTarget)}
+                onKeyUp={(event) => { if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) syncMentionFromElement(event.currentTarget); }}
+                onBlur={() => { setDismissedCommandText(text); setMention(null); }}
+                onPaste={handlePaste}
+                onKeyDown={handleComposerKeyDown}
+                placeholder="질문을 입력하세요 (@파일, #채팅으로 링크)"
+                rows={1}
+              />
             </div>
             <div className="composer-actions">
               {busy && <button type="button" className="danger" disabled={interrupting} onClick={() => {
@@ -796,6 +1056,7 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
           <div className="chat-group-actions">{createTargets.map((target) => (
             <button key={target.key} disabled={groupBusy === `${target.provider}:${group.worktreePath}`} onClick={() => { void createChatInGroup(group, target.provider, target.accountId).then(() => setMenuOpen(false)); }}>+ {target.label}</button>
           ))}</div>
+          {!group.chats.length && <p className="chat-group-empty" title={group.worktreePath || ""}>채팅 없는 작업공간입니다.</p>}
           {group.chats.map((chat: Json) => { const activity = chatActivity(chat, pendingApprovals); return <button className={`chat-item ${selectedChat?.id === chat.id ? "active" : ""}`} key={chat.id} onClick={() => { setSelectedChat(chat); setMenuOpen(false); }}>
             <span className={`provider ${chat.provider}`}>{providerMeta(chat.provider).label}</span><strong>{chat.title}</strong><span className="chat-id">#{chat.id}</span><small><span className={`activity-chip ${activity.className}`}>{activity.label}</span><span className="chat-branch">{chat.git_branch || "프로젝트 공유"}</span></small>
           </button>; })}

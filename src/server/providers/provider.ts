@@ -6,12 +6,23 @@ export interface ProviderLaunch {
   env?: Record<string, string>;
 }
 
+export interface HistoryTokenUsage {
+  inputTokens: number;
+  cachedInputTokens: number;
+  cacheCreationInputTokens: number;
+  cacheReadInputTokens: number;
+  outputTokens: number;
+  reasoningOutputTokens: number;
+  totalTokens: number;
+}
+
 export interface HistoryMessage {
   id: string;
   role: "user" | "assistant" | "system" | "tool";
   kind: string;
   content: string;
   createdAt: string;
+  tokenUsage?: HistoryTokenUsage;
 }
 
 export interface HistorySession {
@@ -93,11 +104,18 @@ export interface ProviderAdapter {
   // 계정 슬롯의 설정 디렉터리를 받아 그 계정의 기록 루트를 계산한다. null이면 CLI 기본 경로를 쓴다.
   historyRootFor(configDir: string | null): string;
   promptQuirks?: {
+    pasteSubmitDelayMs?: number;
+    verifyPromptSubmission?: boolean;
     slashCommandConfirmDelayMs?: number;
     usageCommandDelayMs?: number;
     modelMenuInitialTimeoutMs?: number;
     modelMenuConfirmDelayMs?: number;
     modelOptionsReadsEffortScreen?: boolean;
+    // `/model` 메뉴를 열지 않고도 모델·추론 강도 목록을 만들 수 있는 공급자는 명령 전송 자체를 건너뛴다.
+    // Grok은 CLI가 제공하는 고정 목록과 화면 테두리의 현재 값만으로 충분한데, `/model`을 보내면 메뉴가
+    // 아니라 인자 입력 대기 상태(`/model <model> [effort]`)로 들어가 Esc 뒤에도 입력이 남고, 다음 조회
+    // 명령이 모델 이름으로 먹혀 "Unknown model: /usage show"가 된다(실측).
+    modelOptionsWithoutMenu?: boolean;
   };
   createLaunch(cwd: string, resumeSessionId?: string): ProviderLaunch;
   // 사용량·모델 조회 전용 CLI에 더 가벼운 실행 모드가 있으면 일반 채팅 실행과 분리해 제공한다.
@@ -108,6 +126,10 @@ export interface ProviderAdapter {
   evaluateHistorySync(context: HistorySyncContext): HistorySyncDecision;
   isReady(output: string): boolean;
   isBusy(output: string): boolean;
+  // 화면 하단 입력창에 남아 있는 미전송 텍스트를 돌려준다. 입력창은 있지만 비어 있으면 빈 문자열,
+  // 승인·선택 메뉴처럼 입력창 자체가 없는 화면이면 null이다. isReady는 "비어 있는" 입력창만 준비로
+  // 인정하므로(제출 확인이 그 성질에 의존한다) 초안이 남은 입력창을 구분하려면 이 판정이 따로 필요하다.
+  readPromptDraft?(output: string): string | null;
   parseUsage(output: string, now?: Date): Partial<UsageRecord>;
   detectApproval(output: string): ApprovalHint | null;
   detectModel(output: string): string | null;
@@ -120,11 +142,20 @@ export interface ProviderAdapter {
   // 하단 상태줄의 권한 모드 문구(예: "auto mode on")를 그대로 읽어온다. 지원하지 않는 공급자는 생략 가능.
   detectPermissionMode?(output: string): string | null;
   approvalInput(decision: "accept" | "acceptForSession" | "decline" | "cancel", requestType: string): string;
+  // 승인 화면의 선택지 번호가 도구·상황마다 달라지는 공급자가 쓰는 훅. 지금 떠 있는 화면을 실제로 보고
+  // 보낼 키를 정한다(resolveRateLimitInput과 같은 취지를 일반 승인으로 넓힌 것). 확신할 수 없으면
+  // null을 반환해야 하며, 그러면 호출부가 approvalInput의 고정 매핑으로 되돌아간다.
+  resolveApprovalInput?(decision: "accept" | "acceptForSession" | "decline" | "cancel", requestType: string, output: string): string | null;
   // rate_limit_options에서 "대기"/"업그레이드"가 실제로 몇 번인지(또는 애초에 선택 메뉴가 뜨긴 한 건지)
   // 화면 내용을 보고 판단한다. 확신할 수 없으면 null을 반환해 아무 키도 보내지 않아야 한다 — 고정 번호를
   // 추측해 보내면 선택 메뉴가 없는 화면에서 그 숫자가 그대로 채팅 메시지로 전송돼버릴 수 있다.
   resolveRateLimitInput?(decision: "accept" | "acceptForSession", output: string): string | null;
   usageCommands: string[];
+  // 사용량 화면이 입력창을 덮는 모달로 뜨는 공급자가 파싱 뒤 닫을 때 보낼 입력. 닫지 않으면 다음 주기의
+  // 조회 명령이 입력창이 아니라 모달 단축키로 먹힌다.
+  usageScreenCloseInput?: string;
+  // 일반 사용량보다 드물게 확인할 상세 화면의 명령과 안전한 메뉴 진입·이탈 입력을 정의한다.
+  usageDetails?: { command: string; openInput: string; timeoutMs: number; isReady(screen: string): boolean; closeInput?: string };
   // 공급자 내부 작업용 기록처럼 웹 채팅 목록에 노출하지 않을 기록 파일인지 확인한다.
   isHiddenHistoryFile?(file: string): boolean;
 }

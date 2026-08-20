@@ -4,6 +4,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { AGENT_SKILL_NAMES } from "../src/server/services/agent-skill-installer";
 import { openDatabase, type AppDatabase } from "../src/server/core/database";
 import type { ProviderAdapter } from "../src/server/providers/provider";
 import { AgentBridge } from "../src/server/services/agent-bridge";
@@ -180,7 +181,7 @@ describe("로컬 에이전트 브리지", () => {
     database.close();
   });
 
-  it("자식 채팅의 실제 완료 응답을 기다려 부모가 병합할 결과로 반환한다", async () => {
+  it("장문 첨부로 바뀐 실제 전달 문구 뒤의 완료 응답을 회수한다", async () => {
     const dataDir = createRoot("web-agent-manager-bridge-wait-data-");
     const projectPath = createRoot("web-agent-manager-bridge-wait-project-");
     const database = createDatabase(dataDir);
@@ -206,12 +207,14 @@ describe("로컬 에이전트 브리지", () => {
       sessions: {
         start: () => undefined,
         sendPrompt: async (_chatId: number, text: string) => {
-          messages.push({ id: "user-1", role: "user", kind: "message", content: text, createdAt: new Date().toISOString() });
+          const delivered = `긴 메시지 원문을 첨부 파일에서 읽으세요.\n[첨부: .uploads/${text.length}.txt]`;
+          messages.push({ id: "user-1", role: "user", kind: "message", content: delivered, createdAt: new Date().toISOString() });
           database.prepare("UPDATE chats SET busy = 1 WHERE id = 2").run();
           setTimeout(() => {
             messages.push({ id: "assistant-1", role: "assistant", kind: "message", content: "검증 결과: 수정안이 안전합니다.", createdAt: new Date().toISOString() });
             database.prepare("UPDATE chats SET busy = 0 WHERE id = 2").run();
           }, 30);
+          return delivered;
         },
       } as unknown as Pick<SessionManager, "start" | "sendPrompt">,
       socketPath: path.join(dataDir, "web-agent-manager-agent.sock"),
@@ -222,7 +225,7 @@ describe("로컬 에이전트 브리지", () => {
       params: {
         sourceChatId: 1,
         targetChatId: 2,
-        prompt: "독립적으로 검증하고 결과를 보고하세요.",
+        prompt: `독립적으로 검증하고 결과를 보고하세요.\n${"긴 위임 문맥입니다. ".repeat(80)}`,
         idempotencyKey: "wait-for-child-result",
         timeoutSeconds: 2,
       },
@@ -231,7 +234,8 @@ describe("로컬 에이전트 브리지", () => {
     expect(completed.delegation.status).toBe("completed");
     expect(completed.delegation.completed_at).toBeTruthy();
     expect(completed.result.response).toBe("검증 결과: 수정안이 안전합니다.");
-    const stored = database.prepare("SELECT result_json, completed_at FROM delegations WHERE idempotency_key = ?").get("wait-for-child-result") as { result_json: string; completed_at: string };
+    const stored = database.prepare("SELECT history_prompt, result_json, completed_at FROM delegations WHERE idempotency_key = ?").get("wait-for-child-result") as { history_prompt: string; result_json: string; completed_at: string };
+    expect(stored.history_prompt).toContain("[첨부:");
     expect(JSON.parse(stored.result_json)).toMatchObject({ response: "검증 결과: 수정안이 안전합니다." });
     expect(stored.completed_at).toBeTruthy();
     database.close();
@@ -267,7 +271,7 @@ describe("에이전트 스킬 설치", () => {
   it("Codex·Claude 프로젝트 스킬 링크를 만들고 기존 파일은 덮어쓰지 않는다", () => {
     const projectPath = createRoot("web-agent-manager-skills-project-");
     const rootDir = createRoot("web-agent-manager-skills-source-");
-    for (const name of ["web-agent-manager-session-context", "web-agent-manager-delegate"]) {
+    for (const name of AGENT_SKILL_NAMES) {
       fs.mkdirSync(path.join(rootDir, "skills", name), { recursive: true });
       fs.writeFileSync(path.join(rootDir, "skills", name, "SKILL.md"), name);
     }
@@ -282,7 +286,8 @@ describe("에이전트 스킬 설치", () => {
 
     const result = installProjectAgentSkills(projectPath, rootDir);
 
-    expect(result.installed).toHaveLength(3);
+    // 두 목적지(.agents·.claude) × 스킬 수에서 기존 파일로 막힌 하나를 뺀다.
+    expect(result.installed).toHaveLength(AGENT_SKILL_NAMES.length * 2 - 1);
     expect(result.errors).toContain(`${path.join(projectPath, ".claude", "skills", "web-agent-manager-delegate")}: 기존 항목을 덮어쓰지 않았습니다.`);
     expect(fs.realpathSync(path.join(projectPath, ".agents", "skills", "web-agent-manager-session-context"))).toBe(
       fs.realpathSync(path.join(rootDir, "skills", "web-agent-manager-session-context")),
@@ -295,7 +300,7 @@ describe("에이전트 스킬 설치", () => {
     const parent = createRoot("web-agent-manager-skills-missing-");
     const projectPath = path.join(parent, "removed-project");
     const rootDir = createRoot("web-agent-manager-skills-source-");
-    for (const name of ["web-agent-manager-session-context", "web-agent-manager-delegate"]) {
+    for (const name of AGENT_SKILL_NAMES) {
       fs.mkdirSync(path.join(rootDir, "skills", name), { recursive: true });
     }
 

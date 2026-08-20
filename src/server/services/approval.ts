@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import type { AppConfig } from "../core/config";
 import type { AppDatabase } from "../core/database";
-import type { AuthUser } from "../../shared/types";
+import type { AuthUser, Provider } from "../../shared/types";
 import type { RealtimeHub } from "./realtime";
 import type { Notifier } from "./notifier";
 
@@ -57,7 +57,7 @@ export class ApprovalService {
   // 터미널에서 감지한 공급자별 승인·선택 요청을 중복 없이 생성한다. notify=false면 웹·Slack에 알리지
   // 않는다 — rate_limit_options처럼 사람이 볼 새도 없이 곧바로 자동 처리되는 화면까지 "승인 필요"
   // 알림을 띄우면, 실제로는 할 일이 없는데도 알림이 와서 혼란스럽다(session-manager.ts 참고).
-  createTerminalApproval(chatId: number, provider: "codex" | "claude", summary: string, requestType = "terminal_approval", notify = true): string {
+  createTerminalApproval(chatId: number, provider: Provider, summary: string, requestType = "terminal_approval", notify = true): string {
     const existing = this.database.prepare("SELECT id FROM approvals WHERE chat_id = ? AND status = 'pending'").get(chatId) as { id: string } | undefined;
     if (existing) return existing.id;
     const id = crypto.randomUUID();
@@ -120,11 +120,16 @@ export class ApprovalService {
     this.finalizeApproval(id, decision, null, undefined, true);
   }
 
-  // "닫기": 웹 목록에서만 정리한다. 실제로 AI가 지금 이 요청에 대한 응답을 기다리고 있는 게 확인되면
-  // (작업 중인 Claude 훅이 대기 중이거나, 터미널 화면에 그 프롬프트가 여전히 떠 있으면) 절대 조용히 넘어가지
-  // 않고 에러를 던진다 — 살아있는 요청을 실수로 끊어버리는 대신, 사용자가 실제로 답변하거나 거부하도록
-  // 강제한다. 이미 다른 경로로 끝났거나 화면이 지나간 게 확인된 경우에만 AI 쪽은 전혀 건드리지 않고
-  // DB 상태만 정리한다.
+  // "닫기": 이미 지나간 요청이면 AI 쪽을 전혀 건드리지 않고 웹 목록에서만 정리한다. 반대로 AI가 지금
+  // 실제로 이 요청의 응답을 기다리는 중이면(훅이 대기 중이거나 터미널에 프롬프트가 떠 있으면) 조용히
+  // 목록에서만 지우지 않고 "거부" 결정으로 전달해 즉시 풀어준다.
+  // 예전에는 이 경우 에러를 던져 닫기를 막았는데, AskUserQuestion처럼 답변 전송과 닫기밖에 없는 카드에서는
+  // 사용자가 답을 하지 않으려 할 때 빠져나갈 방법이 아예 없어 훅 9분 타임아웃까지 갇혔다(실제로 겪음).
+  // "취소"(cancel)가 아니라 "거부"(decline)를 쓰는 것이 중요하다 — cancel은 훅에 interrupt=true로 나가
+  // 진행 중인 턴 자체를 중단시키고 터미널에는 Esc를 보내므로, 질문 하나를 닫았을 뿐인데 작업 전체가
+  // 취소돼버린다. decline은 그 요청만 거부하고 작업은 이어가게 한다.
+  // 터미널 승인의 키 입력은 terminalLiveCheckHandler가 지금 화면에 그 프롬프트가 실제로 떠 있다고
+  // 확인한 경우에만 나간다(이미 지나간 화면에는 아무 키도 보내지 않는다).
   dismiss(id: string, user: AuthUser): void {
     const approval = this.database.prepare(`
       SELECT a.chat_id, a.provider, a.request_type, a.status, c.busy,
@@ -133,7 +138,7 @@ export class ApprovalService {
       WHERE a.id = ?
     `).get(id) as {
       chat_id: number;
-      provider: "codex" | "claude";
+      provider: Provider;
       request_type: string;
       status: string;
       busy: number;
@@ -146,7 +151,7 @@ export class ApprovalService {
     const isHookLive = approval.provider === "claude" && approval.request_type === "permission"
       && this.waiting.has(id) && (approval.busy === 1 || approval.chat_progressed === 0);
     const isTerminalLive = approval.request_type !== "permission" && (this.terminalLiveCheckHandler?.(approval.chat_id, approval.request_type) ?? false);
-    if (isHookLive || isTerminalLive) throw new Error("AI가 지금 이 요청에 대한 응답을 실제로 기다리고 있어 그냥 닫을 수 없습니다. 답변하거나 거부해주세요.");
+    if (isHookLive || isTerminalLive) { this.finalizeApproval(id, "decline", user.id, "사용자가 이 요청을 닫았습니다.", true); return; }
     this.database.prepare(`
       UPDATE approvals SET status = 'dismissed', decision = 'dismiss', decided_by = ?, resolved_at = CURRENT_TIMESTAMP WHERE id = ?
     `).run(user.id, id);
@@ -184,7 +189,7 @@ export class ApprovalService {
   private finalizeApproval(id: string, decision: ApprovalDecision, decidedBy: number | null, answer: string | undefined, notifyTerminal: boolean): boolean {
     const approval = this.database.prepare("SELECT chat_id, provider, request_type, status FROM approvals WHERE id = ?").get(id) as {
       chat_id: number;
-      provider: "codex" | "claude";
+      provider: Provider;
       request_type: string;
       status: string;
     } | undefined;

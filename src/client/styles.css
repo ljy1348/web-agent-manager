@@ -228,6 +228,11 @@ nav button.active { color: #fff; border-bottom-color: #d6f56f; }
 .dot.stale { background: #d9a231; }
 .usage-refresh { margin-left: 8px; padding: 2px 8px; font: 500 10px DM Mono, monospace; text-transform: none; }
 .usage-parsed-at { margin: -8px 0 10px; font-size: 10px; color: var(--muted); }
+.usage-reset-credits { display: grid; grid-template-columns: auto auto minmax(0, 1fr) auto; align-items: center; gap: 8px; margin-top: 12px; padding: 10px 12px; border: 1px solid #dedafa; border-radius: 8px; background: #f7f5ff; font-size: 12px; }
+.usage-reset-credits strong { color: #4437b8; }
+.usage-reset-credits b { font: 600 13px DM Mono, monospace; }
+.usage-reset-credits span { min-width: 0; color: var(--muted); font-size: 10px; overflow-wrap: anywhere; }
+.usage-reset-redeem { padding: 4px 8px; border-color: #c8c0f4; color: #4437b8; background: #fff; font-size: 10px; white-space: nowrap; }
 .usage-snapshot { margin-top: 10px; }
 .usage-snapshot .git-box-head h4 { margin: 0; font-size: 12px; }
 .usage-snapshot-text { max-height: 320px; overflow: auto; margin: 0; padding: 10px 12px; background: #111815; color: #d9e7df; border-radius: 7px; font: 11px/1.55 DM Mono, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -255,6 +260,25 @@ nav button.active { color: #fff; border-bottom-color: #d6f56f; }
 .stat-pair span { background: var(--surface-muted); border: 1px solid #edf0ed; border-radius: 7px; padding: 12px; color: var(--muted); font-size: 12px; }
 .stat-pair b { display: block; margin-top: 6px; color: #21382d; font: 500 22px DM Mono, monospace; }
 .small-list { display: flex; flex-direction: column; gap: 7px; margin-top: 12px; font: 400 12px DM Mono, monospace; }
+.token-usage-card { min-width: 0; }
+.token-usage-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
+.token-usage-head h3 { margin: 0; font-size: 18px; }
+.token-usage-head p { margin: 6px 0 0; color: var(--muted); font-size: 11px; }
+.token-usage-filters { display: flex; flex: none; gap: 8px; }
+.token-usage-filters label { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; }
+.token-usage-filters select { min-width: 112px; padding: 7px 26px 7px 9px; }
+.token-usage-summary { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; margin: 18px 0 8px; }
+.token-usage-summary > span { padding: 11px 12px; border: 1px solid #e8ecf3; border-radius: 10px; background: #f8fafc; color: var(--muted); font-size: 10px; }
+.token-usage-summary strong { display: block; margin-top: 5px; color: var(--text); font: 600 18px DM Mono, monospace; }
+.token-usage-counts { margin: 0 0 10px; color: var(--muted); font-size: 10px; }
+.token-usage-table-wrap { max-height: 460px; }
+.token-usage-table { width: 100%; border-collapse: collapse; text-align: left; font: 12px DM Mono, monospace; }
+.token-usage-table th, .token-usage-table td { padding: 10px 9px; border-bottom: 1px solid #e7ebe7; white-space: nowrap; }
+.token-usage-table th { position: sticky; top: 0; z-index: 1; background: var(--surface); color: var(--muted); font-size: 10px; }
+.token-usage-table th:first-child, .token-usage-table td:first-child { min-width: 220px; white-space: normal; }
+.token-usage-table td:first-child strong { overflow-wrap: anywhere; }
+.token-usage-table td:first-child small { display: block; margin-top: 3px; color: var(--muted); font: 10px/1.35 system-ui, sans-serif; overflow-wrap: anywhere; }
+.token-usage-deleted { display: inline-block; margin-left: 7px; padding: 2px 6px; border-radius: 999px; background: #f3e8e8; color: #8c4242; font: 600 9px system-ui, sans-serif; font-style: normal; }
 .table-wrap { overflow: auto; }
 .process-card table { width: 100%; border-collapse: collapse; text-align: left; font: 12px DM Mono, monospace; }
 .process-card th, .process-card td { padding: 10px 9px; border-bottom: 1px solid #e7ebe7; vertical-align: middle; }
@@ -331,6 +355,8 @@ nav button.active { color: #fff; border-bottom-color: #d6f56f; }
   border-radius: 999px; background: transparent; color: var(--muted); font: 500 10.5px DM Mono, monospace;
 }
 .chat-group-actions button:hover:not(:disabled) { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+/* 채팅이 없는 작업공간도 목록에 남겨두므로, 빈 자리가 오류로 보이지 않게 안내 한 줄을 둔다. */
+.chat-group-empty { margin: 0; padding: 0 6px 2px 22px; color: var(--muted); font: 500 10.5px DM Mono, monospace; }
 .chat-branch { min-width: 0; overflow: hidden; color: #486457; font: 500 10px DM Mono, monospace; text-overflow: ellipsis; white-space: nowrap; }
 .activity-chip { display: inline-flex; align-items: center; width: max-content; max-width: 100%; padding: 2px 7px; border-radius: 999px; font: 600 10px DM Mono, monospace; }
 .activity-chip.idle, .activity-text.idle { color: #2f6d4d; background: #e4f1e9; }
@@ -387,9 +413,23 @@ nav button.active { color: #fff; border-bottom-color: #d6f56f; }
 }
 .model-bar b { color: #21382d; font-weight: 600; }
 .model-bar button { margin-left: auto; min-height: 28px; padding: 4px 9px; font-size: 11px; }
-/* 모바일 한 줄 요약바. 데스크톱에서는 기존 model-bar가 이미 한두 줄이면 충분히 들어가 굳이 안 쓰므로
-   숨겨두고, ≤700px에서만 이 요약 한 줄을 보여주고 그 아래 전체 model-bar는 접어둔다. */
-.model-bar-summary { display: none; }
+/* 한 줄 요약바. 화면이 넓고 높을 때는 기존 model-bar가 한 줄에 다 들어가 굳이 필요 없으므로 숨겨두고,
+   ≤700px 모바일과 세로가 짧은 노트북에서만 이 요약을 보여주고 그 아래 전체 model-bar는 접어둔다.
+   두 구간이 같은 모양을 써야 해서 시각 스타일은 여기에 모아두고 미디어쿼리에서는 display만 바꾼다. */
+.model-bar-summary {
+  display: none;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-bottom: 1px solid #e4e8e5;
+  background: #fbfcfb;
+  font-size: 12px;
+  color: var(--muted);
+}
+.model-bar-summary b:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #21382d; font-weight: 600; }
+.model-bar-summary button { margin-left: auto; min-height: 26px; padding: 3px 9px; font-size: 11px; white-space: nowrap; }
+/* 접힌 상태에서도 계속 봐야 하는 값이라 모델명(ellipsis 대상)에 밀려 줄어들지 않게 고정한다. */
+.model-bar-summary .summary-usage { flex: none; white-space: nowrap; }
 .tool-details-toggle { display: flex; align-items: center; gap: 5px; cursor: pointer; user-select: none; }
 .tool-details-toggle input { margin: 0; }
 .git-branch-control { position: relative; min-width: 0; }
@@ -440,6 +480,8 @@ nav button.active { color: #fff; border-bottom-color: #d6f56f; }
 }
 .message.user { margin-left: auto; background: #e6f1eb; border-color: #cde0d5; }
 .message small { display: block; margin-bottom: 4px; color: #63746a; font: 600 10px DM Mono, monospace; text-transform: uppercase; }
+.message-token-usage { margin-top: 7px; color: #829087; font: 500 9.5px/1.4 DM Mono, monospace; overflow-wrap: anywhere; }
+.message.user .message-token-usage { color: rgba(255,255,255,.72); }
 .message pre, .approval pre { white-space: pre-wrap; margin: 0; font: 13px/1.6 Manrope, system-ui, sans-serif; }
 .message pre, .message-body, .message-details pre { max-width: 100%; overflow-wrap: anywhere; word-break: break-word; overflow-x: hidden; }
 .message-details { max-width: 100%; margin-top: 8px; border: 1px solid #d9e0db; border-radius: 7px; background: #f4f6f4; }
@@ -624,6 +666,9 @@ nav button.active { color: #fff; border-bottom-color: #d6f56f; }
 .commit-detail .commit-meta-card { padding: 12px 14px; border-bottom: 1px solid var(--border); }
 .commit-byline { margin: 4px 0 0; color: var(--muted); font-size: 11.5px; }
 .commit-body { margin: 8px 0 0; padding: 10px 12px; border-radius: 7px; background: #f6f8fa; color: #24292f; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.6 var(--font-code); }
+/* 커밋 설명은 페이지 흐름을 따라 그대로 이어지게 둔다. `.git-box pre`의 공용 높이 제한과 자체
+   스크롤이 명시도(0,1,1 > 0,1,0)로 딸려 들어와, 설명만 안쪽에서 따로 스크롤되던 것을 되돌린다. */
+.git-box pre.commit-body { max-height: none; overflow: visible; }
 .commit-file-list { margin: 12px 0; overflow: hidden; border: 1px solid #d1d9e0; border-radius: 8px; }
 .commit-file-list-head { padding: 8px 12px; border-bottom: 1px solid #d1d9e0; background: #f6f8fa; font: 600 12px DM Mono, monospace; }
 .commit-file-item { display: flex; gap: 10px; align-items: center; padding: 7px 12px; border-bottom: 1px solid #eaeef2; color: inherit; text-decoration: none; }
@@ -676,6 +721,17 @@ nav button.active { color: #fff; border-bottom-color: #d6f56f; }
 .slash-menu strong { min-width: 0; font: 600 12px DM Mono, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .slash-menu small { min-width: 0; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .slash-empty { padding: 10px; color: var(--muted); font-size: 12px; }
+.mention-kind { font: 600 11px DM Mono, monospace; color: var(--muted); }
+/* 파일 멘션의 폴더 행: 왼쪽 큰 버튼(눌러서 그 폴더 안으로 들어감)과 오른쪽 작은 + 버튼(폴더 자체를
+   링크로 추가)을 나란히 둔다. .slash-menu button의 3열 grid는 왼쪽 버튼에 그대로 물려받고, +
+   버튼만 좁은 정사각형으로 덮어쓴다. */
+.mention-row { display: flex; align-items: stretch; gap: 4px; margin: 2px 0; }
+.mention-row-main { flex: 1; min-width: 0; margin: 0; }
+.mention-row.active .mention-row-main, .mention-row:hover .mention-row-main { background: var(--accent-soft); border-color: #c4ddce; }
+/* .slash-menu button가 width: 100%를 주는데 클래스 하나뿐인 이 선택자보다 특이도가 높아(class+element)
+   덮어써지지 않으면 이 30px 버튼이 행 전체 너비를 차지해 옆 .mention-row-main을 0폭으로 밀어낸다(실사용 재현). */
+.mention-row-pick { display: flex !important; align-items: center; justify-content: center; width: 30px !important; flex: 0 0 30px !important; min-height: 36px !important; margin: 0 !important; padding: 0 !important; font-size: 16px; color: var(--muted); }
+.mention-row-pick:hover { background: var(--accent-soft); border-color: #c4ddce; color: var(--text); }
 .attach-button { width: 38px; min-height: 38px; padding: 0; font-size: 16px; line-height: 1; }
 .attachment-status { font-size: 11px; color: #65756c; }
 .attachment-status.send-error { color: var(--danger); }
@@ -753,9 +809,9 @@ nav button.active { color: #fff; border-bottom-color: #d6f56f; }
 .file-thumb { display: block; flex: 0 0 32px; overflow: hidden; width: 32px; height: 32px; border: 1px solid #dfe5e1; border-radius: 5px; background: #f5f7f5; }
 .file-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .file-actions { display: flex; align-items: center; justify-content: center; min-width: 0; }
-.file-actions button, .file-actions a, .file-preview .git-box-head button { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; min-height: 0; padding: 0; border: 1px solid #d6dfd9; border-radius: 6px; background: #fff; color: #496155; cursor: pointer; }
-.file-actions svg, .file-preview .git-box-head button svg { width: 15px; height: 15px; }
-.file-actions button:hover, .file-actions a:hover, .file-preview .git-box-head button:hover { border-color: #7fa08d; background: #edf6f1; }
+.file-actions button, .file-actions a, .file-preview .git-box-head button, .file-preview .git-box-head a { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; min-height: 0; padding: 0; border: 1px solid #d6dfd9; border-radius: 6px; background: #fff; color: #496155; cursor: pointer; }
+.file-actions svg, .file-preview .git-box-head button svg, .file-preview .git-box-head a svg { width: 15px; height: 15px; }
+.file-actions button:hover, .file-actions a:hover, .file-preview .git-box-head button:hover, .file-preview .git-box-head a:hover { border-color: #7fa08d; background: #edf6f1; }
 .file-list-empty { margin: 0; padding: 28px 14px; color: var(--muted); text-align: center; font-size: 12px; }
 .file-preview { min-width: 0; position: sticky; top: 12px; border: 1px solid #dde3df; border-radius: 8px; padding: 13px; background: #fff; }
 .file-preview strong { display: block; margin-bottom: 8px; overflow-wrap: anywhere; font: 600 12px DM Mono, monospace; }
@@ -768,6 +824,24 @@ nav button.active { color: #fff; border-bottom-color: #d6f56f; }
 .file-preview-head-actions { display: inline-flex; gap: 6px; }
 .file-preview-editor { display: block; width: 100%; height: 58vh; resize: vertical; box-sizing: border-box; padding: 12px; border: 1px solid #2a3a32; border-radius: 7px; background: #101713; color: #dce9e1; font: 12px/1.55 DM Mono, monospace; }
 .file-edit-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 8px; }
+/* 텍스트 미리보기를 <pre> 한 덩어리 대신 줄 단위 grid로 그려, 줄마다 채팅 연결 버튼을 붙일 수 있게 한다. */
+.file-preview-lines { max-height: 58vh; overflow: auto; border-radius: 7px; background: #101713; color: #dce9e1; font: 12px/1.55 DM Mono, monospace; }
+.file-preview-line { position: relative; display: grid; grid-template-columns: 38px 20px 1fr; align-items: start; padding: 0 8px; }
+.file-preview-line:hover, .file-preview-line:focus-within { background: rgba(255, 255, 255, .06); }
+.file-preview-line.target { background: rgba(255, 209, 102, .18); }
+.file-preview-line-number { padding-right: 8px; color: #6c8577; text-align: right; user-select: none; }
+.file-preview-line-link { display: flex; align-items: center; justify-content: center; width: 18px; height: 18px; padding: 0; margin-top: 2px; border: 0; border-radius: 4px; background: transparent; color: #9fd6b8; opacity: 0; cursor: pointer; }
+.file-preview-line:hover .file-preview-line-link, .file-preview-line:focus-within .file-preview-line-link, .file-preview-line-link:focus { opacity: 1; }
+.file-preview-line-link:hover { background: rgba(255, 255, 255, .12); }
+.file-preview-line-code { white-space: pre-wrap; overflow-wrap: anywhere; }
+.line-chat-menu { position: absolute; z-index: 6; top: 100%; left: 30px; width: min(280px, 80vw); margin-top: 4px; padding: 8px; border: 1px solid var(--border-strong); border-radius: 8px; background: #fff; color: var(--text); box-shadow: 0 12px 28px rgba(21, 32, 26, .2); }
+.line-chat-menu-head { display: flex; gap: 6px; margin-bottom: 6px; }
+.line-chat-menu-head input { flex: 1; min-width: 0; }
+.line-chat-menu-new { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 6px; }
+.line-chat-menu-list { display: flex; flex-direction: column; gap: 2px; max-height: 200px; overflow: auto; }
+.line-chat-menu-item { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; width: 100%; padding: 6px 8px; border-color: transparent; text-align: left; background: transparent; }
+.line-chat-menu-item:hover { background: var(--accent-soft); border-color: #c4ddce; }
+.line-chat-menu-item small { color: var(--muted); }
 .preview-truncated { padding: 8px; border-top: 1px solid #e0e6e2; color: #65756c; font-size: 11px; }
 .project-file-link { cursor: pointer; font-weight: 600; text-decoration: underline; text-underline-offset: 2px; }
 .editor-toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
@@ -818,6 +892,9 @@ nav button.active { color: #fff; border-bottom-color: #d6f56f; }
 .git-file-list input { margin: 0; }
 .git-file-list span { min-width: 0; overflow-wrap: anywhere; font: 500 12px DM Mono, monospace; }
 .git-file-list b { padding: 2px 6px; border-radius: 999px; background: #eef1ee; color: #526158; font-size: 10px; font-weight: 600; }
+.git-file-group { display: flex; flex-direction: column; gap: 5px; }
+.git-file-group-head { background: var(--surface-muted); font-weight: 600; }
+.git-file-row.nested { margin-left: 16px; }
 .commit-form, .github-create, .github-action-grid form { display: flex; flex-direction: column; gap: 8px; }
 .commit-form { margin-top: 12px; }
 .commit-form textarea, .github-create textarea, .github-action-grid textarea { resize: vertical; min-height: 72px; }
@@ -851,6 +928,8 @@ nav button.active { color: #fff; border-bottom-color: #d6f56f; }
 .github-tab > .git-subtabs { margin: 12px -16px 0; }
 .github-split { display: grid; grid-template-columns: minmax(270px, 360px) minmax(0, 1fr); gap: 14px; align-items: start; padding-top: 14px; }
 .github-list { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+/* 목록 접기 토글은 목록과 상세가 세로로 쌓이는 좁은 화면에서만 쓴다(1100px 이하에서 다시 켠다). */
+.github-list-toggle { display: none; }
 .github-list > button {
   display: flex;
   flex-direction: column;
@@ -864,6 +943,11 @@ nav button.active { color: #fff; border-bottom-color: #d6f56f; }
 .github-list > button.active { border-color: #5a8c73; background: #edf5f0; }
 .github-list b { max-width: 100%; overflow-wrap: anywhere; font-size: 12px; }
 .github-list span, .github-detail small, .github-run-list span { color: var(--muted); font-size: 11px; }
+/* 목록 끝의 "더 보기" 버튼. 점선 테두리와 가운데 정렬로 목록 항목과 구분한다. */
+.list-more { width: 100%; margin-top: 2px; color: var(--muted); font-size: 12px; border-style: dashed; }
+.list-more:hover:not(:disabled) { color: #315d48; border-color: #5a8c73; }
+/* 목록 항목과 같은 선택자에 걸려 항목용 높이·정렬을 물려받으므로 여기서 되돌린다. */
+.github-list > button.list-more { min-height: 34px; align-items: center; text-align: center; }
 .github-create, .github-action-grid form, .github-run-list article {
   min-width: 0;
   padding: 10px;
@@ -877,13 +961,17 @@ nav button.active { color: #fff; border-bottom-color: #d6f56f; }
 .github-detail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; margin-bottom: 12px; }
 .github-detail-head h3 { margin: 7px 0 3px; font-size: 17px; line-height: 1.35; overflow-wrap: anywhere; }
 .github-detail-head a { flex: 0 0 auto; color: #235f48; font-size: 12px; }
+/* 액션 영역에 정렬이 없어 버튼과 링크가 좁은 화면에서 겹쳐 보였다 — 줄바꿈과 간격을 준다. */
+.github-detail-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .state-badge { display: inline-flex; width: max-content; padding: 2px 7px; border-radius: 999px; background: #eef1ee; color: #526158; font-size: 11px; font-weight: 700; }
 .state-badge.open { background: #daf5e6; color: #1f7a43; }
 .state-badge.closed { background: #ffe4e1; color: #a7372f; }
 .state-badge.merged { background: #efe4ff; color: #6f42c1; }
 /* 마크다운 렌더링(GithubBody)으로 바뀌어 pre-wrap을 주면 소스의 줄바꿈이 그대로 강제 개행으로
    보여 문단이 어색하게 끊긴다 — 줄바꿈 처리는 .markdown-body의 p/ul 등 요소 규칙에 맡긴다. */
-.github-body { max-height: 220px; overflow: auto; padding: 10px; border: 1px solid #edf0ed; border-radius: 7px; background: #fbfcfb; overflow-wrap: anywhere; }
+/* 본문은 높이를 제한하지 않고 페이지 흐름을 따라 이어지게 둔다 — 220px 상자 안에서 따로 스크롤하면
+   페이지 스크롤과 분리돼 읽기 불편하다(커밋 설명 `.commit-body`와 같은 기준). */
+.github-body { padding: 10px; border: 1px solid #edf0ed; border-radius: 7px; background: #fbfcfb; overflow-wrap: anywhere; }
 .github-action-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin: 12px 0; }
 .github-comments { display: flex; flex-direction: column; gap: 8px; }
 .github-comments article { padding: 10px; border: 1px solid #edf0ed; border-radius: 7px; background: #fbfcfb; }
@@ -960,6 +1048,16 @@ nav button.active { color: #fff; border-bottom-color: #d6f56f; }
   .git-layout { grid-template-columns: 1fr; }
   .git-sidebar { border-right: 0; }
   .github-split, .github-actions-panel { grid-template-columns: 1fr; }
+  /* 1열이 되면 목록 전체가 상세 위에 쌓여, 항목을 골라도 상세를 보려면 목록 끝까지 내려야 했다 —
+     커밋 사이드바와 같은 방식으로 접어서 고른 항목의 상세부터 보이게 한다. */
+  .github-list-toggle {
+    display: flex; width: 100%; gap: 8px; align-items: center; justify-content: space-between;
+    padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px;
+    background: #f6f8f6; color: var(--text); font: 600 12px DM Mono, monospace; text-align: left;
+  }
+  .github-list-summary { min-width: 0; overflow: hidden; color: var(--muted); font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+  .github-split > .github-list { display: none; }
+  .github-split > .github-list.open { display: flex; }
   .github-action-grid { grid-template-columns: 1fr; }
   .tools-grid { grid-template-columns: 1fr; }
   .tool-list { border-right: 0; border-bottom: 1px solid var(--border); max-height: 320px; }
@@ -994,9 +1092,10 @@ nav button.active { color: #fff; border-bottom-color: #d6f56f; }
   .subagent-manager { bottom: var(--mobile-tabbar-h); width: 100%; }
   .subagent-create { grid-template-columns: minmax(0, 1fr); }
   .subagent-create textarea, .subagent-submit { width: 100%; }
-  .model-bar-summary { display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-bottom: 1px solid #e4e8e5; background: #fbfcfb; font-size: 12px; color: var(--muted); }
-  .model-bar-summary b:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #21382d; font-weight: 600; }
-  .model-bar-summary button { margin-left: auto; min-height: 26px; padding: 3px 9px; font-size: 11px; white-space: nowrap; }
+  .model-bar-summary { display: flex; }
+  /* 390px 폭에서는 초기화 시각까지 넣으면 요약이 한 줄을 넘겨 모델명이 과하게 잘린다.
+     퍼센트만 남기고 초기화 시각은 '자세히'를 펼쳐서 본다(노트북 이상에서는 그대로 표시). */
+  .model-bar-summary .summary-reset { display: none; }
   /* 펼치기 전에는 아예 렌더링을 없애 요약 줄 아래로 빈 공간이 생기지 않게 한다. */
   .model-bar { display: none; padding: 8px 10px; gap: 6px 10px; }
   .model-bar.expanded { display: flex; }
@@ -1048,7 +1147,7 @@ nav button.active { color: #fff; border-bottom-color: #d6f56f; }
   .file-preview .git-box-head { position: sticky; top: -12px; z-index: 1; margin: -12px -12px 10px; padding: 10px 12px; border-bottom: 1px solid var(--border); background: #fff; }
   .file-preview-frame { height: calc(100dvh - var(--mobile-tabbar-h) - 104px); }
   .file-preview-media { max-height: calc(100dvh - var(--mobile-tabbar-h) - 104px); }
-  .file-preview-markdown, .file-preview pre { max-height: none; }
+  .file-preview-markdown, .file-preview pre, .file-preview-lines { max-height: none; }
   .file-preview-editor { height: calc(100dvh - var(--mobile-tabbar-h) - 160px); }
   .file-list-head { display: none; }
   /* 프로세스 표가 화면보다 넓어 가로로 밀렸다 — 좁은 화면에서는 행을 카드처럼 쌓는다. */
@@ -1617,6 +1716,12 @@ input, select, textarea { border-radius: 10px !important; }
   .cards { gap: 12px; }
   .cards > .card:hover { transform: none; }
   .stat-pair span { padding: 14px 12px; }
+  .token-usage-head { flex-direction: column; }
+  .token-usage-filters { width: 100%; }
+  .token-usage-filters label { min-width: 0; flex: 1; flex-direction: column; align-items: stretch; }
+  .token-usage-filters select { width: 100%; min-width: 0; }
+  .token-usage-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .token-usage-summary > span:first-child { grid-column: 1 / -1; }
   .process-card tr { margin: 0 -2px; padding: 10px 0; }
   .process-actions button { min-height: 38px; }
   .chat-layout { height: calc(100dvh - var(--mobile-tabbar-h)); min-height: 0; }
@@ -1684,5 +1789,189 @@ input, select, textarea { border-radius: 10px !important; }
   }
   .mobile-tabbar button svg { flex: none; }
   .mobile-tabbar button.active { background: rgba(139,124,246,.18); color: #fff; }
-  .mobile-tabbar button.active svg { color: #b8ff63; }
+.mobile-tabbar button.active svg { color: #b8ff63; }
+}
+
+/* Agent Lab은 실행 조건 매트릭스와 provenance 상세를 같은 화면에서 비교한다. */
+.agent-lab { position: relative; min-width: 0; }
+.agent-lab-empty { display: grid; min-height: 420px; place-items: center; align-content: center; gap: 8px; color: var(--muted); text-align: center; }
+.agent-lab-empty h2, .agent-lab-empty p { margin: 0; }
+.agent-lab .global-error { margin: 0 0 14px; }
+.lab-scope-note { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 5px 12px; margin: -4px 0 18px; padding: 12px 15px; border: 1px solid #ddd9ff; border-radius: 13px; background: #f6f4ff; color: #5d568d; font-size: 12px; line-height: 1.5; }
+.lab-scope-note strong { color: #4437b8; }
+.lab-notice { margin: 0 0 14px; padding: 10px 13px; border: 1px solid #cde7d7; border-radius: 11px; background: #f2fbf5; color: #286545; font-size: 12px; }
+.lab-layout { display: grid; grid-template-columns: 230px minmax(0, 1fr); align-items: start; gap: 16px; }
+.lab-experiment-list { display: flex; min-height: 300px; padding: 10px; flex-direction: column; gap: 6px; }
+.lab-panel-head { display: flex; align-items: center; justify-content: space-between; padding: 6px 8px 10px; color: #687386; font: 700 11px DM Mono, monospace; letter-spacing: .06em; text-transform: uppercase; }
+.lab-panel-head span { display: grid; min-width: 22px; height: 22px; place-items: center; border-radius: 999px; background: #eeecff; color: #5146c6; }
+.lab-experiment-list > button { display: flex; min-width: 0; min-height: 58px; flex-direction: column; align-items: flex-start; justify-content: center; gap: 4px; border-color: transparent; background: transparent; text-align: left; }
+.lab-experiment-list > button strong, .lab-experiment-list > button small { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lab-experiment-list > button small { color: var(--muted); font-size: 10px; }
+.lab-experiment-list > button.active { border-color: #d5d0ff; background: #f0eeff; color: #4437b8; }
+.lab-main { display: flex; min-width: 0; flex-direction: column; gap: 16px; }
+.lab-design { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(220px, 1fr) auto; align-items: center; gap: 18px; }
+.lab-design h3, .lab-run-detail h3 { margin: 4px 0 6px; font-size: 18px; }
+.lab-design p { margin: 0; color: #596579; font-size: 13px; }
+.lab-design dl, .lab-judgments dl { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 9px; margin: 0; font-size: 11px; }
+.lab-design dt, .lab-judgments dt { color: var(--muted); }
+.lab-design dd, .lab-judgments dd { margin: 0; overflow-wrap: anywhere; }
+.lab-design > button, .lab-icon-action, .lab-detail-head > button { display: inline-flex; align-items: center; gap: 5px; }
+.lab-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.lab-form .card-top { grid-column: 1 / -1; margin-bottom: 2px; }
+.lab-form label { display: flex; min-width: 0; flex-direction: column; gap: 5px; color: #556174; font-size: 11px; font-weight: 650; }
+.lab-form input, .lab-form select, .lab-form textarea { width: 100%; min-width: 0; padding: 9px 10px; border: 1px solid var(--border); background: #fff; color: var(--text); }
+.lab-form input, .lab-form select { height: 40px; }
+.lab-form label.lab-check { flex-direction: row; align-items: center; }
+.lab-form label.lab-check input { width: auto; height: auto; }
+.lab-form .span-2 { grid-column: 1 / -1; }
+.lab-skill-picker { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; min-width: 0; margin: 0; padding: 10px; border: 1px solid #dedaf8; border-radius: 10px; background: #faf9ff; }
+.lab-skill-picker legend { padding: 0 5px; color: #554bb0; font-size: 11px; font-weight: 750; }
+.lab-skill-picker > label { display: flex; min-width: 0; padding: 8px; flex-direction: row; align-items: center; gap: 7px; border: 1px solid #e6e3f7; border-radius: 8px; background: #fff; }
+.lab-skill-picker > label input { width: auto; height: auto; flex: none; }
+.lab-skill-picker > label span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lab-skill-picker > label small { display: block; margin-top: 2px; color: var(--muted); font-size: 9px; font-weight: 500; }
+.lab-skill-picker > label:has(input:disabled) { opacity: .55; }
+.lab-skill-picker > small { grid-column: 1 / -1; color: var(--muted); }
+.lab-skill-picker > small.error { color: #a63c3c; }
+.lab-form-hint { align-self: center; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.lab-form-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.lab-matrix { min-width: 0; }
+.lab-matrix table { width: 100%; min-width: 980px; border-collapse: collapse; font-size: 12px; text-align: left; }
+.lab-matrix th, .lab-matrix td { padding: 11px 9px; border-bottom: 1px solid #e8ecf3; vertical-align: middle; }
+.lab-matrix th { color: #7a8494; font: 700 10px DM Mono, monospace; letter-spacing: .05em; text-transform: uppercase; }
+.lab-matrix td:first-child { min-width: 210px; }
+.lab-matrix td:first-child > strong { display: block; margin-bottom: 5px; }
+.lab-matrix td small { display: flex; align-items: center; gap: 5px; margin-top: 4px; color: var(--muted); font-size: 10px; }
+.lab-matrix td:last-child { display: flex; gap: 5px; }
+.lab-run-link { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: 0; border: 0; background: transparent; }
+.lab-status { display: inline-flex; width: max-content; padding: 3px 7px; border-radius: 999px; background: #eef1f5; color: #5e6878; font: 700 10px DM Mono, monospace; }
+.lab-status.running, .lab-status.preparing, .lab-status.evaluating { background: #e8e5ff; color: #5143c7; }
+.lab-status.completed { background: #e2f5e9; color: #247048; }
+.lab-status.failed, .lab-status.budget_exceeded { background: #ffe8e8; color: #a63c3c; }
+.lab-status.cancelled { background: #f0f1f3; color: #6d7480; }
+.lab-check { display: inline-flex; width: max-content; padding: 3px 7px; border-radius: 999px; background: #eef1f5; color: #5e6878; font: 700 10px DM Mono, monospace; }
+.lab-check.passed { background: #e2f5e9; color: #247048; }
+.lab-check.failed { background: #ffe8e8; color: #a63c3c; }
+.lab-check.error { background: #fdeccd; color: #8a5a1b; }
+.lab-check.skipped, .lab-check.none { background: #f0f1f3; color: #6d7480; }
+.lab-recommendation-body { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.lab-recommendation-body strong { font-size: 15px; }
+.lab-grade { display: inline-flex; padding: 3px 8px; border-radius: 999px; font: 700 10px DM Mono, monospace; background: #eef1f5; color: #5e6878; }
+.lab-grade.confirmed { background: #e2f5e9; color: #247048; }
+.lab-grade.tentative { background: #fdeccd; color: #8a5a1b; }
+.lab-grade.indistinguishable { background: #f0f1f3; color: #6d7480; }
+.lab-experiment-tags { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 4px; }
+.lab-tag { display: inline-flex; padding: 2px 6px; border-radius: 6px; background: #eef1f5; color: #5e6878; font: 600 10px DM Mono, monospace; }
+.lab-design-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.lab-icon-action { padding: 6px 8px; font-size: 11px; }
+.lab-run-detail { min-width: 0; }
+.lab-detail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.lab-detail-head h3 { display: flex; align-items: center; gap: 8px; }
+.lab-run-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 16px 0; }
+.lab-run-metrics span { display: flex; min-width: 0; min-height: 66px; padding: 11px; flex-direction: column; justify-content: center; gap: 4px; border: 1px solid #e4e8ef; border-radius: 11px; background: #f8fafc; }
+.lab-run-metrics small { color: var(--muted); font: 650 9px DM Mono, monospace; letter-spacing: .05em; text-transform: uppercase; }
+.lab-run-metrics strong { overflow-wrap: anywhere; font-size: 14px; }
+.lab-run-error { padding: 10px 12px; border-radius: 9px; background: #fff0f0; color: #9a3232; font: 11px/1.5 DM Mono, monospace; white-space: pre-wrap; }
+.lab-isolation-proof { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; margin: -2px 0 14px; padding: 9px 11px; border: 1px solid #d8e7f8; border-radius: 9px; background: #f4f8fd; font: 10px/1.5 DM Mono, monospace; }
+.lab-isolation-proof strong { color: #315e91; }
+.lab-isolation-proof span { overflow-wrap: anywhere; color: #59718d; }
+.lab-evaluator-form { display: grid; grid-template-columns: minmax(180px, 1fr) auto minmax(150px, .7fr) auto minmax(150px, .7fr) auto; align-items: center; gap: 8px; margin: 0 0 14px; padding: 12px; border: 1px solid #dcd8ff; border-radius: 11px; background: #f8f7ff; }
+.lab-evaluator-form > div { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
+.lab-evaluator-form small { color: var(--muted); font-size: 10px; line-height: 1.4; }
+.lab-evaluator-form label { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; font-size: 11px; font-weight: 700; }
+.lab-evaluator-form label input { width: auto; }
+.lab-evaluator-form > input { min-width: 0; height: 36px; padding: 7px 9px; border: 1px solid var(--border); background: #fff; }
+.lab-evaluator-form > button { display: inline-flex; align-items: center; gap: 5px; }
+.lab-promotion-form { display: grid; grid-template-columns: minmax(180px, .8fr) minmax(180px, 1fr) minmax(220px, 1.3fr) auto; align-items: end; gap: 9px; margin: 0 0 14px; padding: 12px; border: 1px solid #cfe6d6; border-radius: 11px; background: #f4fbf6; }
+.lab-promotion-form > div, .lab-promotion-form label { display: flex; min-width: 0; flex-direction: column; gap: 4px; }
+.lab-promotion-form small { color: var(--muted); font-size: 10px; }
+.lab-promotion-form label { color: #556174; font-size: 10px; font-weight: 700; }
+.lab-promotion-form input { min-width: 0; height: 36px; padding: 7px 9px; border: 1px solid var(--border); background: #fff; }
+.lab-promotion-result { display: flex; flex-wrap: wrap; align-items: center; gap: 7px 12px; margin: 0 0 14px; padding: 10px 12px; border: 1px solid #cde7d7; border-radius: 10px; background: #f2fbf5; font-size: 11px; }
+.lab-promotion-result small { color: #88620e; }
+.lab-evaluations { display: flex; margin: 0 0 14px; flex-direction: column; gap: 7px; }
+.lab-evaluations > article { padding: 10px 12px; border: 1px solid #e4e7ed; border-radius: 10px; background: #fbfcfe; }
+.lab-evaluations > article > div { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }
+.lab-evaluations > article > div > button { display: inline-flex; margin-left: auto; align-items: center; gap: 4px; padding: 5px 7px; font-size: 10px; }
+.lab-evaluations > article > small { display: block; margin-top: 6px; color: var(--muted); font-size: 10px; overflow-wrap: anywhere; }
+.lab-evaluations p { margin: 7px 0 0; color: #9a3232; font: 10px/1.45 DM Mono, monospace; white-space: pre-wrap; }
+.lab-detail-grid { display: grid; grid-template-columns: minmax(240px, .8fr) minmax(320px, 1.2fr); gap: 14px; }
+.lab-detail-grid > section { min-width: 0; padding: 13px; border: 1px solid #e5e8ee; border-radius: 12px; }
+.lab-detail-grid h4 { margin: 0 0 10px; font-size: 13px; }
+.lab-event-list { display: flex; max-height: 310px; margin: 0; padding: 0; flex-direction: column; gap: 5px; overflow: auto; list-style: none; }
+.lab-event-list li { display: grid; grid-template-columns: 30px minmax(0, 1fr); gap: 2px 8px; padding: 7px 8px; border-radius: 7px; background: #f7f8fb; font-size: 11px; }
+.lab-event-list code { grid-row: 1 / 3; color: #6658ed; }
+.lab-event-list small { color: var(--muted); font-size: 9px; }
+.lab-judgments { display: flex; flex-direction: column; gap: 9px; }
+.lab-judgments > article { padding: 11px; border: 1px solid #e3e6ed; border-radius: 9px; background: #fbfcfe; }
+.lab-judgments > article > div { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 9px; }
+.lab-judgments p { margin: 9px 0 0; color: #4f5a6c; font-size: 11px; line-height: 1.5; }
+.lab-bias-warning { display: inline-flex; align-items: center; gap: 4px; padding: 3px 6px; border-radius: 6px; background: #fff3d5; color: #88620e; font-size: 9px; font-weight: 700; }
+.lab-loading { position: fixed; right: 22px; bottom: 22px; z-index: 12; display: inline-flex; align-items: center; gap: 7px; padding: 9px 12px; border-radius: 999px; background: #161d31; color: #fff; box-shadow: 0 8px 24px rgba(15,23,42,.22); font-size: 11px; }
+
+@media (max-width: 1000px) {
+  .lab-layout { grid-template-columns: 190px minmax(0, 1fr); }
+  .lab-design { grid-template-columns: 1fr auto; }
+  .lab-design dl { grid-column: 1 / -1; }
+  .lab-detail-grid { grid-template-columns: 1fr; }
+  .lab-evaluator-form { grid-template-columns: auto minmax(0, 1fr); }
+  .lab-evaluator-form > div, .lab-evaluator-form > button { grid-column: 1 / -1; }
+  .lab-promotion-form { grid-template-columns: 1fr 1fr; }
+  .lab-promotion-form > div { grid-column: 1 / -1; }
+  .lab-skill-picker { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 700px) {
+  .agent-lab .section-head { align-items: flex-start; }
+  .agent-lab .section-head .action-row { width: 100%; justify-content: flex-start; }
+  .lab-scope-note { grid-template-columns: 1fr; }
+  .lab-layout { grid-template-columns: 1fr; }
+  .lab-experiment-list { min-height: 0; max-height: 190px; overflow: auto; }
+  .lab-design { grid-template-columns: 1fr; }
+  .lab-design dl { grid-column: auto; }
+  .lab-design > button { justify-self: start; }
+  .lab-skill-picker { grid-template-columns: 1fr; }
+  .lab-form { grid-template-columns: 1fr; }
+  .lab-form .span-2 { grid-column: auto; }
+  .lab-run-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .lab-detail-head { flex-direction: column; }
+  .lab-evaluator-form { grid-template-columns: 1fr; }
+  .lab-evaluator-form > div, .lab-evaluator-form > button { grid-column: auto; }
+  .lab-promotion-form { grid-template-columns: 1fr; }
+  .lab-promotion-form > div { grid-column: auto; }
+  .lab-loading { right: 12px; bottom: calc(var(--mobile-tabbar-h) + 10px); }
+}
+
+/* 노트북 대응. 브레이크포인트가 1100px·700px뿐이라 폭 1400px대 노트북이 대형 데스크톱과 똑같은 고정
+   치수를 써서, 채팅 화면 위아래로 쌓이는 크롬(헤더 64 + 프로젝트 바 52 + main 여백 44 + workspace-head 66
+   + 모드 탭 46 + 2줄로 접힌 model-bar 78 + composer 78 ≈ 430px)이 세로 700~800px 뷰포트의 절반 이상을
+   먹었다. 병목이 폭이 아니라 높이라서 높이 기준으로 잡고, min-width는 ≤700px 모바일 규칙과 겹치지
+   않게 하기 위한 것이다. */
+@media (min-width: 701px) and (max-height: 900px) {
+  .app-shell > header { height: 52px; }
+  .header-icon-button { width: 30px; height: 30px; min-height: 30px; }
+  .project-bar { height: 44px; padding: 5px 24px; }
+  .project-bar select { height: 32px; }
+  .project-bar .project-delete { width: 32px; height: 32px; }
+  .project-bar > button { min-height: 32px; }
+  /* 좌우 24px는 그대로 둔다. 가로까지 좁히면 오히려 더 꽉 차 보이고, 가로 여유는 사이드바 축소로 만든다. */
+  .main { padding: 12px 24px 14px; }
+  /* min-height 560은 짧은 화면에서 남은 높이보다 커져 문서 자체에 스크롤을 만들었다. */
+  .chat-layout { gap: 12px; min-height: 0; grid-template-columns: 240px minmax(0, 1fr); }
+  .chat-layout.has-approvals { grid-template-columns: 240px minmax(0, 1fr) 260px; }
+  .chat-item { min-height: 56px; padding: 8px 9px; }
+  .workspace-head { min-height: 52px; padding: 7px 14px; }
+  .workspace-head h2 { font-size: 15px; }
+  .chat-view-tabs { padding: 4px 10px; }
+  .chat-view-tabs button { min-height: 28px; padding: 3px 11px; }
+  /* 노트북 폭에서는 model-bar가 두 줄로 접혀 한 줄을 더 먹으므로, 모바일에 이미 있는 요약 한 줄 +
+     '자세히 ▾' 펼치기를 그대로 재사용한다(마크업·상태는 공용이라 CSS 표시 규칙만 바꾼다). */
+  .model-bar-summary { display: flex; }
+  .model-bar { display: none; padding: 8px 14px; gap: 6px 12px; }
+  .model-bar.expanded { display: flex; }
+  .model-bar button { margin-left: 0; }
+  .conversation .messages { padding: 16px 18px; }
+  .composer { gap: 6px; padding: 9px 12px; }
+  .composer textarea { min-height: 40px; }
+  .composer .primary, .composer .danger { min-height: 40px; }
 }

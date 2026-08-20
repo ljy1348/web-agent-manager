@@ -20,6 +20,7 @@ test("채팅·터미널 모드 전환과 모바일 채팅 메뉴를 렌더링한
   const terminalScrolls: number[] = [];
   const terminalRowRequests: number[] = [];
   const projectImageRequests: string[] = [];
+  const pastedTextUploadBodies: string[] = [];
   let pushTerminalOutput: (data: string) => void = () => undefined;
   await page.routeWebSocket("**/ws", (webSocket) => {
     pushTerminalOutput = (data) => webSocket.send(JSON.stringify({ type: "terminal_output", payload: { chatId: 1, data } }));
@@ -53,7 +54,8 @@ test("채팅·터미널 모드 전환과 모바일 채팅 메뉴를 렌더링한
       "/api/auth/me": { user: { id: 1, username: "ui-test", role: "admin", chat_view_mode: chatViewMode }, csrfToken: "ui-test" },
       "/api/providers": { providers: [{ id: "codex", label: "Codex", usageWindowId: "weekly", supportsPermissionMode: false }, { id: "claude", label: "Claude", usageWindowId: "session", supportsPermissionMode: true }] },
       "/api/projects": { projects: [{ id: 1, name: "샘플 프로젝트", path: "/home/testuser/myagent" }] },
-      "/api/usage": { usage: [] },
+      // 접힌 상태에서도 사용량·초기화 시각이 남는지 보려면 실제 사용량 구간이 있어야 한다.
+      "/api/usage": { usage: [{ provider: "codex", monitor_status: "ready", data_status: "fresh", used_percent: 12, remaining_percent: 88, reset_at: "1:40pm (Asia/Seoul)", details_json: JSON.stringify({ windows: [{ id: "weekly", label: "Current week", usedPercent: 12, remainingPercent: 88, resetAt: "1:40pm (Asia/Seoul)" }] }) }] },
       "/api/system": { latest: null },
       "/api/runtime": { codex: "disabled", claude: "disabled" },
       "/api/slack": { enabled: false },
@@ -79,6 +81,11 @@ test("채팅·터미널 모드 전환과 모바일 채팅 메뉴를 렌더링한
     }
     if (pathname === "/api/chats/1/messages") {
       await route.fulfill({ json: { messages: [{ id: "u1", role: "user", kind: "text", content: "모바일에서도 채팅에 집중하고 싶어." }, { id: "a1", role: "assistant", kind: "text", content: "프로젝트와 새 채팅은 햄버거 메뉴에서 관리할 수 있습니다. very_long_unbroken_response_text_that_must_wrap_without_horizontal_scrolling\n```diff\n-old line\n+new line\n```" }, { id: "t1", role: "tool", kind: "function_call_output", content: "diff --git a/file b/file\n도구 실행 결과" }, { id: "a2", role: "assistant", kind: "text", content: "화면 확인: [첨부: artifacts/missing.png]" }, { id: "a3", role: "assistant", kind: "text", content: "상대 경로: [첨부: artifacts/relative.png]\n절대 경로: [첨부: /home/testuser/myagent/artifacts/absolute.png]" }] } });
+      return;
+    }
+    if (pathname === "/api/chats/1/attachments" && route.request().method() === "POST") {
+      pastedTextUploadBodies.push(route.request().postDataBuffer()?.toString("utf8") ?? "");
+      await route.fulfill({ status: 201, json: { uploads: [{ name: "pasted-text.txt", path: ".web-agent-manager-uploads/1/pasted-text.txt", size: 5000 }] } });
       return;
     }
     if (pathname.startsWith("/api/projects/1/files/content/artifacts/")) {
@@ -159,6 +166,17 @@ test("채팅·터미널 모드 전환과 모바일 채팅 메뉴를 렌더링한
   await changeDetails.click();
   await expect(changeContent).toBeVisible();
   await changeDetails.click();
+  // 1,000자를 넘는 텍스트 붙여넣기는 textarea에 직접 넣지 않고 기존 채팅 첨부 API로 파일화한다.
+  const longPaste = "긴붙여넣기".repeat(201);
+  await page.getByPlaceholder("질문을 입력하세요").evaluate((element, pastedText) => {
+    const transfer = new DataTransfer();
+    transfer.setData("text/plain", pastedText);
+    element.dispatchEvent(new ClipboardEvent("paste", { clipboardData: transfer, bubbles: true, cancelable: true }));
+  }, longPaste);
+  await expect.poll(() => pastedTextUploadBodies.length).toBe(1);
+  expect(pastedTextUploadBodies[0]).toContain(longPaste.slice(0, 30));
+  expect(pastedTextUploadBodies[0]).toContain("pasted-text-");
+  await expect(page.getByPlaceholder("질문을 입력하세요")).toHaveValue("[첨부: .web-agent-manager-uploads/1/pasted-text.txt]");
   await page.getByRole("button", { name: "터미널 모드" }).click();
   await expect(page.getByLabel("채팅 터미널")).toBeVisible();
   await expect(page.locator(".terminal-host .xterm-rows")).toContainText("원본 터미널 출력");
@@ -217,6 +235,26 @@ test("채팅·터미널 모드 전환과 모바일 채팅 메뉴를 렌더링한
   await expect(page.locator(".conversation")).toBeVisible();
   expect(chatViewModeRequests).toEqual(["terminal", "chat"]);
 
+  // 노트북(세로 ≤900px)에서는 뷰포트가 100px 더 짧아지는데도 헤더·여백·model-bar를 압축하므로
+  // 대화 영역은 오히려 넓어져야 한다. 문서 스크롤이 생기지 않는 것도 함께 본다.
+  const messagesHeight = async (): Promise<number> => page.locator(".conversation .messages").evaluate((element) => element.clientHeight);
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  const desktopMessages = await messagesHeight();
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await expect(page.locator(".model-bar-summary")).toBeVisible();
+  await expect(page.locator(".model-bar")).toBeHidden();
+  // 접어도 사용량과 초기화 시각은 남아야 한다(펼쳐야만 보이면 평소 확인하던 값이 사라진다).
+  await expect(page.locator(".model-bar-summary")).toContainText("사용량 12% · 초기화 1:40pm (Asia/Seoul)");
+  expect(await messagesHeight()).toBeGreaterThan(desktopMessages);
+  expect(await page.evaluate(() => document.documentElement.scrollHeight - document.documentElement.clientHeight)).toBe(0);
+  await page.screenshot({ path: "artifacts/ui-chat-laptop.png", fullPage: true });
+  // 접어둔 model-bar는 요약 줄의 '자세히'로 그대로 펼쳐 모델·권한 설정을 쓸 수 있어야 한다.
+  await page.getByRole("button", { name: "자세히 ▾" }).click();
+  await expect(page.locator(".model-bar")).toBeVisible();
+  await expect(page.getByLabel("도구·diff 상세 보기")).toBeVisible();
+  await page.getByRole("button", { name: "접기 ▴" }).click();
+  await page.setViewportSize({ width: 1440, height: 1000 });
+
   await page.setViewportSize({ width: 390, height: 844 });
   await page.reload();
   await expect(page.locator(".workspace")).toBeVisible();
@@ -239,6 +277,9 @@ test("채팅·터미널 모드 전환과 모바일 채팅 메뉴를 렌더링한
   await expect(page.locator(".model-bar")).toBeHidden();
   const summaryHeight = await page.locator(".model-bar-summary").evaluate((element) => element.getBoundingClientRect().height);
   expect(summaryHeight).toBeLessThan(50);
+  // 390px에서는 초기화 시각까지 넣으면 한 줄을 넘겨 모델명이 과하게 잘리므로 퍼센트만 남긴다.
+  await expect(page.locator(".model-bar-summary")).toContainText("사용량 12%");
+  await expect(page.locator(".model-bar-summary .summary-reset")).toBeHidden();
   await page.locator(".model-bar-summary button").click();
   await expect(page.locator(".model-bar")).toBeVisible();
   await page.locator(".model-bar-summary button").click();
@@ -1045,6 +1086,7 @@ test("채팅의 프로젝트 파일 링크는 파일 탭 미리보기로 이동�
   await expect(page.locator(".file-row")).toHaveCount(rootEntries.length);
   await expect(page.locator(".file-preview strong")).toHaveText("README.md");
   await expect(page.locator(".file-preview-markdown h1")).toHaveText("프로젝트 안내");
+  await expect(page.locator(".file-preview").getByRole("link", { name: "README.md 다운로드" })).toHaveAttribute("href", "/api/projects/1/files/download?path=README.md&chatId=1");
   fs.mkdirSync("artifacts", { recursive: true });
   await page.screenshot({ path: "artifacts/ui-file-markdown-preview.png", fullPage: true });
   await page.getByRole("button", { name: "파일 미리보기: archive.zip" }).click();
@@ -1246,7 +1288,7 @@ test("대시보드에서 사용량 카드마다 터미널 스냅샷을 볼 수 �
       "/api/slack": { enabled: false },
       "/api/approvals": { approvals: [] },
       "/api/chats": { chats: [] },
-      "/api/usage": { usage: [{ provider: "claude", monitor_status: "ready", data_status: "fresh", used_percent: 29, remaining_percent: 71, reset_at: "Jul 18", details_json: JSON.stringify({ windows: [{ id: "weekly_all", label: "Current week (all models)", usedPercent: 29, remainingPercent: 71, resetAt: "Jul 18" }] }) }] },
+      "/api/usage": { usage: [{ provider: "claude", monitor_status: "ready", data_status: "fresh", used_percent: 29, remaining_percent: 71, reset_at: "Jul 18", keepalive_sent_at: "2026-08-11T03:40:00.000Z", keepalive_reason: "claude_session_missing", details_json: JSON.stringify({ windows: [{ id: "weekly_all", label: "Current week (all models)", usedPercent: 29, remainingPercent: 71, resetAt: "Jul 18" }] }) }] },
       "/api/usage/claude/snapshot": { snapshot: { text: "Current week (all models): 29% used\n(세션 창 없음 — 실제 CLI 화면)", capturedAt: "2026-07-12T03:00:29.697Z" } },
     };
     if (pathname in responses) {
@@ -1259,19 +1301,78 @@ test("대시보드에서 사용량 카드마다 터미널 스냅샷을 볼 수 �
 
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "운영 대시보드" })).toBeVisible();
+  await expect(page.getByText("세션 유지 단답", { exact: false })).toContainText("Claude 세션 창 없음");
+  await expect(page.getByText("세션 유지 단답", { exact: false })).toContainText("마지막 전송");
   await expect(page.getByText("터미널 스냅샷")).toHaveCount(0);
   await page.getByRole("button", { name: "터미널 보기" }).click();
   expect(snapshotRequests).toHaveLength(1);
   await expect(page.getByText("터미널 스냅샷")).toBeVisible();
-  await expect(page.getByText("세션 창 없음", { exact: false })).toBeVisible();
+  await expect(page.locator(".usage-snapshot-text")).toContainText("세션 창 없음");
   fs.mkdirSync("artifacts", { recursive: true });
   await page.screenshot({ path: "artifacts/ui-usage-snapshot.png" });
   await page.getByRole("button", { name: "닫기" }).click();
   await expect(page.getByText("터미널 스냅샷")).toHaveCount(0);
 });
 
+test("대시보드에서 Codex 초기화권을 확인 후 사용하고 채팅은 터미널 종료 경로를 사용한다", async ({ page }) => {
+  const terminalStops: string[] = [];
+  const processKills: string[] = [];
+  const resetCreditRedemptions: Array<{ path: string; accountId: number }> = [];
+  const dialogs: string[] = [];
+  page.on("dialog", async (dialog) => { dialogs.push(dialog.message()); await dialog.accept(); });
+  await page.route("**/api/**", async (route) => {
+    const pathname = new URL(route.request().url()).pathname;
+    const responses: Record<string, unknown> = {
+      "/api/auth/me": { user: { id: 1, username: "ui-test", role: "admin" }, csrfToken: "ui-test" },
+      "/api/providers": { providers: [{ id: "codex", label: "Codex", usageWindowId: "weekly", supportsPermissionMode: false }] },
+      "/api/projects": { projects: [{ id: 1, name: "샘플 프로젝트", path: "/home/testuser/myagent" }] },
+      "/api/chats": { chats: [] },
+      "/api/usage": { usage: [{ provider: "codex", account_id: 1, monitor_status: "ready", data_status: "fresh", last_checked_at: "2026-08-11T01:30:00.000Z", details_json: JSON.stringify({ windows: [{ id: "weekly", label: "Weekly limit", usedPercent: 1, remainingPercent: 99, resetAt: "17:37 on 18 Aug" }], rateLimitResetCredits: { availableCount: 1, expiresAt: "2026-08-12T17:28:18.000Z" } }) }] },
+      "/api/system": { latest: { cpuPercent: 1, memory: { total: 100, available: 50 }, disks: [], processes: [{ pid: 1234, name: "codex", cpu: 2, memory: 1024, chat: { chatId: 9, provider: "codex", title: "초기화권 표시", projectId: 1, projectName: "샘플 프로젝트" }, group: { kind: "chat", key: "chat:9", label: "샘플 프로젝트 · 초기화권 표시" } }] } },
+      "/api/runtime": { codex: "0.146.0", claude: "disabled" },
+      "/api/slack": { enabled: false },
+      "/api/ntfy": { enabled: false },
+      "/api/approvals": { approvals: [] },
+    };
+    if (pathname in responses) {
+      await route.fulfill({ json: responses[pathname] });
+      return;
+    }
+    if (pathname === "/api/chats/9/stop" && route.request().method() === "POST") {
+      terminalStops.push(pathname);
+      await route.fulfill({ status: 204, body: "" });
+      return;
+    }
+    if (pathname === "/api/usage/codex/reset-credit/redeem" && route.request().method() === "POST") {
+      resetCreditRedemptions.push({ path: pathname, accountId: route.request().postDataJSON().accountId });
+      await route.fulfill({ json: { outcome: "reset", credits: { availableCount: 0, expiresAt: null } } });
+      return;
+    }
+    if (pathname.includes("/system/processes/") && route.request().method() === "POST") {
+      processKills.push(pathname);
+      await route.fulfill({ json: { accepted: true } });
+      return;
+    }
+    await route.fulfill({ json: {} });
+  });
+
+  await page.goto("/");
+  await expect(page.getByText("초기화권", { exact: true })).toBeVisible();
+  await expect(page.locator(".usage-reset-credits")).toContainText("1개");
+  await expect(page.locator(".usage-reset-credits span")).toHaveText(/기한 .*\d/);
+  await page.getByRole("button", { name: "사용하기" }).click();
+  await expect.poll(() => resetCreditRedemptions).toEqual([{ path: "/api/usage/codex/reset-credit/redeem", accountId: 1 }]);
+  expect(dialogs.some((message) => message.includes("맨 위 Full reset") && message.includes("되돌릴 수 없습니다"))).toBe(true);
+  await expect(page.getByRole("button", { name: "묶음 종료" })).toHaveCount(0);
+  await page.getByRole("button", { name: "터미널 종료" }).click();
+  await expect.poll(() => terminalStops).toEqual(["/api/chats/9/stop"]);
+  expect(processKills).toHaveLength(0);
+});
+
 test("채팅과 GitHub 탭에서 채팅별 브랜치와 worktree를 전환한다", async ({ page }) => {
   const branchRequests: Record<string, unknown>[] = [];
+  const worktreeChatRequests: Record<string, unknown>[] = [];
+  const diffRequests: string[] = [];
   let workspace = {
     chatId: 11,
     branch: "main",
@@ -1294,11 +1395,12 @@ test("채팅과 GitHub 탭에서 채팅별 브랜치와 worktree를 전환한다
       "/api/projects": { projects: [{ id: 1, name: "샘플 프로젝트", path: "/workspace/sample" }] },
       "/api/chats": { chats: [{ id: 11, project_id: 1, provider: "codex", status: "stopped", title: "브랜치 작업", git_branch: workspace.branch, worktree_path: workspace.mode === "worktree" ? workspace.path : null }] },
       "/api/chats/11/messages": { messages: [], hasMore: false },
+      "/api/chats/12/messages": { messages: [], hasMore: false },
       "/api/projects/1/session-backups": { backups: [] },
       "/api/models/codex": { options: { provider: "codex", models: [], efforts: [] } },
       "/api/projects/1/git": { status: `## ${workspace.branch}`, commits: [], remotes: "" },
-      "/api/projects/1/git/changes": { changes: [] },
-      "/api/projects/1/git/diff": { diff: "" },
+      "/api/projects/1/git/changes": { changes: [{ path: "src/selected.ts", indexStatus: " ", worktreeStatus: "M" }, { path: "src/deleted.ts", indexStatus: " ", worktreeStatus: "D" }] },
+      "/api/projects/1/git/workspaces": { workspaces: [{ path: "/workspace/sample", branch: "main", main: true, appManaged: false, assignedChatId: null }, ...workspace.worktrees] },
       "/api/projects/1/github/repositories": { repositories: [], organizations: [] },
       "/api/usage": { usage: [] },
       "/api/system": { latest: null },
@@ -1311,11 +1413,22 @@ test("채팅과 GitHub 탭에서 채팅별 브랜치와 worktree를 전환한다
       await route.fulfill({ json: workspace });
       return;
     }
+    if (pathname === "/api/chats/worktree" && route.request().method() === "POST") {
+      worktreeChatRequests.push(JSON.parse(route.request().postData() || "{}"));
+      await route.fulfill({ status: 201, json: { chat: { id: 12, project_id: 1, provider: "codex", status: "stopped", title: "feature/agent 작업", git_branch: "feature/agent", worktree_path: "/workspace/agent-worktree" } } });
+      return;
+    }
     if (pathname === "/api/projects/1/git/branch" && route.request().method() === "POST") {
       const body = JSON.parse(route.request().postData() || "{}");
       branchRequests.push(body);
       workspace = { ...workspace, branch: String(body.branch), mode: body.mode, path: body.mode === "worktree" ? "/data/git-worktrees/1/11" : "/workspace/sample" };
       await route.fulfill({ json: workspace });
+      return;
+    }
+    if (pathname === "/api/projects/1/git/diff") {
+      diffRequests.push(url.search);
+      const deletedDiff = url.searchParams.getAll("file").includes("src/deleted.ts") ? "\ndiff --git a/src/deleted.ts b/src/deleted.ts\n--- a/src/deleted.ts\n+++ /dev/null\n@@ -1 +0,0 @@\n-deleted change" : "";
+      await route.fulfill({ json: { diff: `diff --git a/src/selected.ts b/src/selected.ts\n--- a/src/selected.ts\n+++ b/src/selected.ts\n@@ -1 +1 @@\n-old\n+selected change${deletedDiff}` } });
       return;
     }
     if (pathname in responses) {
@@ -1327,6 +1440,15 @@ test("채팅과 GitHub 탭에서 채팅별 브랜치와 worktree를 전환한다
 
   await page.goto("/");
   await page.getByRole("button", { name: "채팅", exact: true }).click();
+  // 채팅이 하나도 없는 worktree도 묶음으로 남아야 한다. 채팅 목록만으로 묶음을 만들면 워크트리가
+  // 지워진 것인지 채팅만 없는 것인지 화면에서 구분할 수 없다.
+  const emptyGroup = page.locator(".chat-list .chat-group").filter({ hasText: "feature/agent 워크트리" });
+  await expect(emptyGroup.locator(".chat-group-count")).toHaveText("0");
+  await expect(emptyGroup.locator(".chat-group-empty")).toBeVisible();
+  await emptyGroup.getByRole("button", { name: "+ Codex" }).click();
+  // 브랜치만 넘기면 앱 관리 경로에 새 worktree를 만들려 하므로, 기존 폴더 경로를 함께 보내야 한다.
+  expect(worktreeChatRequests).toEqual([{ projectId: 1, provider: "codex", accountId: null, branch: "feature/agent", worktreePath: "/workspace/agent-worktree", create: false, title: "feature/agent 작업" }]);
+  await page.locator(".chat-list .chat-item").filter({ hasText: "브랜치 작업" }).click();
   const chatControl = page.locator(".workspace .git-branch-control");
   await expect(page.locator(".workspace > .git-branch-control")).toHaveCount(0);
   await expect(chatControl.locator(".git-branch-trigger code")).toHaveText("main");
@@ -1352,7 +1474,19 @@ test("채팅과 GitHub 탭에서 채팅별 브랜치와 worktree를 전환한다
   const gitControl = page.locator(".git-page > .git-branch-control");
   await expect(gitControl.locator(".git-branch-trigger code")).toHaveText("feature/existing");
   await expect(page.getByRole("heading", { name: "최근 커밋" })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "전체 diff" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "파일 diff" })).toBeVisible();
+  await expect(page.getByText("변경 파일을 선택하면", { exact: false })).toBeVisible();
+  expect(diffRequests).toHaveLength(0);
+  await page.getByRole("checkbox", { name: /src\/selected\.ts/ }).check();
+  await expect(page.getByRole("heading", { name: "선택 파일 diff (1)" })).toBeVisible();
+  await expect(page.getByText("selected change", { exact: false })).toBeVisible();
+  expect(diffRequests).toHaveLength(1);
+  expect(new URLSearchParams(diffRequests[0]).getAll("file")).toEqual(["src/selected.ts"]);
+  await page.getByRole("checkbox", { name: /src\/deleted\.ts/ }).check();
+  await expect(page.getByRole("heading", { name: "선택 파일 diff (2)" })).toBeVisible();
+  await expect(page.getByText("deleted change", { exact: false })).toBeVisible();
+  expect(diffRequests).toHaveLength(2);
+  expect(new URLSearchParams(diffRequests[1]).getAll("file")).toEqual(["src/selected.ts", "src/deleted.ts"]);
   await expect(page.getByRole("button", { name: "브랜치 변경" })).toHaveCount(0);
   expect(await gitControl.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
   await page.setViewportSize({ width: 390, height: 844 });
@@ -1412,6 +1546,171 @@ test("지침 편집기와 도구 상세를 데스크톱·모바일에서 렌더�
   await expect(page.locator(".code-editor")).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   await page.screenshot({ path: "artifacts/ui-instructions-mobile.png", fullPage: true });
+});
+
+test("Agent Lab에서 Variant 비교와 evaluator provenance를 표시한다", async ({ page }) => {
+  const experiment = {
+    id: "experiment-1", projectId: 1, name: "스킬 유무 비교", command: "기능을 구현해",
+    taskKind: "maintenance", fixtureId: "fixture-1",
+    design: {
+      schemaVersion: 1, hypothesis: "review 스킬이 성공률을 높인다",
+      controlledVariables: ["runtime.model", "budget"], treatmentVariables: ["skills.mode"],
+      repetitions: 5, randomizeOrder: true,
+    },
+    variants: [
+      {
+        id: "variant-1", name: "Codex High + Skills",
+        config: { runtime: { provider: "codex", model: "gpt-test", reasoningEffort: "high" }, skills: { mode: "all", profile: "isolated_overlay", baseline: "installed", additions: ["lab:review-plus"] } },
+        runs: [{
+          id: "run-1", attempt: 3, status: "completed", totalTokens: 12400, totalTokensSource: "reported", costUsd: 0.43,
+          startedAt: "2026-08-13 09:00:00", finishedAt: "2026-08-13 09:01:00", judgmentSummary: { count: 1, meanScore: 0.91 },
+          waitedSeconds: 20, waitCount: 1,
+          checkStatus: "passed", checkExitCode: 0, checkDurationMs: 12_000,
+        }],
+      },
+      {
+        id: "variant-2", name: "Codex High · Skills off",
+        config: { runtime: { provider: "codex", model: "gpt-test", reasoningEffort: "high" }, skills: { mode: "none", profile: "isolated_overlay", baseline: "clean", additions: [] } },
+        runs: [{ id: "run-2", attempt: 2, status: "failed", totalTokens: 9800, costUsd: 0.31 }],
+      },
+    ],
+  };
+  await page.route("**/api/**", async (route) => {
+    const pathname = new URL(route.request().url()).pathname;
+    const responses: Record<string, unknown> = {
+      "/api/auth/me": { user: { id: 1, username: "ui-test", role: "admin" }, csrfToken: "ui-test" },
+      "/api/providers": { providers: [{ id: "codex", label: "Codex" }, { id: "claude", label: "Claude" }] },
+      "/api/projects": { projects: [{ id: 1, name: "샘플 프로젝트", path: "/home/testuser/myagent" }] },
+      "/api/chats": { chats: [] },
+      "/api/usage": { usage: [] },
+      "/api/system": { latest: null },
+      "/api/runtime": { codex: "test", claude: "test" },
+      "/api/slack": { enabled: false },
+      "/api/ntfy": { enabled: false },
+      "/api/approvals": { approvals: [] },
+      "/api/projects/1/experiments": { experiments: [experiment] },
+      "/api/projects/1/experiment-fixtures": { fixtures: [
+        { id: "fixture-1", name: "django", sizeClass: "large", status: "ready", pinnedCommit: "a".repeat(40) },
+      ] },
+      "/api/experiments/experiment-1/summary": {
+        variants: [
+          { variantId: "variant-1", name: "Codex High + Skills", completedRuns: 3, checkPassRate: 1, totalTokenMedian: 12400 },
+          { variantId: "variant-2", name: "Codex High · Skills off", completedRuns: 3, checkPassRate: 0.33, totalTokenMedian: 9800 },
+        ],
+        recommendation: {
+          grade: "confirmed", winnerVariantId: "variant-1", runnerUpVariantId: "variant-2",
+          criterion: "deterministic_check", costMultiple: 1.2653,
+          reason: "결정적 검사 통과율에서 Codex High + Skills이 우세합니다(표본 3회).",
+        },
+      },
+      "/api/projects/1/experiment-skills": { candidates: [
+        { id: "installed:project:wam", name: "wam", source: "installed", scope: "project", includedByDefault: true },
+        { id: "lab:review-plus", name: "review-plus", source: "project_lab", scope: "lab", includedByDefault: false },
+      ] },
+      "/api/experiment-runs/run-1": {
+        run: {
+          ...experiment.variants[0].runs[0],
+          configSnapshot: { runtime: { provider: "codex", model: "gpt-test" } },
+          terminationReason: "success", error: null,
+          environmentSnapshot: { skillIsolation: {
+            profile: "isolated_overlay", baseline: "installed", additions: [{ id: "lab:review-plus" }],
+            controlFingerprint: "a".repeat(64), digest: "b".repeat(64),
+          } },
+        },
+        nodes: [{ id: "node-1", role: "worker", status: "completed" }],
+        events: [{ id: "event-1", sequence: 1, type: "run.preparing", createdAt: "2026-08-13 09:00:00" }, { id: "event-2", sequence: 2, type: "runtime.completed", createdAt: "2026-08-13 09:01:00" }],
+        checkpoint: null,
+        evaluations: [{
+          id: "evaluation-1", method: "rubric", status: "partial", error: "Codex judge: JSON 형식 오류",
+          calls: [
+            { id: "call-1", evaluatorLabel: "Claude judge", status: "completed", totalTokens: 880, costUsd: 0.018 },
+            { id: "call-2", evaluatorLabel: "Codex judge", status: "failed", totalTokens: 420, costUsd: null },
+          ],
+        }],
+        judgments: [{
+          id: "judgment-1", evaluatorLabel: "Claude judge", evaluatorKind: "agent",
+          evaluatorProvider: "claude", evaluatorModel: "sonnet-test", evaluatorFamily: "claude",
+          subjectProvider: "claude", subjectModel: "sonnet-subject", subjectFamily: "claude", sameFamily: true,
+          blindLabel: "result-b", presentationOrder: 2, score: 0.91, confidence: 0.8,
+          result: { reason: "요건과 테스트를 모두 충족했습니다." },
+        }],
+      },
+      "/api/experiment-runs/run-1/promote": {
+        preset: {
+          id: "preset-1", name: "스킬 유무 비교 우승", status: "active", activeVersion: 1,
+          versions: [{ version: 1, promotionMetrics: { successRate: 1, sampleSize: 1 }, compatibility: { status: "warning", warnings: ["표본이 2회 미만입니다."] } }],
+        },
+      },
+    };
+    if (pathname in responses) {
+      await route.fulfill({ json: responses[pathname] });
+      return;
+    }
+    await route.fulfill({ json: {} });
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "실험실", exact: true }).first().click();
+  await expect(page.getByRole("heading", { name: "조건을 바꿔 실행하고, 측정하고, 판단합니다" })).toBeVisible();
+  await expect(page.getByRole("table").getByText("Codex High + Skills", { exact: true })).toBeVisible();
+  await expect(page.getByText("1.2만")).toBeVisible();
+  await expect(page.getByRole("cell", { name: /91점 1 judgments/ })).toBeVisible();
+  // 벽시계 1분 중 한도 대기 20초를 빼 실작업 40초로 보여야 한다.
+  await expect(page.getByRole("cell", { name: /40초 실작업 · 한도 대기 1회 20초 제외/ })).toBeVisible();
+  // 완성도의 1차 지표인 fixture 검증 명령 결과가 rubric 점수보다 앞에 보여야 한다.
+  await expect(page.getByRole("cell", { name: /통과 12초/ })).toBeVisible();
+  await expect(page.getByRole("cell", { name: /- 검증 없음/ })).toBeVisible();
+  // 표와 점수는 재료일 뿐이라 어떤 기준으로 갈렸는지와 표본 충분 여부를 함께 보여야 한다.
+  await expect(page.getByText("확증", { exact: true })).toBeVisible();
+  await expect(page.getByText(/기준 결정적 검사 · 기준선 대비 토큰 1.27배/)).toBeVisible();
+  await expect(page.getByText(/통과율에서 Codex High \+ Skills이 우세/)).toBeVisible();
+  // 과제 유형과 대상 저장소가 실험 목록에 드러나야 어떤 상황의 결과인지 알 수 있다.
+  await expect(page.getByText("유지보수", { exact: true })).toBeVisible();
+  await expect(page.getByText("대형 · django", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: /계획 실행 · 5회 교차/ })).toBeVisible();
+  await expect(page.getByText(/대기 후 재개한 run은 캐시·턴 구조가 달라져 토큰 지표가 오염될 수 있습니다/)).toBeVisible();
+  await page.getByRole("button", { name: "Variant 추가" }).click();
+  await expect(page.getByRole("checkbox", { name: /review-plus/ })).toBeVisible();
+  await expect(page.getByRole("checkbox", { name: /wam/ })).toBeDisabled();
+  await page.getByRole("checkbox", { name: /review-plus/ }).check();
+  await page.locator(".lab-form label").filter({ hasText: /^Provider/ }).locator("select").selectOption("claude");
+  await expect(page.getByLabel("추가 스킬 활성화")).toBeVisible();
+  await page.getByLabel("추가 스킬 활성화").selectOption("session_start");
+  await expect(page.getByLabel("추가 스킬 활성화")).toHaveValue("session_start");
+  fs.mkdirSync("artifacts", { recursive: true });
+  await page.screenshot({ path: "artifacts/ui-agent-lab-skill-form.png", fullPage: true });
+  await page.getByLabel("Harness").selectOption("orchestrator_worker");
+  await expect(page.getByText(/선택 추가 overlay는 Single/)).toBeVisible();
+  await expect(page.getByLabel("Secondary provider")).toBeVisible();
+  await expect(page.getByLabel("Worker 수")).toHaveValue("2");
+  fs.mkdirSync("artifacts", { recursive: true });
+  await page.screenshot({ path: "artifacts/ui-agent-lab-harness-form.png", fullPage: true });
+  await page.getByRole("button", { name: "Variant 추가" }).click();
+  await page.locator(".lab-run-link").first().click();
+  await expect(page.getByText("Claude judge", { exact: true })).toBeVisible();
+  await expect(page.getByText("피험 모델과 동일 계열", { exact: true })).toBeVisible();
+  await expect(page.getByText("result-b / 2", { exact: true })).toBeVisible();
+  await expect(page.getByText("요건과 테스트를 모두 충족했습니다.", { exact: true })).toBeVisible();
+  await expect(page.getByText("부분 성공", { exact: true })).toBeVisible();
+  await expect(page.getByText(/Claude judge: completed/)).toBeVisible();
+  await page.getByRole("button", { name: "복수 평가" }).click();
+  await expect(page.getByText("블라인드 rubric 평가", { exact: true })).toBeVisible();
+  await expect(page.getByLabel("Codex evaluator model")).toBeVisible();
+  await expect(page.getByLabel("Claude evaluator model")).toBeVisible();
+  await page.getByRole("button", { name: "프리셋 승격" }).click();
+  await expect(page.getByText("Winner promotion", { exact: true })).toBeVisible();
+  await page.getByLabel("선택 근거").fill("품질 우선");
+  await page.getByRole("button", { name: "활성 프리셋으로 승격" }).click();
+  await expect(page.getByText("스킬 유무 비교 우승 · v1", { exact: true })).toBeVisible();
+  await expect(page.getByText("⚠ 표본이 2회 미만입니다.", { exact: true })).toBeVisible();
+  expect(await page.locator(".agent-lab").evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
+  fs.mkdirSync("artifacts", { recursive: true });
+  await page.screenshot({ path: "artifacts/ui-agent-lab.png", fullPage: true });
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(page.locator(".mobile-tabbar").getByRole("button", { name: "실험실", exact: true })).toBeVisible();
+  expect(await page.locator("body").evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
+  await page.screenshot({ path: "artifacts/ui-agent-lab-mobile.png", fullPage: true });
 });
 
 test("로그인 화면을 데스크톱·모바일에서 렌더링한다", async ({ page }) => {

@@ -24,6 +24,10 @@ export interface AppConfig {
     topic?: string;
     serverUrl: string;
   };
+  fcm?: {
+    enabled: boolean;
+    projectId?: string;
+  };
 }
 
 // 새 제품 환경변수를 우선하고 기존 MyAgent 변수는 업그레이드 호환값으로 읽는다.
@@ -85,6 +89,10 @@ export function loadConfig(): AppConfig {
     ntfy: {
       topic: process.env.NTFY_TOPIC,
       serverUrl: process.env.NTFY_SERVER_URL || "https://ntfy.sh",
+    },
+    fcm: {
+      enabled: readProductEnv("FCM_ENABLED") === "1",
+      projectId: readProductEnv("FCM_PROJECT_ID"),
     },
   };
 }

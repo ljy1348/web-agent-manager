@@ -83,8 +83,9 @@ export function requireTrustedNetwork(request: AuthenticatedRequest, response: R
 export function createNetworkCapability(trustedNetworks: string[], trustProxyConfigured = false) {
   const blockList = createBlockList(trustedNetworks);
   return (request: AuthenticatedRequest, _response: Response, next: NextFunction): void => {
-    request.trustedNetwork = !isUnverifiedProxyRequest(request, trustProxyConfigured)
+    request.networkOriginTrusted = !isUnverifiedProxyRequest(request, trustProxyConfigured)
       && checkBlockList(request.ip || request.socket.remoteAddress, blockList);
+    request.trustedNetwork = request.networkOriginTrusted;
     next();
   };
 }

@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ClaudeAdapter } from "../src/server/providers/claude";
 import type { TmuxIO } from "../src/server/providers/provider";
+import { USAGE_KEEPALIVE_PROMPT } from "../src/shared/usage-keepalive";
 
 // ~/.claude/sessions/<pid>.json을 임시 디렉터리로 흉내내기 위해 os.homedir()을 잠깐 바꿔치기한다.
 function withFakeClaudeSessionsDir(entries: Record<string, unknown>[]): void {
@@ -39,6 +40,7 @@ describe("Claude 세션 기록 파싱", () => {
     const adapter = new ClaudeAdapter("/tmp/settings.json", { WAM_HOOK: "enabled" });
     expect(adapter.createMonitorLaunch("/tmp")).toEqual({ command: "claude", args: ["--safe-mode", "--ax-screen-reader"] });
     expect(adapter.createLaunch("/tmp").args).toEqual(["--settings", "/tmp/settings.json"]);
+    expect(adapter.promptQuirks).toMatchObject({ pasteSubmitDelayMs: 160, verifyPromptSubmission: true });
   });
 
   it("도구 실행 결과 턴을 user가 아닌 tool 역할로 분류한다", () => {
@@ -129,6 +131,33 @@ describe("Claude 세션 기록 파싱", () => {
     fs.writeFileSync(file, lines.map((line) => JSON.stringify(line)).join("\n"));
     const session = new ClaudeAdapter("", {}).parseHistoryFile(file);
     expect(session?.model).toBe("Sonnet 5");
+  });
+
+  it("assistant 응답의 입력·캐시·출력 토큰 사용량을 보존한다", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-history-"));
+    const file = path.join(dir, "session.jsonl");
+    const lines = [
+      { type: "user", sessionId: "s1", cwd: "/home/testuser/web-agent-manager", message: { content: "ㅎㅇ" }, timestamp: "2026-07-06T00:00:00.000Z" },
+      {
+        type: "assistant",
+        message: {
+          content: [{ type: "text", text: "1" }],
+          usage: { input_tokens: 2, cache_creation_input_tokens: 6519, cache_read_input_tokens: 13740, output_tokens: 3 },
+        },
+        timestamp: "2026-07-06T00:00:01.000Z",
+      },
+    ];
+    fs.writeFileSync(file, lines.map((line) => JSON.stringify(line)).join("\n"));
+
+    expect(new ClaudeAdapter("", {}).parseHistoryFile(file)?.messages.at(-1)?.tokenUsage).toEqual({
+      inputTokens: 2,
+      cachedInputTokens: 0,
+      cacheCreationInputTokens: 6519,
+      cacheReadInputTokens: 13740,
+      outputTokens: 3,
+      reasoningOutputTokens: 0,
+      totalTokens: 20264,
+    });
   });
 
   it("Claude assistant end_turn은 완료 판정용 kind로 표시한다", () => {
@@ -233,6 +262,18 @@ describe("Claude 세션 기록 파싱", () => {
     expect(adapter.isHiddenHistoryFile(file)).toBe(true);
   });
 
+  it("사용량 창 활성화 단답 기록은 일반 채팅으로 등록하지 않는다", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-history-"));
+    const file = path.join(dir, "session.jsonl");
+    const lines = [
+      { type: "user", sessionId: "usage-keepalive", cwd: "/home/testuser/web-agent-manager", message: { content: USAGE_KEEPALIVE_PROMPT } },
+      { type: "assistant", sessionId: "usage-keepalive", cwd: "/home/testuser/web-agent-manager", message: { content: "1", stop_reason: "end_turn" } },
+    ];
+    fs.writeFileSync(file, lines.map((line) => JSON.stringify(line)).join("\n"));
+
+    expect(new ClaudeAdapter("", {}).isHiddenHistoryFile(file)).toBe(true);
+  });
+
   it("숨김 판정 캐시는 파일이 갱신되어 실제 대화가 생기면 다시 검사해 숨김을 푼다", () => {
     // 판정이 파일 내용 전체를 읽는 비싼 연산이라 mtime 기반으로 캐시하는데, 캐시 때문에 로컬 명령
     // 전용이던 기록이 나중에 실제 대화로 이어졌을 때 숨김이 안 풀리면 안 된다.
@@ -258,6 +299,33 @@ describe("Claude 세션 기록 파싱", () => {
       "$",
     ].join("\n");
     expect(new ClaudeAdapter("", {}).detectApproval(stale)).toBeNull();
+  });
+
+  it("선택 메뉴 없는 최신 세션 리밋 배너는 유휴 프롬프트와 함께 감지한다", () => {
+    const current = [
+      "  ⎿  You've hit your session limit · resets 1:20am (Asia/Seoul)",
+      "Worked for 5m 32s",
+      "────────────────────────────────────────────────────────────────",
+      "❯ Try \"continue\"",
+      "⏵⏵ accept edits on (shift+tab to cycle)",
+      "~394k uncached · /clear to start fresh",
+    ].join("\n");
+    const hint = new ClaudeAdapter("", {}).detectApproval(current);
+    expect(hint?.requestType).toBe("session_limit_notice");
+  });
+
+  it("#190처럼 과거 세션 리밋 배너 뒤에 후속 대화가 있으면 다시 감지하지 않는다", () => {
+    const resumed = [
+      "  ⎿  You've hit your session limit · resets 1:20am (Asia/Seoul)",
+      "you: 계속",
+      "  ⎿  Ran javap to inspect the schema generator",
+      "확인 결과 본문 스키마에는 넣을 수 없습니다.",
+      "you: 계속",
+      "────────────────────────────────────────────────────────────────",
+      "$",
+      "auto mode on (shift+tab to cycle)",
+    ].join("\n");
+    expect(new ClaudeAdapter("", {}).detectApproval(resumed)).toBeNull();
   });
 
   it("디렉터리 신뢰 확인(y/n) 화면은 한도 선택이 아니라 confirm_yn으로 감지한다", () => {

@@ -19,6 +19,7 @@ import { createToolRouter } from "./routes/tool-routes";
 import { prepareRuntimeFiles } from "./services/runtime-files";
 import { CodexAdapter } from "./providers/codex";
 import { ClaudeAdapter } from "./providers/claude";
+import { GrokAdapter } from "./providers/grok";
 import { RealtimeHub } from "./services/realtime";
 import { SlackNotifier } from "./services/slack";
 import { NtfyNotifier } from "./services/ntfy";
@@ -43,6 +44,18 @@ import { createAgentAccountRouter } from "./routes/agent-account-routes";
 import { GitWorkspaceService } from "./services/git-workspaces";
 import { IdleChatReaper } from "./services/idle-chat-reaper";
 import { UsageResetNotifier } from "./services/usage-reset-notifier";
+import { FcmNotifier } from "./services/fcm";
+import { createMobileRouter } from "./routes/mobile-routes";
+import { MobileDeviceTrustService } from "./services/mobile-device-trust";
+import { createMobileTrustBootstrapRouter, createMobileTrustRouter } from "./routes/mobile-trust-routes";
+import { TokenUsageLedger } from "./services/token-usage-ledger";
+import { createTokenUsageRouter } from "./routes/token-usage-routes";
+import { ExperimentService } from "./services/experiment-service";
+import { createExperimentRouter } from "./routes/experiment-routes";
+
+// 종료 신호를 받은 뒤 처리 중이던 요청을 기다려 주는 한계 시간. systemd 유닛의 TimeoutStopSec(20초)과
+// 감시 스크립트의 강제 종료 유예(10초)보다 짧게 잡아 항상 애플리케이션이 먼저 스스로 정리하도록 한다.
+const SHUTDOWN_GRACE_MS = 5_000;
 
 // 이름 변경 전 남은 비활성 Unix 소켓만 제거해 새 브리지 경로와 혼동되지 않게 한다.
 function removeLegacyAgentSocket(dataDir: string): void {
@@ -67,26 +80,31 @@ async function main(): Promise<void> {
   const realtime = new RealtimeHub(server, database, config.publicUrl);
   const slack = new SlackNotifier(config, database);
   const ntfy = new NtfyNotifier(config, database);
+  const fcm = new FcmNotifier(config, database);
+  const mobileTrust = new MobileDeviceTrustService(database);
   // 각 서비스는 이 허브 하나만 알면 되고, Slack·ntfy 둘 다(또는 나중에 추가될 다른 채널도) 같이 알림이
   // 간다 — 채널별 세부 설정(토큰·topic)은 관리자 설정 API에서만 개별 SlackNotifier·NtfyNotifier로 다룬다.
-  const notifications = new NotificationHub([slack, ntfy]);
+  const notifications = new NotificationHub([slack, ntfy, fcm]);
   const approvals = new ApprovalService(config, database, realtime, notifications);
-  const adapters = [new CodexAdapter(), new ClaudeAdapter(runtime.claudeSettingsFile, runtime.hookEnvironment)];
+  const adapters = [new CodexAdapter(), new ClaudeAdapter(runtime.claudeSettingsFile, runtime.hookEnvironment), new GrokAdapter()];
   const accounts = new AgentAccountService(config, database);
   const sessions = new SessionManager(database, adapters, realtime, approvals, notifications, accounts);
   const historyCache = new HistoryCache();
-  const backups = new SessionBackupService(config, database, adapters, historyCache);
-  const history = new HistorySynchronizer(config, database, adapters, realtime, notifications, historyCache, approvals, accounts);
+  const tokenUsage = new TokenUsageLedger(database);
+  const backups = new SessionBackupService(config, database, adapters, historyCache, tokenUsage);
+  const history = new HistorySynchronizer(config, database, adapters, realtime, notifications, historyCache, approvals, accounts, tokenUsage);
   const usageResetNotifier = new UsageResetNotifier(database, notifications, realtime, adapters);
   const usage = new UsageMonitor(database, adapters, realtime, accounts, usageResetNotifier);
   const metrics = new SystemMetricsService(realtime, database);
   const rateLimitResume = new RateLimitResumeService(database, sessions, notifications, realtime, adapters);
   const idleChatReaper = new IdleChatReaper(database, (chatId) => sessions.stop(chatId, null));
+  const experiments = new ExperimentService(database, config, accounts);
   const agentBridge = new AgentBridge({
     database,
     adapters,
     historyCache,
     sessions,
+    experiments,
     socketPath: path.join(config.dataDir, "web-agent-manager-agent.sock"),
   });
   const agentIntegrations = new AgentIntegrationManager(config, database);
@@ -101,6 +119,7 @@ async function main(): Promise<void> {
   app.use(createRequestLogger());
   app.get("/health", (_request, response) => response.json({ ok: true }));
   app.use("/api/auth", createAuthRouter(database, config));
+  app.use("/api", createMobileTrustBootstrapRouter(database, config, mobileTrust));
   app.post("/internal/claude/permission", (request, response, next) => {
     if (!timingSafeEqualString(request.headers.authorization ?? "", `Bearer ${runtime.hookToken}`)) return response.status(401).json({ error: "내부 인증 실패" });
     void approvals.handleClaudeHook(request.body).then((result) => response.json(result)).catch(next);
@@ -117,6 +136,10 @@ async function main(): Promise<void> {
   app.use("/api", createAgentAccountRouter(database, accounts, cliAuth, usage, sessions));
   app.use("/api", createAgentDelegationRouter(database, agentBridge));
   app.use("/api", createOperationsRouter(database, approvals, usage, metrics, slack, ntfy, adapters, idleChatReaper));
+  app.use("/api", createMobileRouter(database, usage, metrics, fcm));
+  app.use("/api", createMobileTrustRouter(database, mobileTrust));
+  app.use("/api", createTokenUsageRouter(tokenUsage));
+  app.use("/api", createExperimentRouter(database, experiments));
 
   if (process.env.NODE_ENV === "production") {
     const clientDir = path.join(config.rootDir, "dist", "client");
@@ -145,6 +168,7 @@ async function main(): Promise<void> {
   await cliAuth.initialize();
   await gitWorkspaces.initialize();
   server.listen(config.port, config.host, () => process.stdout.write(`web-agent-manager: ${config.publicUrl}\n`));
+  backups.backfillTokenUsage();
   history.start();
   sessions.restore();
   metrics.start();
@@ -166,12 +190,33 @@ async function main(): Promise<void> {
     history.stop();
     sessions.close();
     cliAuth.close();
-    server.close(() => {
-      void agentBridge.close().finally(() => {
+    const experimentShutdown = experiments.shutdown();
+
+    // 정상 종료와 시간 초과 경로가 함께 도달할 수 있어 마무리는 한 번만 수행한다.
+    let finalized = false;
+    let forceTimer: NodeJS.Timeout | undefined;
+    const finalize = (): void => {
+      if (finalized) return;
+      finalized = true;
+      if (forceTimer) clearTimeout(forceTimer);
+      void Promise.allSettled([agentBridge.close(), experimentShutdown]).finally(() => {
         database.close();
         process.exit(0);
       });
-    });
+    };
+
+    // server.close는 새 연결만 막고 이미 열린 연결이 모두 끊겨야 콜백을 부른다. 웹 화면이 붙어 있으면
+    // 승격된 WebSocket이 남아 콜백이 호출되지 않으므로 실시간 연결과 유휴 keep-alive 연결을 먼저 끊는다.
+    realtime.close();
+    server.close(finalize);
+    server.closeIdleConnections();
+
+    // 처리 중이던 요청이 끝나지 않아도 종료가 막히지 않도록 한계 시간이 지나면 남은 연결까지 정리한다.
+    forceTimer = setTimeout(() => {
+      log.warn("종료 대기 시간이 지나 남은 연결을 정리한다", { graceMs: SHUTDOWN_GRACE_MS });
+      server.closeAllConnections();
+      finalize();
+    }, SHUTDOWN_GRACE_MS);
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);

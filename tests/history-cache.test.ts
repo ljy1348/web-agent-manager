@@ -4,6 +4,7 @@ import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { CodexAdapter } from "../src/server/providers/codex";
 import { ClaudeAdapter } from "../src/server/providers/claude";
+import { GrokAdapter } from "../src/server/providers/grok";
 import { HistoryCache } from "../src/server/services/history-cache";
 
 // 임시 JSONL 파일에 레코드를 줄 단위로 저장한다.
@@ -62,5 +63,31 @@ describe("세션 기록 증분 캐시", () => {
     expect(cache.get(adapter, file)?.messages).toHaveLength(1);
     fs.appendFileSync(file, `${complete.slice(split)}\n`);
     expect(cache.get(adapter, file)?.messages.at(-1)?.content).toBe("복구");
+  });
+
+  it("Grok chat_history.jsonl 캐시는 updates.jsonl만 바뀌면 무효화 후에야 토큰을 다시 읽는다", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "web-agent-manager-grok-cache-"));
+    const directory = path.join(root, "%2Ftmp", "01a01300-aaaaaaaa-bbbb-cccc-ddddeeee0001");
+    fs.mkdirSync(directory, { recursive: true });
+    const chatHistory = path.join(directory, "chat_history.jsonl");
+    fs.writeFileSync(path.join(directory, "summary.json"), JSON.stringify({
+      info: { id: "01a01300-aaaaaaaa-bbbb-cccc-ddddeeee0001", cwd: "/tmp" },
+      current_model_id: "grok-4.6",
+    }));
+    fs.writeFileSync(chatHistory, `${JSON.stringify({ type: "user", content: [{ type: "text", text: "<user_query>\n안녕\n</user_query>" }], prompt_index: 0 })}\n${JSON.stringify({ type: "assistant", content: "안녕하세요", model_id: "grok-4.6-build" })}\n`);
+    const adapter = new GrokAdapter();
+    const cache = new HistoryCache();
+    expect(cache.get(adapter, chatHistory)?.messages.at(-1)?.tokenUsage).toBeUndefined();
+
+    fs.writeFileSync(path.join(directory, "updates.jsonl"), `${JSON.stringify({
+      method: "_x.ai/session/update",
+      params: { update: { sessionUpdate: "turn_completed", usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12, cachedReadTokens: 4, cacheCreationTokens: 0, reasoningTokens: 1 } } },
+    })}\n`);
+    expect(cache.get(adapter, chatHistory)?.messages.at(-1)?.tokenUsage).toBeUndefined();
+    cache.invalidate(chatHistory);
+    expect(cache.get(adapter, chatHistory)?.messages.at(-1)?.tokenUsage).toEqual({
+      inputTokens: 10, cachedInputTokens: 4, cacheCreationInputTokens: 0, cacheReadInputTokens: 0,
+      outputTokens: 2, reasoningOutputTokens: 1, totalTokens: 12,
+    });
   });
 });

@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/widget_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/widget_background">
+
+    <StackView
+        android:id="@+id/usage_stack"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:animateLayoutChanges="true"
+        android:loopViews="true" />
+
+    <TextView
+        android:id="@+id/compact_empty"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:gravity="center"
+        android:maxLines="2"
+        android:textColor="#FFFFFFFF"
+        android:textSize="10sp" />
+
+    <TextView
+        android:id="@+id/compact_refresh"
+        android:layout_width="24dp"
+        android:layout_height="24dp"
+        android:layout_gravity="top|right"
+        android:contentDescription="@string/refresh"
+        android:gravity="center"
+        android:text="↻"
+        android:textColor="#FFB8FF63"
+        android:textSize="14sp" />
+</FrameLayout>

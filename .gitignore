@@ -1,6 +1,12 @@
 node_modules/
 dist/
 release/
+android/.gradle/
+android/local.properties
+android/**/build/
+android/app/google-services.json
+android/**/*.jks
+android/**/*.keystore
 data/
 coverage/
 *.log
@@ -11,7 +17,10 @@ playwright-report/
 test-results/
 artifacts/*
 !artifacts/ui-agent-integration.png
+!artifacts/ui-grok-overview.png
+!artifacts/ui-grok-chat.png
 !artifacts/ui-chat-terminal.png
+!artifacts/ui-chat-laptop.png
 !artifacts/ui-cli-auth-popup.png
 !artifacts/ui-file-markdown-preview.png
 !artifacts/ui-file-preview-mobile.png

@@ -134,6 +134,22 @@ const BUILTIN_COMMANDS: ToolItem[] = [
   { id: "claude:command:voice", provider: "claude", kind: "commands", name: "/voice", label: "/voice", description: "voice dictation mode를 바꿉니다.", status: "active", scope: "builtin", source: "Claude Code", command: "/voice", template: "/voice " },
   { id: "claude:command:web-setup", provider: "claude", kind: "commands", name: "/web-setup", label: "/web-setup", description: "로컬 gh 인증으로 Claude Code on the web GitHub 연결을 설정합니다.", status: "active", scope: "builtin", source: "Claude Code", command: "/web-setup", template: "/web-setup" },
   { id: "claude:command:workflows", provider: "claude", kind: "commands", name: "/workflows", label: "/workflows", description: "실행 중이거나 완료된 workflow 진행 상황을 봅니다.", status: "active", scope: "builtin", source: "Claude Code", command: "/workflows", template: "/workflows" },
+  { id: "grok:command:model", provider: "grok", kind: "commands", name: "/model", label: "/model", description: "모델과 추론 강도를 바꿉니다. Alias: /m", status: "active", scope: "builtin", source: "Grok CLI", command: "/model", template: "/model " },
+  { id: "grok:command:new", provider: "grok", kind: "commands", name: "/new", label: "/new", description: "새 세션을 시작합니다(문맥 초기화).", status: "active", scope: "builtin", source: "Grok CLI", command: "/new", template: "/new" },
+  { id: "grok:command:load", provider: "grok", kind: "commands", name: "/load", label: "/load", description: "이전 세션을 불러옵니다. Alias: /resume", status: "active", scope: "builtin", source: "Grok CLI", command: "/load", template: "/load " },
+  { id: "grok:command:rewind", provider: "grok", kind: "commands", name: "/rewind", label: "/rewind", description: "이전 프롬프트 시점으로 되돌리고 파일도 복원합니다.", status: "active", scope: "builtin", source: "Grok CLI", command: "/rewind", template: "/rewind " },
+  { id: "grok:command:compact", provider: "grok", kind: "commands", name: "/compact", label: "/compact", description: "대화 기록을 압축합니다.", status: "active", scope: "builtin", source: "Grok CLI", command: "/compact", template: "/compact " },
+  { id: "grok:command:always-approve", provider: "grok", kind: "commands", name: "/always-approve", label: "/always-approve", description: "모든 도구 실행을 자동 승인하는 모드를 전환합니다. Alias: /yolo", status: "active", scope: "builtin", source: "Grok CLI", command: "/always-approve", template: "/always-approve " },
+  { id: "grok:command:multiline", provider: "grok", kind: "commands", name: "/multiline", label: "/multiline", description: "여러 줄 입력 모드를 전환합니다. Alias: /ml", status: "active", scope: "builtin", source: "Grok CLI", command: "/multiline", template: "/multiline" },
+  { id: "grok:command:memory", provider: "grok", kind: "commands", name: "/memory", label: "/memory", description: "메모리 파일에 내용을 덧붙입니다(메모리 기능 활성화 필요).", status: "active", scope: "builtin", source: "Grok CLI", command: "/memory", template: "/memory " },
+  { id: "grok:command:flush", provider: "grok", kind: "commands", name: "/flush", label: "/flush", description: "현재 세션에서 얻은 지식을 메모리에 지금 저장합니다.", status: "active", scope: "builtin", source: "Grok CLI", command: "/flush", template: "/flush" },
+  { id: "grok:command:skills", provider: "grok", kind: "commands", name: "/skills", label: "/skills", description: "스킬 목록을 보거나 스킬을 문맥에 주입합니다.", status: "active", scope: "builtin", source: "Grok CLI", command: "/skills", template: "/skills " },
+  { id: "grok:command:plugins", provider: "grok", kind: "commands", name: "/plugins", label: "/plugins", description: "플러그인을 관리합니다(list, reload, trust). Alias: /plugin", status: "active", scope: "builtin", source: "Grok CLI", command: "/plugins", template: "/plugins " },
+  { id: "grok:command:hooks-list", provider: "grok", kind: "commands", name: "/hooks-list", label: "/hooks-list", description: "이 세션에 로드된 훅을 표시합니다.", status: "active", scope: "builtin", source: "Grok CLI", command: "/hooks-list", template: "/hooks-list" },
+  { id: "grok:command:hooks-trust", provider: "grok", kind: "commands", name: "/hooks-trust", label: "/hooks-trust", description: "이 폴더의 훅 실행을 신뢰하도록 등록합니다.", status: "active", scope: "builtin", source: "Grok CLI", command: "/hooks-trust", template: "/hooks-trust" },
+  { id: "grok:command:hooks-add", provider: "grok", kind: "commands", name: "/hooks-add", label: "/hooks-add", description: "훅 파일이나 디렉터리를 추가합니다.", status: "active", scope: "builtin", source: "Grok CLI", command: "/hooks-add", template: "/hooks-add " },
+  { id: "grok:command:feedback", provider: "grok", kind: "commands", name: "/feedback", label: "/feedback", description: "문제를 신고하거나 피드백을 보냅니다.", status: "active", scope: "builtin", source: "Grok CLI", command: "/feedback", template: "/feedback " },
+  { id: "grok:command:exit", provider: "grok", kind: "commands", name: "/exit", label: "/exit", description: "TUI를 종료합니다. Alias: /quit", status: "active", scope: "builtin", source: "Grok CLI", command: "/exit", template: "/exit" },
   { id: "codex:command:model", provider: "codex", kind: "commands", name: "/model", label: "/model", description: "Codex CLI 모델을 선택합니다.", status: "active", scope: "builtin", source: "Codex CLI", command: "/model", template: "/model" },
   { id: "codex:command:mcp", provider: "codex", kind: "commands", name: "/mcp", label: "/mcp", description: "연결된 MCP 서버 상태를 확인합니다.", status: "active", scope: "builtin", source: "Codex CLI", command: "/mcp", template: "/mcp" },
   { id: "codex:command:plugins", provider: "codex", kind: "commands", name: "/plugins", label: "/plugins", description: "플러그인 브라우저와 marketplace 항목을 엽니다.", status: "active", scope: "builtin", source: "Codex CLI", command: "/plugins", template: "/plugins" },
@@ -340,7 +356,9 @@ async function listCliMcp(provider: Provider, cwd: string): Promise<ToolItem[]> 
     if (cached.items) return cached.items;
     if (cached.promise) return cached.promise;
   }
-  const command = provider === "claude" ? "claude" : "codex";
+  // 세 공급자 모두 id가 그대로 CLI 실행 파일 이름이다. 예전의 삼항식은 새로 추가된 공급자가 전부
+  // codex로 떨어져 엉뚱한 CLI를 실행했다.
+  const command = provider;
   const promise = execFileAsync(command, ["mcp", "list"], { cwd, encoding: "utf8", timeout: 7000, windowsHide: true })
     .then(({ stdout }) => {
       const items = parseCliMcpOutput(provider, command, String(stdout));

@@ -43,3 +43,8 @@ export function projectFileContentUrl(projectId: number, filePath: string, chatI
   const encodedPath = filePath.split("/").filter(Boolean).map(encodeURIComponent).join("/");
   return `/api/projects/${projectId}/files/content/${encodedPath}${chatId ? `?chatId=${chatId}` : ""}`;
 }
+
+// 프로젝트 상대 파일을 현재 채팅 작업공간에서 내려받는 attachment URL로 만든다.
+export function projectFileDownloadUrl(projectId: number, filePath: string, chatId?: number | null): string {
+  return `/api/projects/${projectId}/files/download?path=${encodeURIComponent(filePath)}${chatId ? `&chatId=${chatId}` : ""}`;
+}

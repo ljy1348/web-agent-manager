@@ -1,7 +1,81 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../api";
-import { bytes, usageWindows } from "../../lib/format";
+import { bytes, usageErrorLabel, usageResetCredits, usageWindows } from "../../lib/format";
+import { compactTokenCount } from "../../lib/token-usage";
 import type { Json } from "../../types";
+
+const TOKEN_USAGE_GROUPS = [
+  ["project", "프로젝트별"], ["chat", "채팅별"], ["day", "일자별"],
+  ["provider", "공급자별"], ["account", "계정별"], ["model", "모델별"],
+] as const;
+const TOKEN_USAGE_PERIODS = [["7", "최근 7일"], ["30", "최근 30일"], ["90", "최근 90일"], ["365", "최근 1년"], ["all", "전체"]] as const;
+
+// API 숫자 필드를 토큰 표시에서 안전하게 쓸 수 있는 0 이상의 수로 바꾼다.
+function usageNumber(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+// 축약 토큰 수에 마우스를 올리면 정확한 정수도 확인할 수 있게 표시한다.
+function TokenMetric({ value }: { value: unknown }): React.ReactElement {
+  const count = usageNumber(value);
+  return <span title={Math.round(count).toLocaleString("ko-KR")}>{compactTokenCount(count)}</span>;
+}
+
+// 삭제된 채팅까지 영구 원장에서 합산한 기간·분류별 토큰 사용량을 표시한다.
+function TokenUsageAnalytics(): React.ReactElement {
+  const [groupBy, setGroupBy] = useState("project");
+  const [period, setPeriod] = useState("30");
+  const [data, setData] = useState<Json | null>(null);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    setError("");
+    const params = new URLSearchParams({
+      groupBy,
+      period,
+      timezoneOffsetMinutes: String(-new Date().getTimezoneOffset()),
+    });
+    void api(`/token-usage?${params}`)
+      .then((result) => { if (active) setData(result); })
+      .catch((reason: any) => { if (active) setError(reason?.message || "토큰 사용량을 불러오지 못했습니다."); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [groupBy, period]);
+  const summary = data?.summary ?? {};
+  const rows = Array.isArray(data?.rows) ? data.rows : [];
+  const cacheTotal = usageNumber(summary.cachedInputTokens) + usageNumber(summary.cacheCreationInputTokens) + usageNumber(summary.cacheReadInputTokens);
+  return <article className="card token-usage-card">
+    <div className="token-usage-head">
+      <div><h3>토큰 사용량 기록</h3><p>삭제된 채팅도 포함합니다. 백업 없이 원장 도입 전에 이미 삭제된 기록은 집계할 수 없습니다.</p></div>
+      <div className="token-usage-filters">
+        <label>기간<select value={period} onChange={(event) => setPeriod(event.target.value)}>{TOKEN_USAGE_PERIODS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+        <label>분류<select value={groupBy} onChange={(event) => setGroupBy(event.target.value)}>{TOKEN_USAGE_GROUPS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+      </div>
+    </div>
+    <div className="token-usage-summary">
+      <span>전체<strong><TokenMetric value={summary.totalTokens} /></strong></span>
+      <span>입력<strong><TokenMetric value={summary.inputTokens} /></strong></span>
+      <span>캐시<strong><TokenMetric value={cacheTotal} /></strong></span>
+      <span>출력<strong><TokenMetric value={summary.outputTokens} /></strong></span>
+      <span>추론<strong><TokenMetric value={summary.reasoningOutputTokens} /></strong></span>
+    </div>
+    <p className="token-usage-counts">응답 {usageNumber(summary.messageCount).toLocaleString("ko-KR")}개 · 채팅 {usageNumber(summary.chatCount).toLocaleString("ko-KR")}개 · 프로젝트 {usageNumber(summary.projectCount).toLocaleString("ko-KR")}개</p>
+    {error && <p className="error-text">{error}</p>}
+    <div className="table-wrap token-usage-table-wrap"><table className="token-usage-table"><thead><tr>
+      <th>{TOKEN_USAGE_GROUPS.find(([value]) => value === groupBy)?.[1] ?? "분류"}</th><th>전체</th><th>입력</th><th>캐시</th><th>출력</th><th>응답</th>
+    </tr></thead><tbody>
+      {rows.map((row: Json) => {
+        const rowCache = usageNumber(row.cachedInputTokens) + usageNumber(row.cacheCreationInputTokens) + usageNumber(row.cacheReadInputTokens);
+        return <tr key={String(row.key)}><td><strong>{row.label || "-"}</strong>{row.deleted && groupBy === "chat" && <i className="token-usage-deleted">삭제됨</i>}{row.detail && <small>{row.detail}</small>}</td>
+          <td><TokenMetric value={row.totalTokens} /></td><td><TokenMetric value={row.inputTokens} /></td><td><TokenMetric value={rowCache} /></td><td><TokenMetric value={row.outputTokens} /></td><td>{usageNumber(row.messageCount).toLocaleString("ko-KR")}</td></tr>;
+      })}
+      {!loading && !error && !rows.length && <tr><td colSpan={6} className="muted">이 기간에 기록된 토큰 사용량이 없습니다.</td></tr>}
+      {loading && <tr><td colSpan={6} className="muted">토큰 사용량을 불러오는 중…</td></tr>}
+    </tbody></table></div>
+  </article>;
+}
 
 // 관리자 전용 Slack bot token·channel id 설정 카드를 표시한다.
 function SlackSettingsCard(): React.ReactElement {
@@ -110,6 +184,7 @@ interface ProcessGroupRow {
   processes: Json[];
   cpu: number;
   memory: number;
+  chatId: number | null;
 }
 
 const GROUP_KIND_ORDER: Record<string, number> = { chat: 0, system: 1, other: 2 };
@@ -120,7 +195,7 @@ function groupProcesses(processes: Json[], sortKey: string, sortDir: "asc" | "de
   const groups = new Map<string, ProcessGroupRow>();
   for (const process of processes) {
     const group = process.group ?? { kind: "other", key: "other", label: "기타 프로세스" };
-    const row: ProcessGroupRow = groups.get(group.key) ?? { key: group.key, kind: group.kind, label: group.label, processes: [], cpu: 0, memory: 0 };
+    const row: ProcessGroupRow = groups.get(group.key) ?? { key: group.key, kind: group.kind, label: group.label, processes: [], cpu: 0, memory: 0, chatId: process.chat?.chatId ?? null };
     row.processes.push(process);
     row.cpu += process.cpu ?? 0;
     row.memory += process.memory ?? 0;
@@ -152,6 +227,26 @@ function formatTimestamp(value: string | null | undefined): string {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
 }
 
+// 최소 단답을 보낸 원인을 대시보드용 짧은 한국어로 바꾼다.
+function keepaliveReasonLabel(reason: string | null | undefined): string {
+  if (reason === "claude_session_missing") return "Claude 세션 창 없음";
+  if (reason === "claude_session_zero") return "Claude 세션 0%";
+  if (reason === "codex_reset_zero") return "Codex 사용량 0% 전환";
+  return "사용량 초기화 감지";
+}
+
+// Codex 사용량 카드에 초기화권 잔여량·기한과 관리자용 사용 버튼을 표시한다.
+function ResetCreditsSummary({ record, canRedeem, redeeming, onRedeem }: { record: Json; canRedeem: boolean; redeeming: boolean; onRedeem(): void }): React.ReactElement | null {
+  const credits = usageResetCredits(record);
+  if (!credits) return null;
+  return <div className="usage-reset-credits">
+    <strong>초기화권</strong>
+    <b>{credits.availableCount}개</b>
+    <span>{credits.expiresAt ? `${credits.availableCount > 1 ? "가장 이른 " : ""}기한 ${formatTimestamp(credits.expiresAt)}` : "기한 정보 없음"}</span>
+    {canRedeem && credits.availableCount > 0 && <button type="button" className="usage-reset-redeem" disabled={redeeming} onClick={onRedeem}>{redeeming ? "사용 중…" : "사용하기"}</button>}
+  </div>;
+}
+
 // 사용량과 호스트 자원 요약을 대시보드 카드로 표시한다.
 export function Overview({ user, providers, usage, system, runtime, slack, ntfy, refresh }: Json): React.ReactElement {
   // 새로고침 버튼으로 해당 공급자의 사용량을 즉시 다시 조회하도록 요청한다(실제 파싱 결과는
@@ -161,6 +256,24 @@ export function Overview({ user, providers, usage, system, runtime, slack, ntfy,
       await api(`/usage/${provider}/refresh`, { method: "POST" });
     } catch (error: any) {
       window.alert(error?.message || "사용량 새로고침 요청에 실패했습니다.");
+    }
+  }
+  const [redeemingResetCredit, setRedeemingResetCredit] = useState(false);
+  // 확인창 뒤 Codex 맨 위 Full reset 초기화권 하나를 사용하고 대시보드 데이터를 다시 읽는다.
+  async function redeemResetCredit(record: Json): Promise<void> {
+    const credits = usageResetCredits(record);
+    if (!credits || credits.availableCount < 1) return;
+    const expiry = credits.expiresAt ? `\n기한: ${formatTimestamp(credits.expiresAt)}` : "";
+    if (!window.confirm(`맨 위 Full reset 초기화권 1개를 사용해 현재 Codex 사용량을 초기화할까요?${expiry}\n\n사용한 초기화권은 되돌릴 수 없습니다.`)) return;
+    setRedeemingResetCredit(true);
+    try {
+      await api("/usage/codex/reset-credit/redeem", { method: "POST", body: JSON.stringify({ accountId: record.account_id }) });
+      await refresh();
+      window.alert("Codex 초기화권을 사용했습니다.");
+    } catch (error: any) {
+      window.alert(error?.message || "Codex 초기화권 사용에 실패했습니다.");
+    } finally {
+      setRedeemingResetCredit(false);
     }
   }
   // 사용량 파싱이 이상하거나 실패했을 때 숫자만으로는 원인을 알기 어려워, 파서에 실제로 넘어간
@@ -236,6 +349,19 @@ export function Overview({ user, providers, usage, system, runtime, slack, ntfy,
     setKillingGroup(null);
     if (failures.length) window.alert(`일부 프로세스를 종료하지 못했습니다.\n\n${failures.join("\n")}`);
   }
+  // 채팅 묶음은 PID별 신호 대신 세션 관리자의 정상 터미널 종료 경로를 사용한다.
+  async function stopChatTerminal(group: ProcessGroupRow): Promise<void> {
+    if (!group.chatId) return;
+    if (!window.confirm(`"${group.label}" 채팅 터미널을 종료할까요?\n\n진행 중인 작업과 리밋 재개 대기도 함께 종료됩니다.`)) return;
+    setKillingGroup(group.key);
+    try {
+      await api(`/chats/${group.chatId}/stop`, { method: "POST" });
+    } catch (error: any) {
+      window.alert(error?.message || "터미널 종료에 실패했습니다.");
+    } finally {
+      setKillingGroup(null);
+    }
+  }
   return <section className="content-grid">
     <div className="section-head"><div><span className="eyebrow">실시간 현황</span><h2>운영 대시보드</h2></div><button onClick={refresh}>새로고침</button></div>
     <div className="cards">
@@ -248,11 +374,13 @@ export function Overview({ user, providers, usage, system, runtime, slack, ntfy,
           <button className="usage-refresh" onClick={() => void loadSnapshot(item.provider)}>터미널 보기</button>
         </div>
         <p className="usage-parsed-at">파싱 시각 {formatTimestamp(item.last_checked_at)}{item.data_status === "stale" && ` · 마지막 성공 ${formatTimestamp(item.last_success_at)}`}</p>
+        {item.keepalive_sent_at && <p className="usage-parsed-at">세션 유지 단답 · 마지막 전송 {formatTimestamp(item.keepalive_sent_at)} · {keepaliveReasonLabel(item.keepalive_reason)}</p>}
         {usageWindows(item).map((window) => <div className="meter-row" key={window.id}>
           <div><strong>{window.label}</strong><span>{window.resetAt ? `초기화 ${window.resetAt}` : ""}</span></div>
           <div className="meter"><i style={{ width: `${window.usedPercent || 0}%` }} /></div><b>{window.usedPercent}%</b>
         </div>)}
-        {!usageWindows(item).length && <p className="muted">{item.error_code || "조회 중"}</p>}
+        {item.provider === "codex" && <ResetCreditsSummary record={item} canRedeem={user?.role === "admin"} redeeming={redeemingResetCredit} onRedeem={() => void redeemResetCredit(item)} />}
+        {!usageWindows(item).length && <p className="muted">{usageErrorLabel(item.error_code)}</p>}
         {item.provider in snapshots && (snapshots[item.provider]
           ? <div className="usage-snapshot">
               <div className="git-box-head"><h4>터미널 스냅샷</h4><span>{formatTimestamp(snapshots[item.provider]!.capturedAt)}</span><button onClick={() => closeSnapshot(item.provider)}>닫기</button></div>
@@ -273,6 +401,7 @@ export function Overview({ user, providers, usage, system, runtime, slack, ntfy,
       {user?.role === "admin" && <NtfySettingsCard />}
       {user?.role === "admin" && <IdleChatSettingsCard />}
     </div>
+    <TokenUsageAnalytics />
     <article className="card process-card"><h3>에이전트 프로세스</h3><div className="table-wrap"><table><thead><tr>
       <th className="sortable" onClick={() => toggleSort("name")}>묶음 / 프로세스{sortIndicator("name")}</th>
       <th className="sortable" onClick={() => toggleSort("pid")}>PID{sortIndicator("pid")}</th>
@@ -295,7 +424,8 @@ export function Overview({ user, providers, usage, system, runtime, slack, ntfy,
           <td data-label="메모리">{bytes(group.memory)}</td>
           {user?.role === "admin" && <td className="process-actions">
             {/* 시스템 묶음에는 서버 본체와 이를 띄운 watch 프로세스가 들어 있어 종료하면 앱이 내려간다. */}
-            {group.kind === "system" ? <span className="muted process-protected">앱 구동에 필요</span> : <>
+            {group.kind === "system" ? <span className="muted process-protected">앱 구동에 필요</span> : group.kind === "chat" ?
+              <button disabled={killingGroup === group.key} onClick={() => void stopChatTerminal(group)}>{killingGroup === group.key ? "종료 중…" : "터미널 종료"}</button> : <>
               <button disabled={killingGroup === group.key} onClick={() => void killGroup(group, false)}>{killingGroup === group.key ? "종료 중…" : "묶음 종료"}</button>
               <button className="danger" disabled={killingGroup === group.key} onClick={() => void killGroup(group, true)}>강제</button>
             </>}

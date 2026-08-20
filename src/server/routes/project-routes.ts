@@ -11,6 +11,7 @@ import { requireAdmin, type AuthenticatedRequest } from "../core/auth";
 import { requireTrustedNetwork } from "../core/network";
 import { resolveProjectPath } from "./helpers";
 import type { Provider } from "../../shared/types";
+import { CHAT_ATTACHMENT_MAX_FILES, CHAT_ATTACHMENT_MAX_FILE_BYTES, CHAT_ATTACHMENT_MAX_TOTAL_BYTES } from "../../shared/chat-attachments";
 import type { SessionManager } from "../services/session-manager";
 import type { ProviderAdapter } from "../providers/provider";
 import type { HistoryCache } from "../services/history-cache";
@@ -182,6 +183,37 @@ export function createProjectRouter(database: AppDatabase, config: AppConfig, se
       next(error);
     }
   });
+// 채팅 생성 시 고를 수 있는 preset 버전을 확정한다. 실행 중 preset이 바뀌어도 이미 시작한 작업이
+// 흔들리지 않도록, 여기서 고른 버전의 설정 스냅샷을 채팅 행에 복사해 고정한다(14장).
+function resolvePinnedPreset(
+  database: AppDatabase,
+  projectId: number,
+  provider: Provider,
+  body: { presetId?: unknown; presetVersionId?: unknown },
+): { versionId: string; config: string; model: string | null } | null {
+  const presetVersionId = typeof body.presetVersionId === "string" ? body.presetVersionId.trim() : "";
+  const presetId = typeof body.presetId === "string" ? body.presetId.trim() : "";
+  if (!presetVersionId && !presetId) return null;
+  const row = presetVersionId
+    ? database.prepare(`
+        SELECT v.id, v.config_snapshot_json AS config, p.project_id AS projectId
+        FROM agent_preset_versions v JOIN agent_presets p ON p.id = v.preset_id
+        WHERE v.id = ?
+      `).get(presetVersionId) as { id: string; config: string; projectId: number } | undefined
+    : database.prepare(`
+        SELECT v.id, v.config_snapshot_json AS config, p.project_id AS projectId
+        FROM agent_presets p JOIN agent_preset_versions v ON v.preset_id = p.id AND v.version = p.active_version
+        WHERE p.id = ?
+      `).get(presetId) as { id: string; config: string; projectId: number } | undefined;
+  if (!row) throw new Error("선택한 Agent preset 버전을 찾을 수 없습니다.");
+  if (row.projectId !== projectId) throw new Error("다른 프로젝트의 Agent preset은 사용할 수 없습니다.");
+  const config = JSON.parse(row.config) as { runtime?: { provider?: string; model?: string | null } };
+  if (config.runtime?.provider && config.runtime.provider !== provider) {
+    throw new Error(`이 preset은 ${config.runtime.provider} 전용이라 ${provider} 채팅에 쓸 수 없습니다.`);
+  }
+  return { versionId: row.id, config: row.config, model: config.runtime?.model ?? null };
+}
+
   router.post("/chats", requireAdmin, async (request: AuthenticatedRequest, response, next) => {
     try {
       const projectId = Number(request.body?.projectId);
@@ -193,10 +225,15 @@ export function createProjectRouter(database: AppDatabase, config: AppConfig, se
       // 계정을 고르지 않았으면 그 공급자의 기본 계정(기존 ~/.claude·~/.codex 인증)으로 만든다.
       const account = accounts.requireForProvider(provider, request.body?.accountId != null ? Number(request.body.accountId) : null);
       const gitBranch = gitWorkspaces ? await gitWorkspaces.projectBranch(projectId).catch(() => null) : null;
+      const pinned = resolvePinnedPreset(database, projectId, provider, request.body ?? {});
       const placeholder = `pending_${crypto.randomUUID().replaceAll("-", "")}`;
       const result = database.prepare(`
-        INSERT INTO chats(project_id, provider, account_id, tmux_name, status, title, git_branch) VALUES (?, ?, ?, ?, 'starting', ?, ?)
-      `).run(projectId, provider, account.id, placeholder, `새 ${adapter.displayLabel} 채팅`, gitBranch);
+        INSERT INTO chats(project_id, provider, account_id, tmux_name, status, title, git_branch, preset_version_id, preset_config_json, model)
+        VALUES (?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?)
+      `).run(
+        projectId, provider, account.id, placeholder, `새 ${adapter.displayLabel} 채팅`, gitBranch,
+        pinned?.versionId ?? null, pinned?.config ?? null, pinned?.model ?? null,
+      );
       const chatId = Number(result.lastInsertRowid);
       const tmuxName = `web_agent_manager_chat_${chatId}`;
       database.prepare("UPDATE chats SET tmux_name = ? WHERE id = ?").run(tmuxName, chatId);
@@ -219,13 +256,16 @@ export function createProjectRouter(database: AppDatabase, config: AppConfig, se
       const adapter = adapterById.get(provider);
       const branch = String(request.body?.branch ?? "").trim();
       const create = request.body?.create !== false;
+      // 이미 존재하는 worktree 폴더를 지정하면 새로 만들지 않고 그 폴더에 채팅을 붙인다.
+      // 앱 밖에서 만든 외부 worktree는 앱 관리 경로에 없어 브랜치만으로는 연결할 수 없기 때문이다.
+      const worktreePath = String(request.body?.worktreePath ?? "").trim();
       if (!Number.isInteger(projectId) || !adapter) throw new Error("프로젝트와 공급자가 필요합니다.");
-      if (!branch) throw new Error("브랜치 이름이 필요합니다.");
+      if (!branch && !worktreePath) throw new Error("브랜치 이름이 필요합니다.");
       const project = database.prepare("SELECT id FROM projects WHERE id = ? AND active = 1").get(projectId);
       if (!project) throw new Error("프로젝트를 찾을 수 없습니다.");
       const title = typeof request.body?.title === "string" && request.body.title.trim()
         ? request.body.title.trim().slice(0, 120)
-        : `${branch} 작업`;
+        : `${branch || path.basename(worktreePath)} 작업`;
       const account = accounts.requireForProvider(provider, request.body?.accountId != null ? Number(request.body.accountId) : null);
       const placeholder = `pending_${crypto.randomUUID().replaceAll("-", "")}`;
       const result = database.prepare(`
@@ -234,15 +274,16 @@ export function createProjectRouter(database: AppDatabase, config: AppConfig, se
       const chatId = Number(result.lastInsertRowid);
       database.prepare("UPDATE chats SET tmux_name = ? WHERE id = ?").run(`web_agent_manager_chat_${chatId}`, chatId);
       try {
-        await gitWorkspaces.switchBranch(projectId, { chatId, branch, create, mode: "worktree" });
+        if (worktreePath) await gitWorkspaces.attachWorktree(projectId, chatId, worktreePath);
+        else await gitWorkspaces.switchBranch(projectId, { chatId, branch, create, mode: "worktree" });
       } catch (error) {
         // worktree를 못 만들면 빈 채팅만 남으므로 되돌린다.
         database.prepare("DELETE FROM chats WHERE id = ?").run(chatId);
         throw error;
       }
       sessions.start(chatId, false);
-      logChatServer("chats:create_worktree", { userId: request.authUser!.id, projectId, provider, chatId, branch });
-      writeAudit(database, request.authUser!.id, "chat.create_worktree", "chat", chatId, { provider, projectId, branch, create });
+      logChatServer("chats:create_worktree", { userId: request.authUser!.id, projectId, provider, chatId, branch, worktreePath: worktreePath || null });
+      writeAudit(database, request.authUser!.id, "chat.create_worktree", "chat", chatId, { provider, projectId, branch, create, worktreePath: worktreePath || null });
       response.status(201).json({ chat: database.prepare("SELECT * FROM chats WHERE id = ?").get(chatId) });
     } catch (error) {
       next(error);
@@ -329,14 +370,14 @@ export function createProjectRouter(database: AppDatabase, config: AppConfig, se
       const uploads: Array<{ name: string; path: string; size: number }> = [];
       void processMultipartFiles(request, {
         destinationDir: actualUploadDir,
-        maxFileBytes: 25 * 1024 * 1024,
-        maxTotalBytes: 50 * 1024 * 1024,
-        maxFiles: 5,
+        maxFileBytes: CHAT_ATTACHMENT_MAX_FILE_BYTES,
+        maxTotalBytes: CHAT_ATTACHMENT_MAX_TOTAL_BYTES,
+        maxFiles: CHAT_ATTACHMENT_MAX_FILES,
       }, async (stream, info, accountBytes) => {
         const original = safeBasename(info.filename || "붙여넣기");
         const filename = `${Date.now()}_${crypto.randomUUID().slice(0, 8)}_${original}`;
         const { size } = await streamToFile(stream, actualUploadDir, filename, {
-          maxBytes: 25 * 1024 * 1024,
+          maxBytes: CHAT_ATTACHMENT_MAX_FILE_BYTES,
           accountBytes,
         });
         const relativePath = path.relative(projectPath, path.join(actualUploadDir, filename));

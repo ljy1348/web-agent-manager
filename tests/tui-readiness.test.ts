@@ -132,4 +132,39 @@ $`;
     expect(claude.isBusy(paddedPane)).toBe(true);
     expect(claude.isReady(paddedPane)).toBe(false);
   });
+
+  // 채팅 #257에서 실제로 겪은 교착이다. 입력창에 미전송 글자가 남으면 isReady·isBusy가 동시에 false가
+  // 되어 준비 대기가 15초마다 타임아웃하고 상태를 다시 error로 덮어써, 웹에서 복구할 방법이 없었다.
+  // readPromptDraft는 그 초안을 읽어내 "입력창은 있다"는 사실과 지울 글자 수를 함께 알려준다.
+  it("입력창에 미전송 초안이 남아 있으면 그 텍스트를 읽어낸다", () => {
+    const screen = [
+      "✻ Brewed for 13m 15s",
+      "──────────────────────────",
+      "❯ backend 복구해줘",
+      "──────────────────────────",
+      "  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent",
+    ].join("\n");
+    expect(claude.isReady(screen)).toBe(false);
+    expect(claude.isBusy(screen)).toBe(false);
+    expect(claude.readPromptDraft(screen)).toBe("backend 복구해줘");
+  });
+
+  it("빈 입력창은 지울 초안이 없는 빈 문자열로 본다", () => {
+    const screen = [
+      "──────────────────────────",
+      "❯ ",
+      "──────────────────────────",
+      "  ⏵⏵ auto mode on (shift+tab to cycle)",
+    ].join("\n");
+    expect(claude.readPromptDraft(screen)).toBe("");
+  });
+
+  it("입력창이 없는 선택 메뉴 화면은 null로 구분해 채팅 입력을 흘려보내지 않는다", () => {
+    const screen = [
+      "Do you want to proceed?",
+      "❯ 1. Yes",
+      "  2. No, and tell Claude what to do differently",
+    ].join("\n");
+    expect(claude.readPromptDraft(screen)).toBeNull();
+  });
 });

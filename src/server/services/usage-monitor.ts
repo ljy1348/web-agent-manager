@@ -9,6 +9,9 @@ import { TerminalScreen } from "./terminal-screen";
 import { todayResetTime } from "../providers/usage-utils";
 import { createLogger } from "../core/logger";
 import type { UsageResetNotifier } from "./usage-reset-notifier";
+import { parseUsageResetMoment } from "./usage-reset-notifier";
+import { consumeCodexResetCredit, readCodexResetCredits, type CodexResetCredits, type CodexResetCreditConsumeResult } from "../providers/codex-rate-limits";
+import { USAGE_KEEPALIVE_COOLDOWN_MS, USAGE_KEEPALIVE_PROMPT } from "../../shared/usage-keepalive";
 
 const usageLog = createLogger("usage-check");
 
@@ -20,6 +23,12 @@ const usageLog = createLogger("usage-check");
 // 보고 0% 사용·5시간 뒤 재리셋으로 직접 채워 넣는다(2분 여유는 CLI의 반영 지연을 감안한 것).
 const SESSION_RESET_GRACE_MS = 2 * 60_000;
 const SESSION_WINDOW_HOURS = 5;
+const USAGE_DETAILS_INTERVAL_MS = 24 * 60 * 60_000;
+
+// 마지막 상세 조회 시각을 기준으로 하루 주기의 다음 조회가 필요한지 판정한다.
+export function isUsageDetailsDue(lastCheckedAt: number | undefined, now: number): boolean {
+  return lastCheckedAt === undefined || now - lastCheckedAt >= USAGE_DETAILS_INTERVAL_MS;
+}
 
 function parseWindows(detailsJson: string | null | undefined): UsageWindow[] {
   if (!detailsJson) return [];
@@ -27,6 +36,42 @@ function parseWindows(detailsJson: string | null | undefined): UsageWindow[] {
     return (JSON.parse(detailsJson) as { windows?: UsageWindow[] }).windows ?? [];
   } catch {
     return [];
+  }
+}
+
+// 사용량 상세 JSON에서 유효한 Codex 초기화권 요약만 꺼낸다.
+function storedCodexResetCredits(details: Record<string, unknown>): CodexResetCredits | null {
+  const value = details.rateLimitResetCredits;
+  if (!value || typeof value !== "object") return null;
+  const credits = value as Partial<CodexResetCredits>;
+  if (!Number.isInteger(credits.availableCount) || Number(credits.availableCount) < 0) return null;
+  return { availableCount: Number(credits.availableCount), expiresAt: typeof credits.expiresAt === "string" ? credits.expiresAt : null };
+}
+
+// TUI·app-server의 새 값과 직전 캐시를 합치되 같은 개수의 정상 기한은 보존한다.
+export function mergeCodexResetCredits(detailsJson: string | null | undefined, credits: CodexResetCredits | null, previousDetailsJson?: string | null): string | null {
+  if (!detailsJson) return detailsJson ?? null;
+  try {
+    const details = JSON.parse(detailsJson) as Record<string, unknown>;
+    const screenCredits = storedCodexResetCredits(details);
+    let previousCredits: CodexResetCredits | null = null;
+    if (previousDetailsJson) {
+      try {
+        previousCredits = storedCodexResetCredits(JSON.parse(previousDetailsJson) as Record<string, unknown>);
+      } catch {
+        previousCredits = null;
+      }
+    }
+    let resetCredits = credits ?? screenCredits ?? previousCredits;
+    if (resetCredits && !resetCredits.expiresAt) {
+      const dated = [screenCredits, previousCredits].find((candidate): candidate is CodexResetCredits & { expiresAt: string } => (
+        !!candidate && candidate.availableCount === resetCredits?.availableCount && !!candidate.expiresAt
+      ));
+      if (dated) resetCredits = { ...resetCredits, expiresAt: dated.expiresAt };
+    }
+    return JSON.stringify(resetCredits ? { ...details, rateLimitResetCredits: resetCredits } : details);
+  } catch {
+    return detailsJson;
   }
 }
 
@@ -89,6 +134,119 @@ export function reconcileStaleClaudeSessionWindow(parsed: Partial<UsageRecord>, 
   };
 }
 
+export type UsageKeepaliveReason = "claude_session_missing" | "claude_session_zero" | "codex_reset_zero";
+
+export interface UsageKeepaliveTrigger {
+  reason: UsageKeepaliveReason;
+  windowKey: string | null;
+}
+
+interface UsageKeepaliveWindowPart {
+  id: string;
+  resetAt: string | null;
+}
+
+const KEEPALIVE_RESET_TOLERANCE_MS = 15 * 60_000;
+
+// 이미 절대시각인 내부 보정값은 다시 시:분 문구로 해석하지 않고 그대로 사용한다.
+function usageKeepaliveResetAt(resetAt: string | null | undefined, now: Date): string | null {
+  if (!resetAt) return null;
+  const iso = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(resetAt) ? new Date(resetAt) : null;
+  const parsed = iso && !Number.isNaN(iso.getTime()) ? iso : parseUsageResetMoment(resetAt, now);
+  return parsed?.toISOString() ?? resetAt;
+}
+
+// 사용량 창 목록을 시각 표기 차이에 강한 DB 저장용 키로 직렬화한다.
+function usageKeepaliveWindowKey(windows: UsageWindow[], now: Date): string | null {
+  if (!windows.length) return null;
+  const parts = windows.map((window): UsageKeepaliveWindowPart => ({
+    id: window.id,
+    resetAt: usageKeepaliveResetAt(window.resetAt, now),
+  })).sort((left, right) => left.id.localeCompare(right.id));
+  return JSON.stringify(parts);
+}
+
+// Claude 세션이 화면에서 사라졌으면 직전 리셋을 5시간씩 넘겨 현재 창의 다음 리셋을 복원한다.
+function missingClaudeSessionWindow(previousDetailsJson: string | null | undefined, now: Date): UsageWindow[] {
+  const previousSession = parseWindows(previousDetailsJson).find((window) => window.id === "session");
+  if (!previousSession?.resetAt) return [];
+  const parsedReset = parseUsageResetMoment(previousSession.resetAt, now);
+  if (!parsedReset) return [previousSession];
+  const resetAt = new Date(parsedReset.getTime());
+  while (resetAt.getTime() <= now.getTime()) resetAt.setTime(resetAt.getTime() + SESSION_WINDOW_HOURS * 60 * 60_000);
+  return [{ ...previousSession, resetAt: resetAt.toISOString() }];
+}
+
+// 현재 정상 스냅샷에서 최소 단답 사유와 중복 판정용 초기화 창을 함께 계산한다.
+export function detectUsageKeepaliveTrigger(provider: Provider, previousDetailsJson: string | null | undefined, parsedDetailsJson: string | null | undefined, now: Date = new Date()): UsageKeepaliveTrigger | null {
+  const current = parseWindows(parsedDetailsJson);
+  if (!current.length) return null;
+  if (provider === "claude") {
+    const session = current.find((window) => window.id === "session");
+    if (!session) return {
+      reason: "claude_session_missing",
+      windowKey: usageKeepaliveWindowKey(missingClaudeSessionWindow(previousDetailsJson, now), now),
+    };
+    return session.usedPercent === 0
+      ? { reason: "claude_session_zero", windowKey: usageKeepaliveWindowKey([session], now) }
+      : null;
+  }
+  const previous = parseWindows(previousDetailsJson);
+  const resetWindows = current.filter((window) => window.usedPercent === 0 && (previous.find((item) => item.id === window.id)?.usedPercent ?? 0) > 0);
+  return resetWindows.length
+    ? { reason: "codex_reset_zero", windowKey: usageKeepaliveWindowKey(resetWindows, now) }
+    : null;
+}
+
+// 사용량 창이 실제 최소 턴으로 활성화되어야 하는 상태 전환인지 판정한다.
+export function detectUsageKeepaliveReason(provider: Provider, previousDetailsJson: string | null | undefined, parsedDetailsJson: string | null | undefined): UsageKeepaliveReason | null {
+  return detectUsageKeepaliveTrigger(provider, previousDetailsJson, parsedDetailsJson)?.reason ?? null;
+}
+
+// 직렬화된 창 키가 같은 초기화 창인지 15분 이내 시각 표기 오차를 허용해 비교한다.
+export function isSameUsageKeepaliveWindow(previousKey: string | null | undefined, currentKey: string | null | undefined): boolean {
+  if (!previousKey || !currentKey) return false;
+  if (previousKey === currentKey) return true;
+  try {
+    const previous = JSON.parse(previousKey) as UsageKeepaliveWindowPart[];
+    const current = JSON.parse(currentKey) as UsageKeepaliveWindowPart[];
+    if (previous.length !== current.length) return false;
+    return previous.every((part, index) => {
+      const candidate = current[index];
+      if (!candidate || part.id !== candidate.id) return false;
+      const previousReset = new Date(part.resetAt ?? "").getTime();
+      const currentReset = new Date(candidate.resetAt ?? "").getTime();
+      if (Number.isNaN(previousReset) || Number.isNaN(currentReset)) return part.resetAt === candidate.resetAt;
+      return Math.abs(previousReset - currentReset) <= KEEPALIVE_RESET_TOLERANCE_MS;
+    });
+  } catch {
+    return false;
+  }
+}
+
+// 창 키가 있으면 새 초기화 창인지 비교하고, 식별 불가 상태에서만 기존 5시간 제한을 사용한다.
+export function isUsageKeepaliveDue(lastSentAt: string | null | undefined, previousWindowKey: string | null | undefined, currentWindowKey: string | null | undefined, now: Date): boolean {
+  if (!lastSentAt) return true;
+  if (currentWindowKey) return !isSameUsageKeepaliveWindow(previousWindowKey, currentWindowKey);
+  const sentAt = new Date(lastSentAt).getTime();
+  return Number.isNaN(sentAt) || now.getTime() - sentAt >= USAGE_KEEPALIVE_COOLDOWN_MS;
+}
+
+// 창 키 도입 전 전송 시각이 현재 Claude 5시간 창 안이면 같은 창의 기존 기록으로 승계한다.
+function isLegacyKeepaliveFromCurrentWindow(lastSentAt: string, currentWindowKey: string): boolean {
+  try {
+    const parts = JSON.parse(currentWindowKey) as UsageKeepaliveWindowPart[];
+    if (parts.length !== 1 || parts[0].id !== "session" || !parts[0].resetAt) return false;
+    const sentAt = new Date(lastSentAt).getTime();
+    const resetAt = new Date(parts[0].resetAt).getTime();
+    if (Number.isNaN(sentAt) || Number.isNaN(resetAt)) return false;
+    const startedAt = resetAt - SESSION_WINDOW_HOURS * 60 * 60_000;
+    return sentAt >= startedAt - KEEPALIVE_RESET_TOLERANCE_MS && sentAt < resetAt;
+  } catch {
+    return false;
+  }
+}
+
 interface MonitorState {
   adapter: ProviderAdapter;
   // 이 조회 PTY가 어느 계정 슬롯의 한도를 보는지. 계정마다 설정 디렉터리가 달라 한도도 따로 계산된다.
@@ -102,6 +260,10 @@ interface MonitorState {
   retryTimer?: NodeJS.Timeout;
   commandIndex: number;
   failureCount: number;
+  // 마지막 정상 반영 이후 연속으로 거부된 조회 횟수(shouldAdoptRejectedUsage 참고).
+  rejectedStreak: number;
+  collectUsageDetails: boolean;
+  usageDetailsCheckedAt?: number;
   // 파싱에 실제로 넘긴 원본 화면 텍스트를 매 조회마다 남겨, 파싱이 왜 실패·이상하게 됐는지 웹에서
   // 직접 확인할 수 있게 한다("숫자만 보지 말고 실제 CLI 화면을 보고 싶다"는 실사용 요청으로 추가함).
   lastSnapshot?: { text: string; capturedAt: string };
@@ -168,11 +330,25 @@ export function detectUsageRegression(previousDetailsJson: string | null, parsed
   });
 }
 
+// 조회 주기가 60초이므로 약 5분에 해당한다. 옛 스냅샷 오염은 보통 한두 주기면 사라지는 반면,
+// 이 횟수만큼 같은 판정이 이어지면 CLI가 계속 그 값을 주고 있다는 뜻이라 실제 최신값으로 본다.
+const REJECTED_ADOPT_STREAK = 5;
+
+// 거부가 연속으로 이어질 때 마지막 정상값 보호를 풀고 최신값을 그대로 채택할지 판단한다.
+// 거부 처리는 마지막 정상값을 무기한 지키기 때문에 탈출구가 없으면 그대로 굳는다(실측: 이미 지난
+// 리셋 시각의 100%가 27분간 유지돼 사용자가 사용량이 갱신되지 않는다고 보고함). 오염값을 잘못
+// 채택해도 다음 주기에 진짜 값이 증가 방향으로 들어와 자동 복구되지만, 갇힘은 스스로 풀리지
+// 않는다는 비대칭 때문에 일정 횟수 뒤에는 최신값을 택한다.
+export function shouldAdoptRejectedUsage(rejectedStreak: number): boolean {
+  return rejectedStreak >= REJECTED_ADOPT_STREAK;
+}
+
 // 공급자별 경량 전용 PTY에서 실제 슬래시 명령을 1분마다 실행한다.
 export class UsageMonitor {
   // 계정마다 조회 PTY가 하나씩이라 "공급자:계정ID"를 키로 쓴다.
   private readonly monitors = new Map<string, MonitorState>();
   private readonly adapters: ProviderAdapter[];
+  private readonly resetCreditRedemptions = new Set<string>();
   private stopping = false;
 
   constructor(
@@ -191,7 +367,7 @@ export class UsageMonitor {
       for (const account of this.accounts.monitorTargets(adapter.id)) {
         const key = monitorKey(adapter.id, account.id);
         if (this.monitors.has(key)) continue;
-        this.monitors.set(key, { adapter, account, screen: new TerminalScreen(), busy: false, commandIndex: 0, failureCount: 0 });
+        this.monitors.set(key, { adapter, account, screen: new TerminalScreen(), busy: false, commandIndex: 0, failureCount: 0, rejectedStreak: 0, collectUsageDetails: false });
       }
     }
   }
@@ -238,9 +414,15 @@ export class UsageMonitor {
     }
   }
 
-  // 현재 저장된 계정별 사용량 상태를 반환한다.
+  // 계정별 사용량 상태에 마지막 최소 단답 전송 기록을 합쳐 반환한다.
   list(): UsageRecord[] {
-    return this.database.prepare("SELECT * FROM usage_status ORDER BY provider, account_id").all() as UsageRecord[];
+    return this.database.prepare(`
+      SELECT usage_status.*, usage_keepalive_prompts.sent_at AS keepalive_sent_at,
+        usage_keepalive_prompts.reason AS keepalive_reason
+      FROM usage_status
+      LEFT JOIN usage_keepalive_prompts USING(provider, account_id)
+      ORDER BY usage_status.provider, usage_status.account_id
+    `).all() as UsageRecord[];
   }
 
   // 가장 최근 사용량 조회 때 파서에 실제로 넘어간 원본 화면 텍스트를 반환한다(터미널 스냅샷 보기용).
@@ -256,6 +438,42 @@ export class UsageMonitor {
       : [...this.monitors.values()].filter((monitor) => monitor.adapter.id === provider);
     if (!targets.length) throw new Error("지원하지 않는 공급자입니다.");
     for (const monitor of targets) this.requestUsage(monitor);
+  }
+
+  // 저장값과 공식 app-server를 모두 확인한 뒤 Codex 초기화권 맨 위 항목 하나를 사용한다.
+  async redeemResetCredit(provider: Provider, accountId?: number): Promise<CodexResetCreditConsumeResult> {
+    if (provider !== "codex") throw new Error("Codex만 초기화권 사용을 지원합니다.");
+    const monitor = this.findMonitor(provider, accountId);
+    if (!monitor) throw new Error("Codex 사용량 조회 계정을 찾을 수 없습니다.");
+    const key = monitorKey(provider, monitor.account.id);
+    if (this.resetCreditRedemptions.has(key)) throw new Error("Codex 초기화권을 이미 사용 중입니다.");
+    const row = this.database.prepare("SELECT details_json FROM usage_status WHERE provider = ? AND account_id = ?")
+      .get(provider, monitor.account.id) as { details_json: string | null } | undefined;
+    let stored: CodexResetCredits | null = null;
+    try {
+      stored = row?.details_json ? storedCodexResetCredits(JSON.parse(row.details_json) as Record<string, unknown>) : null;
+    } catch {
+      stored = null;
+    }
+    if (!stored || stored.availableCount < 1) throw new Error("대시보드에 사용 가능한 Codex 초기화권이 없습니다.");
+    this.resetCreditRedemptions.add(key);
+    try {
+      const result = await consumeCodexResetCredit(this.accounts.environment(monitor.account));
+      if (result.outcome === "nothingToReset") throw new Error("현재 사용량은 초기화가 필요하지 않습니다.");
+      if (result.outcome === "noCredit") throw new Error("사용 가능한 Codex 초기화권이 없습니다.");
+      if (result.outcome !== "reset" && result.outcome !== "alreadyRedeemed") throw new Error("Codex 초기화권을 사용하지 못했습니다.");
+      const current = result.after && result.after.availableCount < result.before.availableCount
+        ? result.after
+        : { availableCount: Math.max(0, result.before.availableCount - 1), expiresAt: null };
+      const detailsJson = mergeCodexResetCredits(row?.details_json ?? JSON.stringify({ windows: [] }), current);
+      const now = new Date().toISOString();
+      monitor.usageDetailsCheckedAt = Date.now();
+      this.update(monitor, { details_json: detailsJson, last_checked_at: now, last_success_at: now });
+      this.requestUsage(monitor);
+      return { ...result, after: current };
+    } finally {
+      this.resetCreditRedemptions.delete(key);
+    }
   }
 
   // 공급자의 조회 대상 하나를 찾는다. 모델 목록처럼 계정과 무관한 조회는 첫 대상을 그대로 쓴다.
@@ -291,6 +509,13 @@ export class UsageMonitor {
     if (monitor.busy) {
       if (monitor.modelOptions) return monitor.modelOptions;
       throw new Error("상태 조회 터미널이 사용 중입니다. 잠시 후 다시 시도해주세요.");
+    }
+    // 메뉴를 열 필요가 없는 공급자는 지금 화면만으로 목록을 만든다. 굳이 `/model`을 보내면 그 공급자에
+    // 따라 인자 입력 대기 상태가 남아 다음 사용량 조회 명령까지 망가진다(grok에서 실측).
+    if (monitor.adapter.promptQuirks?.modelOptionsWithoutMenu) {
+      const options = monitor.adapter.parseModelOptions(monitor.screen.text());
+      if (options.models.length) monitor.modelOptions = options;
+      return options.models.length || !monitor.modelOptions ? options : monitor.modelOptions;
     }
     monitor.busy = true;
     if (monitor.parseTimer) clearTimeout(monitor.parseTimer);
@@ -341,19 +566,23 @@ export class UsageMonitor {
     return text;
   }
 
+  // 계정 환경을 적용한 공급자 상태 조회용 PTY를 새로 만든다.
+  private spawnProviderTerminal(monitor: MonitorState): IPty {
+    const launch = monitor.adapter.createMonitorLaunch?.(process.cwd()) ?? monitor.adapter.createLaunch(process.cwd());
+    return pty.spawn(launch.command, launch.args, {
+      name: "xterm-256color",
+      cols: 120,
+      rows: 40,
+      cwd: process.cwd(),
+      env: { ...process.env, ...launch.env, ...this.accounts.environment(monitor.account), TERM: "xterm-256color" } as Record<string, string>,
+    });
+  }
+
   // 공급자 인터랙티브 CLI를 상태 조회 전용 PTY로 실행한다.
   private startProvider(monitor: MonitorState): void {
-    const launch = monitor.adapter.createMonitorLaunch?.(process.cwd()) ?? monitor.adapter.createLaunch(process.cwd());
     this.update(monitor, { monitor_status: "starting", data_status: "unavailable", error_code: null });
     try {
-      const terminal = pty.spawn(launch.command, launch.args, {
-        name: "xterm-256color",
-        cols: 120,
-        rows: 40,
-        cwd: process.cwd(),
-        // 계정 슬롯의 설정 디렉터리를 지정해야 그 계정의 한도를 조회한다(지정하지 않으면 기본 계정 한도가 나온다).
-        env: { ...process.env, ...launch.env, ...this.accounts.environment(monitor.account), TERM: "xterm-256color" } as Record<string, string>,
-      });
+      const terminal = this.spawnProviderTerminal(monitor);
       monitor.terminal = terminal;
       terminal.onData((data) => monitor.screen.write(data));
       terminal.onExit(() => {
@@ -401,14 +630,34 @@ export class UsageMonitor {
     if (!monitor.terminal || monitor.busy) return;
     monitor.busy = true;
     monitor.commandIndex = 0;
+    const now = Date.now();
+    monitor.collectUsageDetails = !!monitor.adapter.usageDetails && isUsageDetailsDue(monitor.usageDetailsCheckedAt, now);
+    if (monitor.collectUsageDetails) monitor.usageDetailsCheckedAt = now;
     monitor.screen.reset();
     this.update(monitor, { monitor_status: "refreshing", last_checked_at: new Date().toISOString() });
     this.runNextCommand(monitor);
   }
 
+  // 상세 메뉴가 로딩을 마칠 때까지 짧게 재확인하고, 완료 또는 시간 초과 화면을 파싱한다.
+  private waitForUsageDetails(monitor: MonitorState, details: NonNullable<ProviderAdapter["usageDetails"]>, deadline: number): void {
+    const screenText = monitor.screen.text();
+    if (!details.isReady(screenText) && Date.now() < deadline) {
+      monitor.parseTimer = setTimeout(() => this.waitForUsageDetails(monitor, details, deadline), 200);
+      monitor.parseTimer.unref();
+      return;
+    }
+    monitor.parseTimer = undefined;
+    if (details.closeInput) monitor.terminal?.write(details.closeInput);
+    void this.finishUsage(monitor, screenText);
+  }
+
   // 명령 자동완성을 고려해 입력하고 마지막 명령 뒤 화면을 파싱한다.
   private runNextCommand(monitor: MonitorState): void {
-    const command = monitor.adapter.usageCommands[monitor.commandIndex];
+    const details = monitor.adapter.usageDetails;
+    const commands = monitor.collectUsageDetails && details
+      ? [...monitor.adapter.usageCommands, details.command]
+      : monitor.adapter.usageCommands;
+    const command = commands[monitor.commandIndex];
     if (command) {
       monitor.terminal?.write(`${command}\r`);
       // Codex는 슬래시 명령 자동완성 메뉴를 먼저 확정해야 실제 명령이 실행된다. Enter를 즉시
@@ -424,7 +673,20 @@ export class UsageMonitor {
       monitor.parseTimer.unref();
       return;
     }
+    if (monitor.collectUsageDetails && details && monitor.terminal) {
+      monitor.terminal.write(details.openInput);
+      this.waitForUsageDetails(monitor, details, Date.now() + details.timeoutMs);
+      return;
+    }
     const screenText = monitor.screen.text();
+    // 사용량 화면이 모달로 뜨는 공급자(grok)는 파싱을 마친 뒤 닫아야 다음 주기의 조회 명령이 입력창에
+    // 제대로 들어간다. 화면을 읽은 다음에 닫는 순서를 지킨다.
+    if (monitor.adapter.usageScreenCloseInput) monitor.terminal?.write(monitor.adapter.usageScreenCloseInput);
+    void this.finishUsage(monitor, screenText);
+  }
+
+  // 터미널 사용량과 Codex 초기화권을 합친 뒤 마지막 정상값 보호 규칙을 적용한다.
+  private async finishUsage(monitor: MonitorState, screenText: string): Promise<void> {
     monitor.lastSnapshot = { text: screenText, capturedAt: new Date().toISOString() };
     const rawParsed = monitor.adapter.parseUsage(screenText);
     // TODO(임시 상세 로그): 사용량 파싱 오판 추적용. 안정화되면 제거하거나 레벨을 낮춘다.
@@ -438,12 +700,32 @@ export class UsageMonitor {
     // 같은 리셋 시각의 창에서 사용량이 줄었다면 CLI가 돌려준 옛 스냅샷이므로, 이 값으로 마지막
     // 정상값을 덮어쓰지 않고 stale 표시만 남긴다(detectUsageRegression 참고). 다음 주기에 CLI가
     // 다시 최신 값을 주면 퍼센트가 증가 방향이라 그대로 통과돼 자동 복구된다.
-    const previous = this.database.prepare("SELECT details_json FROM usage_status WHERE provider = ? AND account_id = ?")
-      .get(monitor.adapter.id, monitor.account.id) as { details_json: string | null } | undefined;
+    const previous = this.database.prepare("SELECT details_json, reset_at FROM usage_status WHERE provider = ? AND account_id = ?")
+      .get(monitor.adapter.id, monitor.account.id) as { details_json: string | null; reset_at: string | null } | undefined;
+    // TODO(임시 상세 로그): 리셋 직후 reset_at 표기가 폴링마다 안정화되기 전까지 계속 바뀌는지
+    // 추적하기 위한 로그. 리셋 시각이 실제로 몇 번의 폴링만에 고정되는지 확인되면 제거한다.
+    if (success && previous?.reset_at && rawParsed.reset_at && previous.reset_at !== rawParsed.reset_at) {
+      usageLog.info("reset_at_changed", { provider: monitor.adapter.id, accountId: monitor.account.id, from: previous.reset_at, to: rawParsed.reset_at });
+    }
+    if (monitor.adapter.id === "codex" && rawParsed.details_json) {
+      const resetCredits = monitor.collectUsageDetails
+        ? await readCodexResetCredits(this.accounts.environment(monitor.account))
+        : null;
+      rawParsed.details_json = mergeCodexResetCredits(rawParsed.details_json, resetCredits, previous?.details_json);
+    }
     // 세션 리셋 시각이 물리적으로 불가능할 만큼 먼 값(5시간짜리 롤링 윈도우인데 8시간 넘게 남음 등)도
     // 옛 스냅샷과 같은 종류의 오검출이라 같은 방식(stale만 남기고 마지막 정상값 유지)으로 처리한다.
     const implausibleSessionReset = monitor.adapter.id === "claude" && success && isImplausibleClaudeSessionReset(parsed.details_json, new Date());
-    if (success && (detectUsageRegression(previous?.details_json ?? null, parsed.details_json) || implausibleSessionReset)) {
+    const rejected = success && (detectUsageRegression(previous?.details_json ?? null, parsed.details_json) || implausibleSessionReset);
+    monitor.rejectedStreak = rejected ? monitor.rejectedStreak + 1 : 0;
+    // 거부가 계속 이어지면 마지막 정상값이 굳어버리므로 임계치를 넘긴 뒤에는 최신값을 채택한다.
+    const adoptRejected = rejected && shouldAdoptRejectedUsage(monitor.rejectedStreak);
+    if (adoptRejected) {
+      usageLog.warn("rejected-adopted", { provider: monitor.adapter.id, accountId: monitor.account.id, streak: monitor.rejectedStreak, out: parsed });
+      monitor.rejectedStreak = 0;
+    }
+    let keepaliveTrigger: UsageKeepaliveTrigger | null = null;
+    if (rejected && !adoptRejected) {
       this.update(monitor, { monitor_status: "ready", data_status: "stale" });
     } else {
       this.update(monitor, {
@@ -451,10 +733,87 @@ export class UsageMonitor {
         monitor_status: success ? "ready" : "error",
         last_success_at: success ? new Date().toISOString() : undefined,
       });
-      if (success) this.resetNotifier?.observe(monitor.adapter.id, parsed.details_json);
+      if (success) {
+        this.resetNotifier?.observe(monitor.adapter.id, parsed.details_json);
+        keepaliveTrigger = detectUsageKeepaliveTrigger(monitor.adapter.id, previous?.details_json, parsed.details_json);
+      }
     }
-    monitor.busy = false;
+    monitor.collectUsageDetails = false;
     monitor.terminal?.write("\u001b");
+    if (keepaliveTrigger) await this.maybeSendUsageKeepalive(monitor, keepaliveTrigger);
+    monitor.busy = false;
+  }
+
+  // 계정별 초기화 창 중복 기록을 DB에서 확인하고 조회 PTY에 최소 단답 턴을 보낸다.
+  private async maybeSendUsageKeepalive(monitor: MonitorState, trigger: UsageKeepaliveTrigger): Promise<void> {
+    const row = this.database.prepare("SELECT reason, sent_at, window_key FROM usage_keepalive_prompts WHERE provider = ? AND account_id = ?")
+      .get(monitor.adapter.id, monitor.account.id) as { reason: UsageKeepaliveReason; sent_at: string; window_key: string | null } | undefined;
+    const now = new Date();
+    if (!row?.window_key && row?.sent_at && trigger.windowKey && isLegacyKeepaliveFromCurrentWindow(row.sent_at, trigger.windowKey)) {
+      this.database.prepare("UPDATE usage_keepalive_prompts SET window_key = ? WHERE provider = ? AND account_id = ? AND window_key IS NULL")
+        .run(trigger.windowKey, monitor.adapter.id, monitor.account.id);
+      return;
+    }
+    if (!isUsageKeepaliveDue(row?.sent_at, row?.window_key, trigger.windowKey, now)) return;
+    const sentAt = now.toISOString();
+    this.database.prepare(`
+      INSERT INTO usage_keepalive_prompts(provider, account_id, reason, sent_at, window_key) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(provider, account_id) DO UPDATE SET reason = excluded.reason, sent_at = excluded.sent_at, window_key = excluded.window_key
+    `).run(monitor.adapter.id, monitor.account.id, trigger.reason, sentAt, trigger.windowKey);
+    try {
+      await this.sendUsageKeepalivePrompt(monitor);
+      usageLog.info("keepalive", { provider: monitor.adapter.id, accountId: monitor.account.id, reason: trigger.reason });
+      this.realtime.broadcast("usage_updated", { provider: monitor.adapter.id, accountId: monitor.account.id });
+    } catch (error) {
+      if (row) {
+        this.database.prepare("UPDATE usage_keepalive_prompts SET reason = ?, sent_at = ?, window_key = ? WHERE provider = ? AND account_id = ? AND sent_at = ?")
+          .run(row.reason, row.sent_at, row.window_key, monitor.adapter.id, monitor.account.id, sentAt);
+      } else {
+        this.database.prepare("DELETE FROM usage_keepalive_prompts WHERE provider = ? AND account_id = ? AND sent_at = ?")
+          .run(monitor.adapter.id, monitor.account.id, sentAt);
+      }
+      usageLog.warn("keepalive_failed", { provider: monitor.adapter.id, accountId: monitor.account.id, reason: trigger.reason, error });
+    }
+  }
+
+  // 누적 조회 문맥이 모델 입력에 섞이지 않도록 새 PTY에서 최소 턴만 실행하고 즉시 폐기한다.
+  private async sendUsageKeepalivePrompt(monitor: MonitorState): Promise<void> {
+    const terminal = this.spawnProviderTerminal(monitor);
+    const screen = new TerminalScreen();
+    let exited = false;
+    terminal.onData((data) => screen.write(data));
+    terminal.onExit(() => { exited = true; });
+    try {
+      const readyDeadline = Date.now() + 15_000;
+      while (!exited && !monitor.adapter.isReady(screen.text()) && Date.now() < readyDeadline) await wait(100);
+      if (exited || !monitor.adapter.isReady(screen.text())) throw new Error("세션 유지용 터미널이 준비되지 않았습니다.");
+      await wait(250);
+      screen.reset();
+      terminal.write(USAGE_KEEPALIVE_PROMPT);
+      await wait(monitor.adapter.promptQuirks?.pasteSubmitDelayMs ?? 160);
+      terminal.write("\r");
+      const startedAt = Date.now();
+      const deadline = startedAt + 15_000;
+      let retried = false;
+      let sawBusy = false;
+      while (!exited && Date.now() < deadline) {
+        const snapshot = screen.text();
+        const busy = monitor.adapter.isBusy(snapshot);
+        if (busy) sawBusy = true;
+        const answered = snapshot.split("\n").some((line) => line.trim() === "1");
+        if (monitor.adapter.isReady(snapshot) && (sawBusy || answered) && Date.now() - startedAt >= 300) return;
+        if (!retried && Date.now() - startedAt >= 1_000 && !busy) {
+          terminal.write("\r");
+          retried = true;
+        }
+        await wait(100);
+      }
+      if (exited) throw new Error("세션 유지용 터미널이 종료되었습니다.");
+      throw new Error("세션 유지용 단답 응답을 확인하지 못했습니다.");
+    } finally {
+      if (!exited) terminal.kill();
+      screen.dispose();
+    }
   }
 
   // 사용량 상태의 변경 필드만 upsert하고 웹에 알린다.

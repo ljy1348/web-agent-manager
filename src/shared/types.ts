@@ -1,4 +1,4 @@
-export type Provider = "codex" | "claude";
+export type Provider = "codex" | "claude" | "grok";
 
 export interface ProviderMeta {
   id: Provider;
@@ -104,4 +104,6 @@ export interface UsageRecord {
   details_json: string | null;
   last_checked_at: string | null;
   last_success_at: string | null;
+  keepalive_sent_at: string | null;
+  keepalive_reason: "claude_session_missing" | "claude_session_zero" | "codex_reset_zero" | null;
 }

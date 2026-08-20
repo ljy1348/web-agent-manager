@@ -9,7 +9,7 @@ import { AgentIntegrationNotice } from "./components/AgentIntegrationNotice";
 import { CliAuthPanel } from "./components/CliAuthPanel";
 import { ProjectDialog } from "./components/ProjectDialog";
 import {
-  Files, FolderPlus, Gauge, GitPullRequest, KeyRound, MessageSquareText, ScrollText, Trash2, Wrench,
+  Files, FlaskConical, FolderPlus, Gauge, GitPullRequest, KeyRound, MessageSquareText, ScrollText, Trash2, Wrench,
 } from "lucide-react";
 import { Overview } from "./features/overview/Overview";
 import { ChatView } from "./features/chat/ChatView";
@@ -17,6 +17,7 @@ import { FilesView } from "./features/files/FilesView";
 import { InstructionsView } from "./features/instructions/InstructionsView";
 import { GitView } from "./features/git/GitView";
 import { ToolsView } from "./features/tools/ToolsView";
+import { ExperimentsView } from "./features/experiments/ExperimentsView";
 import { notificationPermission, requestNotificationPermission, showNotification } from "./lib/notifications";
 import { initClientLogging } from "./lib/logger";
 import type { Json, Tab } from "./types";
@@ -25,14 +26,15 @@ import type { Json, Tab } from "./types";
 initClientLogging();
 
 // 데스크톱 상단 nav와 모바일 하단 탭바가 같은 탭 목록·라벨을 공유한다.
-const TABS: Tab[] = ["overview", "chat", "files", "instructions", "git", "tools"];
-const TAB_LABELS: Record<Tab, string> = { overview: "대시보드", chat: "채팅", files: "파일", instructions: "지침", git: "GitHub", tools: "도구" };
+const TABS: Tab[] = ["overview", "chat", "files", "instructions", "git", "experiments", "tools"];
+const TAB_LABELS: Record<Tab, string> = { overview: "대시보드", chat: "채팅", files: "파일", instructions: "지침", git: "GitHub", experiments: "실험실", tools: "도구" };
 const TAB_ICONS: Record<Tab, typeof Gauge> = {
   overview: Gauge,
   chat: MessageSquareText,
   files: Files,
   instructions: ScrollText,
   git: GitPullRequest,
+  experiments: FlaskConical,
   tools: Wrench,
 };
 
@@ -103,11 +105,14 @@ function App(): React.ReactElement {
   const [showProjectDialog, setShowProjectDialog] = useState(false);
   const [showCliAuth, setShowCliAuth] = useState(false);
   const [cliAuthPending, setCliAuthPending] = useState(false);
-  const [fileTarget, setFileTarget] = useState<{ projectId: number; path: string; requestId: number } | null>(
+  const [fileTarget, setFileTarget] = useState<{ projectId: number; path: string; line?: number | null; requestId: number } | null>(
     initialNavigation.current.projectId && initialNavigation.current.filePath !== null
       ? { projectId: initialNavigation.current.projectId, path: initialNavigation.current.filePath, requestId: Date.now() }
       : null,
   );
+  // 파일 미리보기의 줄 링크로 채팅을 열었을 때, 그 채팅 입력창에 채워 넣을 참조 텍스트.
+  // ChatView가 이 값이 바뀔 때마다 자기 입력창 상태에 한 번만 반영한다(요청 ID로 중복 적용 방지).
+  const [composerPrefill, setComposerPrefill] = useState<{ requestId: number; text: string } | null>(null);
   // 브라우저 알림 권한 상태. 탭을 새로고침하거나 다른 곳에서 권한을 바꿀 수 있어 마운트 시 한 번 읽어둔다.
   const [notifPermission, setNotifPermission] = useState<NotificationPermission>(() => notificationPermission());
   // ChatView는 tab이 바뀌면 언마운트되므로, 그 안의 useRef(사용자 스크롤 여부·이전 위치)로는 탭을 벗어났다
@@ -583,15 +588,69 @@ function App(): React.ReactElement {
     setTab("chat");
     selectProject(next);
   }
-  // 채팅의 프로젝트 파일 링크를 파일 탭의 정확한 경로 탐색 요청으로 변환한다.
-  function openProjectFile(path: string): void {
+  // 메시지 속 채팅 링크(chat:번호, 입력창의 "#채팅" 멘션이 삽입)를 눌러 프로젝트가 다르더라도
+  // 그 채팅으로 바로 이동한다. popstate 핸들러의 크로스 프로젝트 전환 로직과 같은 순서를 따른다:
+  // 이미 로드된 채팅 목록에 있으면 즉시 전환하고, 없으면 단건 조회로 소속 프로젝트를 확인해 전환한다.
+  async function openChatById(chatId: number): Promise<void> {
+    if (chatRef.current?.id === chatId) { tabRef.current = "chat"; setTab("chat"); return; }
+    logChatTrace("openChatById:start", { chatId, currentChatId: chatRef.current?.id ?? null });
+    const selectionVersion = ++selectionVersionRef.current;
+    chatListRequestRef.current += 1;
+    tabRef.current = "chat";
+    setTab("chat");
+    fileTargetRef.current = null;
+    setFileTarget(null);
+    const known = chats.find((item: Json) => item.id === chatId);
+    if (known) {
+      chatRef.current = known;
+      setChat(known);
+      setMessages([]);
+      setHasMoreMessages(false);
+      setPendingChatTarget(null);
+      syncNavigation("push", { tab: "chat", chatId: known.id, projectId: known.project_id ?? projectRef.current?.id ?? null, filePath: null });
+      return;
+    }
+    chatRef.current = null;
+    setChat(null);
+    setMessages([]);
+    setHasMoreMessages(false);
+    setPendingChatTarget(chatId);
+    try {
+      const data = await api(`/chats/${chatId}`);
+      if (selectionVersionRef.current !== selectionVersion || targetChatIdRef.current !== chatId) return;
+      const nextProject = projects.find((item: Json) => item.id === data.chat.project_id) || null;
+      if (nextProject && projectRef.current?.id !== nextProject.id) {
+        projectRef.current = nextProject;
+        setProject(nextProject);
+      }
+      chatRef.current = data.chat;
+      setChat(data.chat);
+      setPendingChatTarget(null);
+      syncNavigation("push", { tab: "chat", chatId: data.chat.id, projectId: data.chat.project_id, filePath: null });
+    } catch (error: any) {
+      setPendingChatTarget(null);
+      window.alert(error?.message || "채팅을 찾을 수 없습니다.");
+    }
+  }
+  // 채팅의 프로젝트 파일 링크를 파일 탭의 정확한 경로 탐색 요청으로 변환한다. line이 있으면(파일
+  // 미리보기의 줄 링크로 채팅에 걸어둔 참조) 그 줄로 스크롤·강조까지 이어간다.
+  function openProjectFile(path: string, line?: number): void {
     if (!project) return;
-    const nextTarget = { projectId: project.id, path, requestId: Date.now() };
+    const nextTarget = { projectId: project.id, path, line: line ?? null, requestId: Date.now() };
     fileTargetRef.current = nextTarget;
     setFileTarget(nextTarget);
     tabRef.current = "files";
     setTab("files");
     syncNavigation("push", { tab: "files", projectId: project.id, filePath: path });
+  }
+  // 파일 미리보기의 특정 줄을 채팅에 연결한다. 기존 채팅을 골랐으면 그 채팅으로(프로젝트가 달라도)
+  // 이동하고, provider를 골랐으면 현재 프로젝트에 새 채팅을 만든 뒤, 두 경우 모두 입력창에
+  // "[경로:줄](경로#L줄)" 참조를 채워 넣어 사용자가 확인하고 보낼 수 있게 한다.
+  async function linkFileLineToChat(filePath: string, line: number, target: { chatId: number } | { provider: string; accountId?: number | null }): Promise<void> {
+    if ("chatId" in target) await openChatById(target.chatId);
+    else await createChat(target.provider, target.accountId ?? null);
+    const href = `${filePath.split("/").filter(Boolean).map(encodeURIComponent).join("/")}#L${line}`;
+    setComposerPrefill({ requestId: Date.now(), text: `[${filePath}:${line}](${href})` });
   }
   // 파일 탭 안의 폴더·미리보기 이동도 브라우저 뒤로가기로 복원되도록 기록한다.
   function navigateFile(path: string): void {
@@ -614,7 +673,7 @@ function App(): React.ReactElement {
     <div className="project-bar"><span className="project-bar-label">작업 프로젝트</span><select aria-label="작업 프로젝트" value={project?.id || ""} onChange={(event) => selectProject(projects.find((item) => item.id === Number(event.target.value)) || null)}><option value="">프로젝트 없음</option>{projects.map((item) => <option value={item.id} key={item.id}>{item.name} · {shortProjectPath(item.path, defaultProjectPath)}</option>)}</select><button className="project-add" aria-label="프로젝트" onClick={addProject}><FolderPlus size={16} /><span>프로젝트 추가</span></button>{project && <button type="button" className="project-delete" title="목록에서 프로젝트 삭제" aria-label="목록에서 프로젝트 삭제" onClick={() => void deleteProject(project)}><Trash2 size={16} /></button>}</div>
     <AgentIntegrationNotice user={user} />
     {error && <div className="global-error" onClick={() => setError("")}>{error}</div>}
-    <main className={`main${tab === "chat" ? " main-chat" : ""}${tab === "chat" && user.chat_view_mode === "terminal" ? " main-chat-terminal" : ""}`}>{tab === "overview" && <Overview user={user} providers={providers} usage={usage} system={system} runtime={runtime} slack={slack} ntfy={ntfy} refresh={loadCore} />}{tab === "chat" && <ChatView user={user} chatViewMode={user.chat_view_mode === "terminal" ? "terminal" : "chat"} changeChatViewMode={changeChatViewMode} providers={providers} accounts={accounts} project={project} projects={projects} setProject={selectProject} addProject={addProject} deleteProject={deleteProject} chats={chats} selectedChat={chat} setSelectedChat={selectChat} refreshChats={refetchChats} createChat={createChat} send={send} stop={stop} interrupt={interrupt} cycleMode={cycleMode} startChat={startChat} messages={messages} hasMoreMessages={hasMoreMessages} loadMoreMessages={loadMoreMessages} usage={usage} busy={!!chat?.busy} socket={socket} approvals={approvals} decide={decide} scrollState={chatScrollStateRef.current} sessionBackups={sessionBackups} backupChat={backupChat} deleteChat={deleteChat} restoreBackup={restoreBackup} deleteBackup={deleteBackup} onOpenProjectFile={openProjectFile} />}{tab === "files" && <FilesView project={project} chat={chat} target={fileTarget} onNavigate={navigateFile} />}{tab === "instructions" && <InstructionsView project={project} chat={chat} />}{tab === "git" && <GitView project={project} user={user} chat={chat} providers={providers} refreshChats={refetchChats} onOpenProject={(next) => void openProject(next)} onOpenChat={(next) => { selectChat(next); setTab("chat"); }} />}{tab === "tools" && <ToolsView project={project} />}</main>
+    <main className={`main${tab === "chat" ? " main-chat" : ""}${tab === "chat" && user.chat_view_mode === "terminal" ? " main-chat-terminal" : ""}`}>{tab === "overview" && <Overview user={user} providers={providers} usage={usage} system={system} runtime={runtime} slack={slack} ntfy={ntfy} refresh={loadCore} />}{tab === "chat" && <ChatView user={user} chatViewMode={user.chat_view_mode === "terminal" ? "terminal" : "chat"} changeChatViewMode={changeChatViewMode} providers={providers} accounts={accounts} project={project} projects={projects} setProject={selectProject} addProject={addProject} deleteProject={deleteProject} chats={chats} selectedChat={chat} setSelectedChat={selectChat} refreshChats={refetchChats} createChat={createChat} send={send} stop={stop} interrupt={interrupt} cycleMode={cycleMode} startChat={startChat} messages={messages} hasMoreMessages={hasMoreMessages} loadMoreMessages={loadMoreMessages} usage={usage} busy={!!chat?.busy} socket={socket} approvals={approvals} decide={decide} scrollState={chatScrollStateRef.current} sessionBackups={sessionBackups} backupChat={backupChat} deleteChat={deleteChat} restoreBackup={restoreBackup} deleteBackup={deleteBackup} onOpenProjectFile={openProjectFile} onOpenChat={openChatById} composerPrefill={composerPrefill} />}{tab === "files" && <FilesView project={project} chat={chat} target={fileTarget} onNavigate={navigateFile} providers={providers} projects={projects} onLinkFileLine={linkFileLineToChat} />}{tab === "instructions" && <InstructionsView project={project} chat={chat} />}{tab === "git" && <GitView project={project} user={user} chat={chat} providers={providers} refreshChats={refetchChats} onOpenProject={(next) => void openProject(next)} onOpenChat={(next) => { selectChat(next); setTab("chat"); }} />}{tab === "experiments" && <ExperimentsView project={project} />}{tab === "tools" && <ToolsView project={project} />}</main>
     <ProjectDialog open={showProjectDialog} defaultPath={defaultProjectPath} onClose={() => setShowProjectDialog(false)} onProject={(next) => void openProject(next)} />
     <CliAuthPanel open={showCliAuth} user={user} socket={socket} onClose={() => setShowCliAuth(false)} onRequireOpen={() => setShowCliAuth(true)} onPendingChange={setCliAuthPending} />
     {/* 데스크톱 상단 header/nav는 모바일에서 전부 display:none이라, 채팅 탭 말고는 갈 방법이 없었다.
