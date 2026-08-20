@@ -14,8 +14,21 @@ import { parseExperimentVariantConfig } from "../src/shared/experiments";
 
 const roots: string[] = [];
 
+// prepare()가 만든 읽기 전용(0o555) 번들 디렉터리는 root가 아니면 그대로 삭제할 수 없어 정리 전에 권한을 복원한다.
+function unlockForCleanup(root: string): void {
+  if (!fs.existsSync(root)) return;
+  fs.chmodSync(root, 0o700);
+  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+    if (entry.isDirectory()) unlockForCleanup(path.join(root, entry.name));
+  }
+}
+
 afterEach(() => {
-  while (roots.length) fs.rmSync(roots.pop()!, { recursive: true, force: true });
+  while (roots.length) {
+    const root = roots.pop()!;
+    unlockForCleanup(root);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 // 임시 경로를 만들고 테스트 종료 시 정리 목록에 등록한다.
