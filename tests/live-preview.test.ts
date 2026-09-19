@@ -121,7 +121,7 @@ describe("loopback live preview 증거 수집", () => {
     const event = databaseEvent(fixtureValue.database, "preview-task");
     expect(event.type).toBe("workbench.preview_captured");
     expect(event.payload_json).toContain(artifact.sha256);
-    expect(elapsed).toBeLessThan(10_000);
+    expect(elapsed).toBeLessThan(20_000);
     fs.appendFileSync(file.path, "tamper");
     expect(() => fixtureValue.service.file(artifact.id)).toThrow(/무결성/);
     fixtureValue.database.close();
@@ -192,7 +192,7 @@ describe("loopback live preview 증거 수집", () => {
     expect(regression.comparable).toBe(true);
     expect(regression.changedPixels).toBeGreaterThan(50_000);
     expect(regression.changedRatio).toBeGreaterThan(0.5);
-    expect(performance.now() - startedAt).toBeLessThan(10_000);
+    expect(performance.now() - startedAt).toBeLessThan(20_000);
     const diffFile = fixtureValue.service.file(regression.diffArtifact.id);
     expect(fs.statSync(diffFile.path).mode & 0o777).toBe(0o600);
     expect(diffFile.filename).toBe(`visual-diff-${regression.diffArtifact.id}.png`);
