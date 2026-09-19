@@ -135,8 +135,10 @@ function resultPayload(block: Record<string, unknown>): Record<string, unknown> 
   return objectValue(content) ?? { ...block, content };
 }
 
-// Claude stream-json 한 레코드를 공급자 중립 이벤트로 변환한다.
-export function normalizeClaudePrintEvent(raw: Record<string, unknown>, occurredAt = new Date().toISOString()): RuntimeEvent[] {
+// Claude stream-json 한 레코드를 공급자 중립 이벤트로 변환한다. Grok headless의
+// streaming-messages-json이 같은 wire format이라 그쪽도 이 함수를 쓰며, 오류 문구에 엉뚱한 공급자
+// 이름이 남지 않도록 표시 이름만 인자로 받는다.
+export function normalizeClaudePrintEvent(raw: Record<string, unknown>, occurredAt = new Date().toISOString(), providerLabel = "Claude"): RuntimeEvent[] {
   const type = typeof raw.type === "string" ? raw.type : "";
   const parentToolCallId = eventId(raw.parent_tool_use_id);
   if (type === "system") {
@@ -187,7 +189,7 @@ export function normalizeClaudePrintEvent(raw: Record<string, unknown>, occurred
           : "runtime_error";
       const error = typeof raw.result === "string" && raw.result.trim()
         ? raw.result
-        : `Claude 실행이 ${subtype || "unknown"} 상태로 종료됐습니다.`;
+        : `${providerLabel} 실행이 ${subtype || "unknown"} 상태로 종료됐습니다.`;
       events.push({ type: "failed", error, reason, occurredAt });
     }
     return events;

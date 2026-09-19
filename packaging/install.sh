@@ -93,6 +93,10 @@ ensure_gh() {
     printf '%s\n' "GitHub CLI(gh)를 설치하세요: https://cli.github.com/" >&2
     exit 1
   fi
+  if ! gh auth login --help 2>&1 | grep -q -- "--skip-ssh-key"; then
+    printf '%s\n' "설치된 GitHub CLI(gh)가 오래되어 gh auth login --skip-ssh-key를 지원하지 않습니다. GitHub 로그인이 실패하므로 최신 버전을 설치하세요: https://cli.github.com/" >&2
+    exit 1
+  fi
 }
 ensure_gh
 # node-pty 등 네이티브 모듈은 이 환경용 prebuild가 없으면 npm이 그 자리에서 컴파일을

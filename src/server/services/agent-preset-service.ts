@@ -1,11 +1,20 @@
 import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import type { AppDatabase } from "../core/database";
 import { ExperimentRepository } from "./experiment-repository";
+import type { Provider } from "../../shared/types";
+import { registeredProjectProfileRecommendation } from "./project-profile-recommendations";
+import { projectProfileLaunch } from "./project-profile-launch";
+
+export type ProjectTaskKind = "analysis" | "implementation" | "high_risk" | "operations";
+const PROJECT_TASK_KINDS: ProjectTaskKind[] = ["analysis", "implementation", "high_risk", "operations"];
 
 export interface AgentPresetRecord {
   id: string;
   projectId: number;
   name: string;
+  taskKind: ProjectTaskKind;
   status: "draft" | "active" | "archived";
   activeVersion: number | null;
   versions: Array<{
@@ -60,10 +69,10 @@ export class AgentPresetService {
   // 프로젝트의 프리셋과 최신순 버전을 반환한다.
   list(projectId: number): AgentPresetRecord[] {
     const presets = this.database.prepare("SELECT * FROM agent_presets WHERE project_id = ? ORDER BY updated_at DESC, name").all(projectId) as Array<{
-      id: string; project_id: number; name: string; status: AgentPresetRecord["status"]; active_version: number | null;
+      id: string; project_id: number; name: string; task_kind: ProjectTaskKind; status: AgentPresetRecord["status"]; active_version: number | null;
     }>;
     return presets.map((preset) => ({
-      id: preset.id, projectId: preset.project_id, name: preset.name, status: preset.status, activeVersion: preset.active_version,
+      id: preset.id, projectId: preset.project_id, name: preset.name, taskKind: preset.task_kind, status: preset.status, activeVersion: preset.active_version,
       versions: (this.database.prepare("SELECT * FROM agent_preset_versions WHERE preset_id = ? ORDER BY version DESC").all(preset.id) as AgentPresetVersionRow[]).map((version) => ({
         id: version.id, version: version.version, configSnapshot: JSON.parse(version.config_snapshot_json),
         sourceExperimentId: version.source_experiment_id, sourceVariantId: version.source_variant_id, sourceRunId: version.source_run_id,
@@ -73,12 +82,177 @@ export class AgentPresetService {
     }));
   }
 
+  readiness(): Record<string, unknown> {
+    const projects = this.database.prepare("SELECT id, name FROM projects WHERE active=1 ORDER BY name, id").all() as Array<{ id: number; name: string }>;
+    const rows = projects.map((project) => {
+      const profiles = this.list(project.id);
+      const requiredTaskKinds: ProjectTaskKind[] = ["analysis", "implementation"];
+      const taskKinds = requiredTaskKinds.map((taskKind) => {
+        const profile = profiles.find((item) => item.taskKind === taskKind && item.status === "active" && item.activeVersion !== null);
+        const version = profile?.versions.find((item) => item.version === profile.activeVersion);
+        const config = version?.configSnapshot as Record<string, any> | undefined;
+        const issues = [
+          ...(!profile || !version ? ["active_profile_missing"] : []),
+          ...(version && (!Array.isArray(config?.verification?.steps) || !config!.verification.steps.length) ? ["verification_steps_missing"] : []),
+          ...(version && (!Array.isArray(config?.protectedActions) || !config!.protectedActions.length) ? ["protected_actions_missing"] : []),
+        ];
+        return { taskKind, ready: issues.length === 0, profileId: profile?.id ?? null, profileName: profile?.name ?? null, activeVersion: profile?.activeVersion ?? null, issues };
+      });
+      let detectedWarnings: string[] = [];
+      let detectedScripts: string[] = [];
+      try {
+        const draft = this.draft(project.id, "claude", "implementation") as { warnings?: string[]; detected?: { scripts?: string[] } };
+        detectedWarnings = [...new Set(draft.warnings ?? [])]; detectedScripts = draft.detected?.scripts ?? [];
+      } catch { detectedWarnings = ["project_analysis_failed"]; }
+      const ready = taskKinds.every((item) => item.ready) && detectedWarnings.length === 0;
+      return { projectId: project.id, projectName: project.name, ready, taskKinds, detectedWarnings, detectedScripts };
+    });
+    return { totalProjects: rows.length, readyProjects: rows.filter((row) => row.ready).length, requiredTaskKinds: ["analysis", "implementation"], projects: rows };
+  }
+
+  // 실험 없이 사용자가 검토한 일반 project profile의 첫 불변 version을 만든다.
+  createManual(input: { projectId: number; userId: number; name: unknown; taskKind: unknown; configSnapshot: unknown; note?: unknown }): AgentPresetRecord {
+    const name = textValue(input.name, 200, "프로필 이름", true)!;
+    const taskKind = this.taskKind(input.taskKind);
+    const project = this.database.prepare("SELECT id, path FROM projects WHERE id = ? AND active = 1").get(input.projectId) as { id: number; path: string } | undefined;
+    if (!project) throw new Error("프로젝트를 찾을 수 없습니다.");
+    const config = this.profileConfig(input.configSnapshot, taskKind);
+    projectProfileLaunch(JSON.stringify(config), project.path);
+    const note = textValue(input.note, 20_000, "프로필 메모", false);
+    const id = crypto.randomUUID();
+    const versionId = crypto.randomUUID();
+    this.database.transaction(() => {
+      this.database.prepare(`
+        INSERT INTO agent_presets(id, project_id, name, task_kind, created_by) VALUES (?, ?, ?, ?, ?)
+      `).run(id, input.projectId, name, taskKind, input.userId);
+      this.database.prepare(`
+        INSERT INTO agent_preset_versions(id, preset_id, version, config_snapshot_json, compatibility_json, note, created_by)
+        VALUES (?, ?, 1, ?, ?, ?, ?)
+      `).run(versionId, id, JSON.stringify(config), JSON.stringify({ status: "unvalidated", warnings: ["사용자 검토 후 활성화가 필요합니다."] }), note, input.userId);
+    })();
+    return this.list(input.projectId).find((preset) => preset.id === id)!;
+  }
+
+  // 기존 version을 덮어쓰지 않고 같은 profile에 다음 version을 추가한다.
+  addManualVersion(input: { projectId: number; presetId: string; userId: number; configSnapshot: unknown; note?: unknown }): AgentPresetRecord {
+    const preset = this.database.prepare(`SELECT ap.id, ap.task_kind, p.path AS project_path
+      FROM agent_presets ap JOIN projects p ON p.id=ap.project_id
+      WHERE ap.id = ? AND ap.project_id = ? AND ap.status <> 'archived' AND p.active=1`)
+      .get(input.presetId, input.projectId) as { id: string; task_kind: ProjectTaskKind; project_path: string } | undefined;
+    if (!preset) throw new Error("프로필을 찾을 수 없습니다.");
+    const config = this.profileConfig(input.configSnapshot, preset.task_kind);
+    projectProfileLaunch(JSON.stringify(config), preset.project_path);
+    const note = textValue(input.note, 20_000, "프로필 메모", false);
+    this.database.transaction(() => {
+      const latest = this.database.prepare("SELECT COALESCE(MAX(version), 0) AS version FROM agent_preset_versions WHERE preset_id = ?").get(preset.id) as { version: number };
+      this.database.prepare(`
+        INSERT INTO agent_preset_versions(id, preset_id, version, config_snapshot_json, compatibility_json, note, created_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(crypto.randomUUID(), preset.id, latest.version + 1, JSON.stringify(config), JSON.stringify({ status: "unvalidated", warnings: ["사용자 검토 후 활성화가 필요합니다."] }), note, input.userId);
+      this.database.prepare("UPDATE agent_presets SET updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(preset.id);
+    })();
+    return this.list(input.projectId).find((entry) => entry.id === preset.id)!;
+  }
+
+  // 명시한 불변 version만 활성화한다. 최신 version을 암묵 선택하지 않아 검토 대상이 바뀌지 않는다.
+  activate(input: { projectId: number; presetId: string; versionId: string }): AgentPresetRecord {
+    const version = this.database.prepare(`
+      SELECT v.version, v.config_snapshot_json, project.path AS project_path
+      FROM agent_preset_versions v JOIN agent_presets p ON p.id = v.preset_id
+      JOIN projects project ON project.id=p.project_id
+      WHERE p.id = ? AND p.project_id = ? AND v.id = ? AND p.status <> 'archived' AND project.active=1
+    `).get(input.presetId, input.projectId, input.versionId) as { version: number; config_snapshot_json: string; project_path: string } | undefined;
+    if (!version) throw new Error("활성화할 프로젝트 프로필 version을 찾을 수 없습니다.");
+    projectProfileLaunch(version.config_snapshot_json, version.project_path);
+    this.database.transaction(() => {
+      this.database.prepare(`
+        UPDATE agent_presets SET status = 'draft', updated_at = CURRENT_TIMESTAMP
+        WHERE project_id = ? AND task_kind = (SELECT task_kind FROM agent_presets WHERE id = ?) AND id <> ? AND status = 'active'
+      `).run(input.projectId, input.presetId, input.presetId);
+      this.database.prepare("UPDATE agent_presets SET status = 'active', active_version = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+        .run(version.version, input.presetId);
+    })();
+    return this.list(input.projectId).find((entry) => entry.id === input.presetId)!;
+  }
+
+  // 프로젝트 파일을 읽어 검토용 초안만 반환한다. DB에는 저장하거나 활성화하지 않는다.
+  draft(projectId: number, provider: Provider, taskKindValue: unknown): Record<string, unknown> {
+    const taskKind = this.taskKind(taskKindValue);
+    const project = this.database.prepare("SELECT name, path FROM projects WHERE id = ? AND active = 1").get(projectId) as { name: string; path: string } | undefined;
+    if (!project) throw new Error("프로젝트를 찾을 수 없습니다.");
+    const instructions = ["AGENTS.md", "CLAUDE.md"].map((name) => ({ name, present: fs.existsSync(path.join(project.path, name)) }));
+    const claudeFile = path.join(project.path, "CLAUDE.md");
+    const claudeImportsAgents = instructions.every((entry) => !entry.present) || !instructions.find((entry) => entry.name === "AGENTS.md")?.present
+      || (instructions.find((entry) => entry.name === "CLAUDE.md")?.present
+        && fs.readFileSync(claudeFile, "utf8").slice(0, 256 * 1024).split(/\r?\n/).some((line) => /^\s*@(?:\.\/)?AGENTS\.md\s*$/.test(line)));
+    const scripts: Record<string, string> = {};
+    const packageFile = path.join(project.path, "package.json");
+    if (fs.existsSync(packageFile)) {
+      try {
+        const manifest = JSON.parse(fs.readFileSync(packageFile, "utf8")) as { scripts?: Record<string, unknown> };
+        for (const [name, command] of Object.entries(manifest.scripts ?? {})) if (typeof command === "string") scripts[name] = command;
+      } catch {
+        // 잘못된 manifest는 초안 생성을 막지 않고 경고로 드러낸다.
+      }
+    }
+    const genericRecipe = ["typecheck", "lint", "test", "build"].filter((name) => scripts[name]).map((name) => ({ kind: name === "test" ? "full_test" : name === "build" ? "build" : "static", command: `npm run ${name}`, argv: ["npm", "run", name], required: true }));
+    const recommendation = registeredProjectProfileRecommendation(project.name, project.path, Object.keys(scripts));
+    const recipe = recommendation?.verificationSteps ?? genericRecipe;
+    const sandbox = taskKind === "analysis" ? "read-only" : "workspace-write";
+    return {
+      name: `${project.name} ${taskKind}`,
+      taskKind,
+      detected: {
+        packageManager: fs.existsSync(path.join(project.path, "package-lock.json")) ? "npm" : null,
+        scripts: Object.keys(scripts), instructions, recommendationId: recommendation?.id ?? null,
+      },
+      configSnapshot: {
+        schemaVersion: 1,
+        taskKind,
+        ...(recommendation ? { profileTemplate: { id: recommendation.id, source: "registered_project_catalog" } } : {}),
+        runtime: { provider, ...(recommendation?.reasoningEffort ? { reasoningEffort: recommendation.reasoningEffort } : {}) },
+        permissions: { sandbox, approvalMode: taskKind === "operations" || taskKind === "high_risk" ? "on-request" : "untrusted", additionalWritePaths: [] },
+        instructions: { files: instructions.filter((entry) => entry.present).map((entry) => entry.name) },
+        verification: { steps: recipe },
+        protectedActions: recommendation?.protectedActions ?? ["deploy", "database_migration", "process_restart", "credential_change"],
+        budget: {},
+      },
+      warnings: [
+        ...instructions.filter((entry) => !entry.present).map((entry) => `${entry.name} 없음`),
+        ...(provider === "claude" && !claudeImportsAgents ? ["CLAUDE.md import 불일치"] : []),
+        ...(recipe.length ? [] : ["검증 명령 없음"]),
+        ...(recommendation?.warnings ?? []),
+      ],
+    };
+  }
+
+  private taskKind(value: unknown): ProjectTaskKind {
+    if (typeof value !== "string" || !PROJECT_TASK_KINDS.includes(value as ProjectTaskKind)) throw new Error("유효한 작업 종류가 필요합니다.");
+    return value as ProjectTaskKind;
+  }
+
+  private profileConfig(value: unknown, taskKind: ProjectTaskKind): Record<string, unknown> {
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("프로필 설정 snapshot이 필요합니다.");
+    const config = structuredClone(value as Record<string, unknown>);
+    const runtime = config.runtime;
+    if (!runtime || typeof runtime !== "object" || !["codex", "claude", "grok"].includes(String((runtime as Record<string, unknown>).provider))) {
+      throw new Error("프로필 runtime provider가 올바르지 않습니다.");
+    }
+    if (config.taskKind !== undefined && config.taskKind !== taskKind) throw new Error("프로필 설정의 작업 종류가 일치하지 않습니다.");
+    config.taskKind = taskKind;
+    return config;
+  }
+
   // 완료 run과 사용자 accepted 판정을 새 preset version으로 transaction 승격한다.
   promote(input: { runId: string; userId: number; name: unknown; note?: unknown; activate?: boolean }): AgentPresetRecord {
     const run = this.experiments.getRun(input.runId);
     if (!run || run.status !== "completed") throw new Error("완료 run만 프리셋으로 승격할 수 있습니다.");
     const experiment = this.experiments.getExperiment(run.experimentId);
     if (!experiment) throw new Error("실험을 찾을 수 없습니다.");
+    const project = this.database.prepare("SELECT path FROM projects WHERE id = ? AND active = 1").get(experiment.projectId) as { path: string } | undefined;
+    if (!project) throw new Error("프로젝트를 찾을 수 없습니다.");
+    // 실험 결과도 일반 profile과 같은 실행 경계를 통과한 뒤에만 version/accepted 판정을 남긴다.
+    projectProfileLaunch(JSON.stringify(run.configSnapshot), project.path);
     const name = textValue(input.name, 200, "프리셋 이름", true)!;
     const note = textValue(input.note, 20_000, "승격 메모", false);
     const runs = this.experiments.listRuns({ variantId: run.variantId, limit: 500 });

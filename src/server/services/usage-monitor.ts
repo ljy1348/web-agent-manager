@@ -1,3 +1,7 @@
+import { execFile } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import * as pty from "node-pty";
 import type { IPty } from "node-pty";
 import type { AppDatabase } from "../core/database";
@@ -8,10 +12,11 @@ import type { AgentAccountService } from "./agent-accounts";
 import { TerminalScreen } from "./terminal-screen";
 import { todayResetTime } from "../providers/usage-utils";
 import { createLogger } from "../core/logger";
+import type { Notifier } from "./notifier";
 import type { UsageResetNotifier } from "./usage-reset-notifier";
 import { parseUsageResetMoment } from "./usage-reset-notifier";
 import { consumeCodexResetCredit, readCodexResetCredits, type CodexResetCredits, type CodexResetCreditConsumeResult } from "../providers/codex-rate-limits";
-import { USAGE_KEEPALIVE_COOLDOWN_MS, USAGE_KEEPALIVE_PROMPT } from "../../shared/usage-keepalive";
+import { CODEX_USAGE_KEEPALIVE_MAX_ATTEMPTS, USAGE_KEEPALIVE_COOLDOWN_MS, usageKeepaliveHasRemainingAttempts, usageKeepaliveMinimumResponseChars, usageKeepalivePrompt } from "../../shared/usage-keepalive";
 
 const usageLog = createLogger("usage-check");
 
@@ -24,6 +29,125 @@ const usageLog = createLogger("usage-check");
 const SESSION_RESET_GRACE_MS = 2 * 60_000;
 const SESSION_WINDOW_HOURS = 5;
 const USAGE_DETAILS_INTERVAL_MS = 24 * 60 * 60_000;
+
+// 조회 전용 PTY를 오래 켜두면 Claude CLI가 /usage 요청에 프로세스 시작 시점의 캐시를 간헐적으로
+// 그대로 돌려준다(실측 #52: 16시간 된 PTY가 최신값 "2pm 13%"와 시작 당시 값 "6pm 89%"를 매분
+// 번갈아 반환. 같은 명령으로 새로 띄운 PTY는 6회 조회 6회 모두 최신값이었고, 그 PTY를 재시작하자
+// 10분 관찰에서 옛 값이 한 번도 나오지 않았다). CLI 쪽 동작이라 파싱으로는 막을 수 없어, 캐시가
+// 묵기 전에 주기적으로 새 프로세스로 갈아탄다.
+const MONITOR_PTY_MAX_AGE_MS = 3 * 60 * 60_000;
+
+// 초기화 감지 뒤 고정 메시지를 보내기까지 두는 간격. 이 사이에 조회 PTY를 새로 띄워, CLI가 아직
+// 옛 창을 들고 있는 경계 구간을 지나 새 창을 정확히 잡은 상태에서 고정하도록 한다(#57).
+const KEEPALIVE_RESTART_DELAY_MS = 60_000;
+// 고정용 임시 PTY가 뜨기를 기다리는 한계. Codex는 15초 안에 준비되지 않아 고정이 통째로 실패했다.
+const KEEPALIVE_READY_TIMEOUT_MS = 90_000;
+// 전송 또는 사후 고정 확인이 실패했을 때 다음 시도까지 한 번의 조회 주기를 둔다. 첫 시도는
+// KEEPALIVE_RESTART_DELAY_MS 뒤 그대로 나가고, 실패한 0% 창은 1분 뒤 더 긴 문구로 재시도한다.
+const KEEPALIVE_RETRY_INTERVAL_MS = 60_000;
+// Codex 응답 뒤 첫 사용량 재확인을 당기는 시간과, 0% reset 시각이 정말 멈췄는지 보는 최소 간격.
+const KEEPALIVE_VERIFY_DELAY_MS = 10_000;
+// reset 표시는 분 단위라 60초보다 길게 떨어져야, 계속 미끄러지는 창을 같은 문자열로 오인하지 않는다.
+const KEEPALIVE_STABLE_RESET_INTERVAL_MS = 75_000;
+// 격리된 Codex exec는 정상 실측에서 7~10초에 끝났지만 공급자 지연을 감안해 충분한 한계를 둔다.
+const CODEX_KEEPALIVE_EXEC_TIMEOUT_MS = 180_000;
+const CODEX_KEEPALIVE_EXEC_MAX_BUFFER_BYTES = 2 * 1024 * 1024;
+
+export interface CodexKeepaliveExecSummary {
+  responseChars: number;
+  usage: Record<string, unknown> | null;
+}
+
+// 대화형 TUI 화면은 답변 스트리밍 중에도 빈 composer를 다시 보여 완료로 오인된다. Codex의
+// 비대화형 JSON 실행 인자만 사용해 프로젝트 지침·쓰기 권한·MCP 설정을 고정 턴에서 분리한다.
+export function codexKeepaliveExecArgs(isolatedDirectory: string, prompt: string): string[] {
+  return [
+    "exec",
+    "-C", isolatedDirectory,
+    "--skip-git-repo-check",
+    "--ignore-user-config",
+    "--ignore-rules",
+    "--sandbox", "read-only",
+    "--color", "never",
+    "--json",
+    prompt,
+  ];
+}
+
+// 정상 종료만으로는 빈 응답도 성공할 수 있으므로 JSON 이벤트에서 완결된 agent_message와
+// turn.completed를 함께 요구한다. 일부 스트리밍 텍스트는 item.completed가 아니어서 통과하지 못한다.
+export function parseCodexKeepaliveExecOutput(output: string, minimumResponseChars: number): CodexKeepaliveExecSummary {
+  let response = "";
+  let completed = false;
+  let usage: Record<string, unknown> | null = null;
+  for (const line of output.split("\n").map((value) => value.trim()).filter(Boolean)) {
+    let event: Record<string, unknown>;
+    try {
+      event = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    const type = typeof event.type === "string" ? event.type : "";
+    if (type === "turn.failed" || type === "error") throw new Error("Codex 세션 유지 턴이 실패했습니다.");
+    if (type === "item.completed" && event.item && typeof event.item === "object") {
+      const item = event.item as Record<string, unknown>;
+      if (item.type === "agent_message" && typeof item.text === "string") response = item.text.trim();
+      if (["command_execution", "file_change", "mcp_tool_call", "web_search"].includes(String(item.type))) {
+        throw new Error("Codex 세션 유지 턴이 격리 응답 외 도구를 실행했습니다.");
+      }
+    }
+    if (type === "turn.completed") {
+      completed = true;
+      usage = event.usage && typeof event.usage === "object" ? event.usage as Record<string, unknown> : null;
+    }
+  }
+  if (!completed) throw new Error("Codex 세션 유지 턴 완료 이벤트를 확인하지 못했습니다.");
+  const responseChars = Array.from(response).length;
+  if (responseChars < minimumResponseChars) {
+    throw new Error(`Codex 세션 유지 답변이 너무 짧습니다(${responseChars}/${minimumResponseChars}자).`);
+  }
+  return { responseChars, usage };
+}
+
+// 계정 인증 환경만 전달하고 매 실행마다 빈 임시 cwd를 만든다. 세션 JSONL은 보존해 이후에도 실제
+// 질문·답변을 감사할 수 있지만, 정확한 keepalive 문구라 history-sync가 일반 채팅에서는 숨긴다.
+export async function runCodexKeepaliveExec(options: {
+  command: string;
+  env: Record<string, string>;
+  prompt: string;
+  minimumResponseChars: number;
+}): Promise<CodexKeepaliveExecSummary> {
+  const isolatedDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "wam-codex-keepalive-"));
+  try {
+    const output = await new Promise<string>((resolve, reject) => {
+      const child = execFile(options.command, codexKeepaliveExecArgs(isolatedDirectory, options.prompt), {
+        cwd: isolatedDirectory,
+        env: options.env,
+        encoding: "utf8",
+        timeout: CODEX_KEEPALIVE_EXEC_TIMEOUT_MS,
+        maxBuffer: CODEX_KEEPALIVE_EXEC_MAX_BUFFER_BYTES,
+      }, (error, stdout, stderr) => {
+        if (error) {
+          const detail = stderr.trim().split("\n").slice(-1)[0];
+          reject(new Error(`Codex 세션 유지 실행 실패: ${error.message}${detail ? ` (${detail})` : ""}`));
+          return;
+        }
+        resolve(stdout);
+      });
+      // execFile의 기본 stdin pipe를 열어두면 Codex가 프롬프트 인자를 받았어도 추가 stdin이 올 때까지
+      // 기다려 실제 통합 검증에서 60초 timeout됐다. 입력은 인자로 모두 전달했으므로 즉시 EOF를 보낸다.
+      child.stdin?.end();
+    });
+    return parseCodexKeepaliveExecOutput(output, options.minimumResponseChars);
+  } finally {
+    fs.rmSync(isolatedDirectory, { recursive: true, force: true });
+  }
+}
+
+// 조회 PTY가 캐시가 묵을 만큼 오래 떠 있었는지 판정한다.
+export function isMonitorTerminalAged(startedAt: number | undefined, now: number): boolean {
+  return startedAt !== undefined && now - startedAt >= MONITOR_PTY_MAX_AGE_MS;
+}
 
 // 마지막 상세 조회 시각을 기준으로 하루 주기의 다음 조회가 필요한지 판정한다.
 export function isUsageDetailsDue(lastCheckedAt: number | undefined, now: number): boolean {
@@ -102,11 +226,22 @@ export function isImplausibleClaudeSessionReset(detailsJson: string | null | und
   return next.getTime() - now.getTime() > SESSION_RESET_PLAUSIBLE_MAX_MS;
 }
 
-export function reconcileStaleClaudeSessionWindow(parsed: Partial<UsageRecord>, now: Date): Partial<UsageRecord> {
+export function reconcileStaleClaudeSessionWindow(parsed: Partial<UsageRecord>, now: Date, previousDetailsJson?: string | null): Partial<UsageRecord> {
   if (parsed.data_status === "unavailable") return parsed;
-  const windows = parseWindows(parsed.details_json);
-  const sessionIndex = windows.findIndex((window) => window.id === "session");
-  const session = windows[sessionIndex];
+  let windows = parseWindows(parsed.details_json);
+  let sessionIndex = windows.findIndex((window) => window.id === "session");
+  let session = windows[sessionIndex];
+  // 새 화면에 세션 Resets가 없으면 직전 저장 창으로만 만료를 본다. 주간은 방금 읽은 값을 유지한다.
+  if (!session?.resetAt) {
+    const previousWindows = parseWindows(previousDetailsJson);
+    const previousSession = previousWindows.find((window) => window.id === "session");
+    if (!previousSession?.resetAt) return parsed;
+    const weeklyFromParsed = windows.filter((window) => window.id !== "session");
+    const previousWeekly = previousWindows.filter((window) => window.id !== "session");
+    windows = [{ ...previousSession }, ...(weeklyFromParsed.length ? weeklyFromParsed : previousWeekly)];
+    sessionIndex = 0;
+    session = windows[0];
+  }
   if (!session?.resetAt) return parsed;
   const expiredAt = todayResetTime(session.resetAt, now);
   if (!expiredAt || now.getTime() - expiredAt.getTime() < SESSION_RESET_GRACE_MS) return parsed;
@@ -126,6 +261,7 @@ export function reconcileStaleClaudeSessionWindow(parsed: Partial<UsageRecord>, 
   return {
     ...parsed,
     data_status: "fresh",
+    error_code: null,
     used_percent: isPrimary ? freshSession.usedPercent : parsed.used_percent,
     remaining_percent: isPrimary ? freshSession.remainingPercent : parsed.remaining_percent,
     reset_at: isPrimary ? freshSession.resetAt : parsed.reset_at,
@@ -140,6 +276,30 @@ export interface UsageKeepaliveTrigger {
   reason: UsageKeepaliveReason;
   windowKey: string | null;
 }
+
+// 양수→0% 전환 순간에만 얻을 수 있는 새 창 키는 이후 연속 0% 관측에서 다시 만들 수 없다.
+// 같은 keepalive 에피소드가 진행 중이면 키가 있는 pending을 우선해, 60초 정기 폴링이 같은 시각의
+// 실행 타이머보다 먼저 돌아도 새 초기화 예약을 null 키·기존 쿨다운 상태로 강등하지 않는다.
+function prioritizeUsageKeepaliveTrigger(
+  pending: UsageKeepaliveTrigger | undefined,
+  observed: UsageKeepaliveTrigger,
+): UsageKeepaliveTrigger {
+  if (pending?.reason === observed.reason && pending.windowKey && !observed.windowKey) return pending;
+  return observed;
+}
+
+export interface CodexKeepaliveConfirmation {
+  trigger: UsageKeepaliveTrigger;
+  sentAt: string;
+  targetWindowIds: string[];
+  resetSignature?: string;
+  resetObservedAt?: number;
+}
+
+export type CodexKeepaliveConfirmationResult =
+  | { status: "confirmed" }
+  | { status: "pending"; confirmation: CodexKeepaliveConfirmation }
+  | { status: "retry" };
 
 interface UsageKeepaliveWindowPart {
   id: string;
@@ -164,6 +324,33 @@ function usageKeepaliveWindowKey(windows: UsageWindow[], now: Date): string | nu
     resetAt: usageKeepaliveResetAt(window.resetAt, now),
   })).sort((left, right) => left.id.localeCompare(right.id));
   return JSON.stringify(parts);
+}
+
+// Codex는 응답 도착만으로 성공 처리하지 않는다. 대상 창이 모두 정수 사용량 1% 이상이면 즉시
+// 고정 성공이다. 일부 창이 0%로 반올림되면 대상 전체의 reset 문자열이 충분한 간격의 두 조회에서
+// 정확히 같을 때만 보조 성공으로 인정한다. 5시간만 1%가 됐다고 주간 확인을 조기 종료하지 않는다.
+export function evaluateCodexKeepaliveConfirmation(
+  confirmation: CodexKeepaliveConfirmation,
+  detailsJson: string | null | undefined,
+  now: Date = new Date(),
+): CodexKeepaliveConfirmationResult {
+  const targets = parseWindows(detailsJson).filter((window) => confirmation.targetWindowIds.includes(window.id));
+  if (!targets.length) return { status: "pending", confirmation };
+  if (targets.length === confirmation.targetWindowIds.length
+    && targets.every((window) => window.usedPercent !== null && window.usedPercent >= 1)) return { status: "confirmed" };
+  if (targets.length !== confirmation.targetWindowIds.length || targets.some((window) => !window.resetAt)) {
+    return { status: "pending", confirmation };
+  }
+  const resetSignature = JSON.stringify(targets
+    .map((window) => ({ id: window.id, resetAt: window.resetAt }))
+    .sort((left, right) => left.id.localeCompare(right.id)));
+  if (!confirmation.resetSignature || confirmation.resetObservedAt === undefined) {
+    return { status: "pending", confirmation: { ...confirmation, resetSignature, resetObservedAt: now.getTime() } };
+  }
+  if (now.getTime() - confirmation.resetObservedAt < KEEPALIVE_STABLE_RESET_INTERVAL_MS) {
+    return { status: "pending", confirmation };
+  }
+  return resetSignature === confirmation.resetSignature ? { status: "confirmed" } : { status: "retry" };
 }
 
 // Claude 세션이 화면에서 사라졌으면 직전 리셋을 5시간씩 넘겨 현재 창의 다음 리셋을 복원한다.
@@ -191,11 +378,30 @@ export function detectUsageKeepaliveTrigger(provider: Provider, previousDetailsJ
       ? { reason: "claude_session_zero", windowKey: usageKeepaliveWindowKey([session], now) }
       : null;
   }
+  // Grok 주간 한도는 빈 창을 깨울 대상이 아니라서 Codex keepalive 경로에 넣지 않는다.
+  if (provider !== "codex") return null;
+  // 사용자의 정책에 따라 롤링 5시간과 주간 창 모두 초기화 직후 한 턴으로 활성화한다. 두 창이
+  // 동시에 0%여도 exec는 하나만 만들며, 확인 중 재전송 금지가 분 단위 비용 폭주를 막는다.
+  const zeroWindows = current.filter((window) => (window.id === "five_hour" || window.id === "weekly") && window.usedPercent === 0);
+  if (!zeroWindows.length) return null;
   const previous = parseWindows(previousDetailsJson);
-  const resetWindows = current.filter((window) => window.usedPercent === 0 && (previous.find((item) => item.id === window.id)?.usedPercent ?? 0) > 0);
-  return resetWindows.length
-    ? { reason: "codex_reset_zero", windowKey: usageKeepaliveWindowKey(resetWindows, now) }
-    : null;
+  const resetWindows = zeroWindows.filter((window) => {
+    const before = previous.find((candidate) => candidate.id === window.id);
+    return before?.usedPercent !== null && before?.usedPercent !== undefined && before.usedPercent > 0;
+  });
+  // 양수→0% 전환은 직전 keepalive 쿨다운과 무관한 새 초기화다. 이 순간의 키를 예약 작업에
+  // 보존해 즉시 처리하고, 이후 계속되는 0% 관측은 null 키로 기존 5시간 중복 방지를 적용한다.
+  return {
+    reason: "codex_reset_zero",
+    windowKey: resetWindows.length ? usageKeepaliveWindowKey(resetWindows, now) : null,
+  };
+}
+
+// 5시간 창이 이미 1% 이상이면 고정 턴을 더 보내지 않고 현재 창을 성공으로 남긴다.
+export function pinnedCodexKeepaliveTrigger(detailsJson: string | null | undefined, now: Date = new Date()): UsageKeepaliveTrigger | null {
+  const fiveHour = parseWindows(detailsJson).find((window) => window.id === "five_hour");
+  if (fiveHour?.usedPercent === null || fiveHour?.usedPercent === undefined || fiveHour.usedPercent < 1) return null;
+  return { reason: "codex_reset_zero", windowKey: usageKeepaliveWindowKey([fiveHour], now) };
 }
 
 // 사용량 창이 실제 최소 턴으로 활성화되어야 하는 상태 전환인지 판정한다.
@@ -260,10 +466,42 @@ interface MonitorState {
   retryTimer?: NodeJS.Timeout;
   commandIndex: number;
   failureCount: number;
-  // 마지막 정상 반영 이후 연속으로 거부된 조회 횟수(shouldAdoptRejectedUsage 참고).
+  // 마지막 정상 반영 이후 연속으로 거부된 fresh 조회 횟수. non-fresh가 끼면 즉시 0으로 돌아간다.
   rejectedStreak: number;
+  // 같은 리셋 날짜에서 0%로 떨어진 창을 확정하기 전 연속 관측 횟수와, 이미 PTY를 재시작했는지.
+  zeroConfirmStreak?: number;
+  zeroConfirmRecycled?: boolean;
+  // Claude usage 상세 endpoint가 fallback을 돌려줄 때 매분 다시 두드리지 않도록 다음 자동 조회를
+  // 허용할 시각과 연속 fallback 횟수를 기억한다. 사용자가 누른 수동 새로고침은 이 시각을 우회한다.
+  usagePollNotBeforeAt?: number;
+  usageFallbackStreak?: number;
+  // keepalive 타이머가 실행될 때 가장 최근 관측이 fresh였는지 확인한다. false면 보존 DB 숫자를
+  // 현재값으로 오인해 비용이 드는 턴을 보내지 않는다.
+  usageObservationFresh?: boolean;
+  // 숫자는 채택하지 않아도 세션 0%·Resets 없음·세션 블록 누락처럼 현재 화면에서 고정을 봐야 하면 true.
+  usageKeepaliveTrusted?: boolean;
   collectUsageDetails: boolean;
   usageDetailsCheckedAt?: number;
+  // 조회 PTY를 띄운 시각. 수명이 다하면 CLI 캐시가 묵기 전에 갈아탄다(MONITOR_PTY_MAX_AGE_MS 참고).
+  terminalStartedAt?: number;
+  // 수명이 다해 우리가 일부러 끊는 중인지. 실패로 오인해 error를 띄우지 않기 위한 표시다.
+  recycling?: boolean;
+  // 아직 보내지 못한 초기화 고정 요청. 전송에 실패하면 남겨두고 다음 조회 주기에 다시 시도한다.
+  // Codex 트리거는 "양수 → 0%" 전환 순간에만 잡혀서, 이게 없으면 한 번 실패한 창은 영영 고정되지
+  // 못한다(실측 #57: 준비 시간 초과로 두 번 실패한 뒤 재시도 기회가 없어 그 창이 고정 안 됨).
+  pendingKeepalive?: UsageKeepaliveTrigger;
+  keepaliveTimer?: NodeJS.Timeout;
+  // 첫 감지 뒤 1분 경계와 실패 재시도 간격을 보존한다. 타이머가 사용량 조회 busy와 겹쳐도 이
+  // 시각은 사라지지 않아, 조회 완료 직후 같은 pending 작업을 이어서 처리할 수 있다.
+  keepaliveNotBeforeAt?: number;
+  // 마지막으로 고정 전송을 시도한 시각. 실패가 이어질 때 재시도 간격을 벌리는 데 쓴다.
+  lastKeepaliveAttemptAt?: number;
+  // Codex는 모델 응답 뒤 1% 이상 사용량 또는 안정된 reset 시각을 다시 관측해야 DB 성공 기록을 남긴다.
+  keepaliveConfirmation?: CodexKeepaliveConfirmation;
+  keepaliveVerificationTimer?: NodeJS.Timeout;
+  keepalivePromptAttempt?: number;
+  // exec가 끝나기 전에 재시도 타이머가 또 보내면 긴 답이 겹쳐 한도만 소모한다.
+  keepaliveSendInFlight?: boolean;
   // 파싱에 실제로 넘긴 원본 화면 텍스트를 매 조회마다 남겨, 파싱이 왜 실패·이상하게 됐는지 웹에서
   // 직접 확인할 수 있게 한다("숫자만 보지 말고 실제 CLI 화면을 보고 싶다"는 실사용 요청으로 추가함).
   lastSnapshot?: { text: string; capturedAt: string };
@@ -308,39 +546,119 @@ function isSameResetWindow(a: string, b: string): boolean {
   return Math.min(raw, 1440 - raw) <= SAME_WINDOW_TOLERANCE_MINUTES;
 }
 
-// 새로 파싱한 사용량이 직전 저장값보다 "같은 창인데 줄어든" 구간이 있는지 확인한다.
-// 사용량 창은 리셋 시각이 지나기 전까지 누적만 되므로, 같은 창에서 퍼센트가 줄었다면 조회 전용
-// CLI가 오래된 스냅샷을 돌려준 것이다(실측: 실제 56% 시점에 1시간 전 값 26%를 최신인 척 반환,
-// 리셋 시각이 아직 미래라 isExpiredResetTime로는 못 잡음). 리셋 시각이 실질적으로 달라졌으면
-// (몇 분 표기 오차 초과 — isSameResetWindow 참고) 창이 넘어간 것이므로 감소를 정상으로 본다.
-export function detectUsageRegression(previousDetailsJson: string | null, parsedDetailsJson: string | null | undefined): boolean {
-  if (!previousDetailsJson || !parsedDetailsJson) return false;
+// 같은 리셋 창에서 사용량이 줄었는지 한 창만 본다.
+function isUsageWindowRegression(before: UsageWindow | undefined, window: UsageWindow): boolean {
+  return !!before && before.usedPercent !== null && window.usedPercent !== null
+    && !!window.resetAt && !!before.resetAt
+    && isSameResetWindow(window.resetAt, before.resetAt)
+    && window.usedPercent < before.usedPercent;
+}
+
+// 새로 파싱한 사용량에서 같은 창인데 줄어든 구간 id를 모은다.
+export function regressedUsageWindowIds(previousDetailsJson: string | null, parsedDetailsJson: string | null | undefined): string[] {
+  if (!previousDetailsJson || !parsedDetailsJson) return [];
   let previous: UsageWindow[];
   let parsed: UsageWindow[];
   try {
     previous = (JSON.parse(previousDetailsJson) as { windows?: UsageWindow[] }).windows ?? [];
     parsed = (JSON.parse(parsedDetailsJson) as { windows?: UsageWindow[] }).windows ?? [];
   } catch {
-    return false;
+    return [];
   }
-  return parsed.some((window) => {
-    if (window.usedPercent === null) return false;
-    const before = previous.find((item) => item.id === window.id);
-    return !!before && before.usedPercent !== null && !!window.resetAt && !!before.resetAt && isSameResetWindow(window.resetAt, before.resetAt) && window.usedPercent < before.usedPercent;
-  });
+  return parsed.filter((window) => isUsageWindowRegression(previous.find((item) => item.id === window.id), window)).map((window) => window.id);
 }
 
-// 조회 주기가 60초이므로 약 5분에 해당한다. 옛 스냅샷 오염은 보통 한두 주기면 사라지는 반면,
-// 이 횟수만큼 같은 판정이 이어지면 CLI가 계속 그 값을 주고 있다는 뜻이라 실제 최신값으로 본다.
+// 새로 파싱한 사용량이 직전 저장값보다 "같은 창인데 줄어든" 구간이 있는지 확인한다.
+// 사용량 창은 리셋 시각이 지나기 전까지 누적만 되므로, 같은 창에서 퍼센트가 줄었다면 조회 전용
+// CLI가 오래된 스냅샷을 돌려준 것이다(실측: 실제 56% 시점에 1시간 전 값 26%를 최신인 척 반환,
+// 리셋 시각이 아직 미래라 isExpiredResetTime로는 못 잡음). 리셋 시각이 실질적으로 달라졌으면
+// (몇 분 표기 오차 초과 — isSameResetWindow 참고) 창이 넘어간 것이므로 감소를 정상으로 본다.
+export function detectUsageRegression(previousDetailsJson: string | null, parsedDetailsJson: string | null | undefined): boolean {
+  return regressedUsageWindowIds(previousDetailsJson, parsedDetailsJson).length > 0;
+}
+
+export interface ZeroUsageConfirmState {
+  streak: number;
+  recycled: boolean;
+}
+
+export type FreshUsageDecision =
+  | { kind: "adopt"; record: Partial<UsageRecord>; zeroConfirm: ZeroUsageConfirmState }
+  | { kind: "reject"; zeroConfirm: ZeroUsageConfirmState }
+  | { kind: "hold-zero"; record: Partial<UsageRecord>; recycle: boolean; zeroConfirm: ZeroUsageConfirmState };
+
+const ZERO_USAGE_CONFIRM_STREAK = 2;
+
+// 사용량 창 목록으로 대표값·요약을 다시 만든다.
+function recordWithWindows(parsed: Partial<UsageRecord>, windows: UsageWindow[], primaryId?: string): Partial<UsageRecord> {
+  const primary = windows.find((window) => window.id === primaryId) ?? windows[0];
+  let extras: Record<string, unknown> = {};
+  try {
+    extras = JSON.parse(parsed.details_json ?? "{}") as Record<string, unknown>;
+  } catch {
+    extras = {};
+  }
+  return {
+    ...parsed,
+    used_percent: primary?.usedPercent ?? parsed.used_percent,
+    remaining_percent: primary?.remainingPercent ?? parsed.remaining_percent,
+    reset_at: primary?.resetAt ?? parsed.reset_at,
+    summary: windows.map((window) => `${window.label}: ${window.usedPercent}% used`).join("\n"),
+    details_json: JSON.stringify({ ...extras, windows }),
+  };
+}
+
+// 같은 날짜 0%는 바로 거절하지 않는다. 2회 연속 뒤 PTY를 재시작해 그때도 0%면 확정한다.
+export function decideFreshUsageAdoption(
+  parsed: Partial<UsageRecord>,
+  previousDetailsJson: string | null | undefined,
+  primaryWindowId: string | undefined,
+  zeroConfirm: ZeroUsageConfirmState,
+): FreshUsageDecision {
+  const parsedWindows = parseWindows(parsed.details_json);
+  const previousWindows = parseWindows(previousDetailsJson);
+  const regressedIds = regressedUsageWindowIds(previousDetailsJson ?? null, parsed.details_json);
+  const primaryId = primaryWindowId ?? parsedWindows[0]?.id;
+  const zeroRegressedIds = regressedIds.filter((id) => parsedWindows.find((window) => window.id === id)?.usedPercent === 0);
+  const resetConfirm = { streak: 0, recycled: false };
+  if (primaryId && regressedIds.includes(primaryId) && !zeroRegressedIds.includes(primaryId)) {
+    return { kind: "reject", zeroConfirm: resetConfirm };
+  }
+  if (!zeroRegressedIds.length) return { kind: "adopt", record: parsed, zeroConfirm: resetConfirm };
+  if (zeroConfirm.recycled) return { kind: "adopt", record: parsed, zeroConfirm: resetConfirm };
+  const streak = zeroConfirm.streak + 1;
+  const recycle = streak >= ZERO_USAGE_CONFIRM_STREAK;
+  const heldWindows = parsedWindows.map((window) => (
+    zeroRegressedIds.includes(window.id) ? previousWindows.find((item) => item.id === window.id) ?? window : window
+  ));
+  return {
+    kind: "hold-zero",
+    recycle,
+    zeroConfirm: { streak, recycled: recycle || zeroConfirm.recycled },
+    record: recordWithWindows(parsed, heldWindows, primaryId),
+  };
+}
+
+// 조회 주기가 60초이므로 약 5분에 해당한다. 이 횟수만큼 같은 감소가 이어져도 최신이라는 증거는
+// 아니다. 실제 Claude fallback 1%가 다섯 번 반복돼 이 임계값에서 잘못 채택된 운영 장애가 있었다.
 const REJECTED_ADOPT_STREAK = 5;
 
-// 거부가 연속으로 이어질 때 마지막 정상값 보호를 풀고 최신값을 그대로 채택할지 판단한다.
-// 거부 처리는 마지막 정상값을 무기한 지키기 때문에 탈출구가 없으면 그대로 굳는다(실측: 이미 지난
-// 리셋 시각의 100%가 27분간 유지돼 사용자가 사용량이 갱신되지 않는다고 보고함). 오염값을 잘못
-// 채택해도 다음 주기에 진짜 값이 증가 방향으로 들어와 자동 복구되지만, 갇힘은 스스로 풀리지
-// 않는다는 비대칭 때문에 일정 횟수 뒤에는 최신값을 택한다.
-export function shouldAdoptRejectedUsage(rejectedStreak: number): boolean {
-  return rejectedStreak >= REJECTED_ADOPT_STREAK;
+const CLAUDE_USAGE_BACKOFF_BASE_MS = 2 * 60_000;
+const CLAUDE_USAGE_BACKOFF_MAX_MS = 15 * 60_000;
+
+// 사용자 quota와 무관한 /usage 상세 조회 fallback만 자동 폴링 백오프 대상으로 삼는다.
+export function isClaudeUsageFallbackError(errorCode: UsageRecord["error_code"] | undefined): boolean {
+  return !!errorCode && [
+    "usage_seeded_headers_throttled",
+    "usage_seeded_persisted_throttled",
+    "usage_seeded_headers_refresh_failed",
+    "usage_seeded_persisted_refresh_failed",
+    "usage_endpoint_throttled",
+  ].includes(errorCode);
+}
+
+export function claudeUsageBackoffMs(fallbackStreak: number): number {
+  return Math.min(CLAUDE_USAGE_BACKOFF_MAX_MS, CLAUDE_USAGE_BACKOFF_BASE_MS * 2 ** Math.max(0, fallbackStreak - 1));
 }
 
 // 공급자별 경량 전용 PTY에서 실제 슬래시 명령을 1분마다 실행한다.
@@ -349,6 +667,7 @@ export class UsageMonitor {
   private readonly monitors = new Map<string, MonitorState>();
   private readonly adapters: ProviderAdapter[];
   private readonly resetCreditRedemptions = new Set<string>();
+  private runCodexKeepalive = runCodexKeepaliveExec;
   private stopping = false;
 
   constructor(
@@ -357,6 +676,10 @@ export class UsageMonitor {
     private readonly realtime: RealtimeHub,
     private readonly accounts: AgentAccountService,
     private readonly resetNotifier?: UsageResetNotifier,
+    // 인증 안 된 계정을 무작정 폴링하면 codex·claude 모두 로그인·온보딩 화면에 계속 걸리는
+    // 문제가 있었다(실사용 보고). 없으면(테스트 등) 항상 인증된 것으로 보고 기존처럼 동작한다.
+    private readonly isAuthenticated?: (provider: Provider, accountId: number) => boolean,
+    private readonly notifications?: Notifier,
   ) {
     this.adapters = adapters;
   }
@@ -367,7 +690,7 @@ export class UsageMonitor {
       for (const account of this.accounts.monitorTargets(adapter.id)) {
         const key = monitorKey(adapter.id, account.id);
         if (this.monitors.has(key)) continue;
-        this.monitors.set(key, { adapter, account, screen: new TerminalScreen(), busy: false, commandIndex: 0, failureCount: 0, rejectedStreak: 0, collectUsageDetails: false });
+        this.monitors.set(key, { adapter, account, screen: new TerminalScreen(), busy: false, commandIndex: 0, failureCount: 0, rejectedStreak: 0, zeroConfirmStreak: 0, collectUsageDetails: false });
       }
     }
   }
@@ -400,6 +723,8 @@ export class UsageMonitor {
     if (monitor.timer) clearInterval(monitor.timer);
     if (monitor.parseTimer) clearTimeout(monitor.parseTimer);
     if (monitor.retryTimer) clearTimeout(monitor.retryTimer);
+    if (monitor.keepaliveTimer) clearTimeout(monitor.keepaliveTimer);
+    if (monitor.keepaliveVerificationTimer) clearTimeout(monitor.keepaliveVerificationTimer);
     monitor.terminal?.kill();
     monitor.terminal = undefined;
     monitor.screen.dispose();
@@ -431,13 +756,38 @@ export class UsageMonitor {
     return this.findMonitor(provider, accountId)?.lastSnapshot ?? null;
   }
 
+  // CliAuthManager가 로그인 완료를 감지하면 부른다. 인증 안 돼 startProvider가 건너뛴 계정을
+  // 그제서야 실제로 띄운다. github 등 이 클래스가 모르는 공급자·계정 없음(null)은 조용히 무시한다.
+  notifyAuthenticated(provider: string, accountId: number | null): void {
+    if (accountId == null) return;
+    const monitor = this.monitors.get(monitorKey(provider as Provider, accountId));
+    if (monitor && !monitor.terminal) this.startProvider(monitor);
+  }
+
   // 지정 공급자의 사용량을 즉시 다시 조회한다. 계정을 지정하지 않으면 그 공급자의 모든 조회 대상을 갱신한다.
   refresh(provider: Provider, accountId?: number): void {
     const targets = accountId != null
       ? [this.findMonitor(provider, accountId)].filter((monitor): monitor is MonitorState => !!monitor)
       : [...this.monitors.values()].filter((monitor) => monitor.adapter.id === provider);
     if (!targets.length) throw new Error("지원하지 않는 공급자입니다.");
-    for (const monitor of targets) this.requestUsage(monitor);
+    for (const monitor of targets) this.requestUsage(monitor, true);
+  }
+
+  // CLI 업데이트 뒤 해당 공급자의 계정별 조회 PTY를 모두 새 프로세스로 교체한다. 모델 목록 캐시는
+  // 구버전 메뉴에서 읽은 값이므로 비우고, 사용량 DB의 마지막 정상값은 새 조회가 끝날 때까지 유지한다.
+  // modelOptions()와 requestUsage()가 같은 PTY를 공유하므로 이 한 경로로 모델 조회·사용량 파싱이 모두
+  // 새 바이너리를 사용하게 된다.
+  restartProviderTerminals(provider: Provider): number {
+    const targets = [...this.monitors.values()].filter((monitor) => monitor.adapter.id === provider);
+    for (const monitor of targets) {
+      monitor.modelOptions = undefined;
+      monitor.failureCount = 0;
+      monitor.usagePollNotBeforeAt = undefined;
+      monitor.usageFallbackStreak = 0;
+      if (monitor.terminal) this.recycleTerminal(monitor);
+      else this.startProvider(monitor, { keepLastValue: true });
+    }
+    return targets.length;
   }
 
   // 저장값과 공식 app-server를 모두 확인한 뒤 Codex 초기화권 맨 위 항목 하나를 사용한다.
@@ -469,7 +819,7 @@ export class UsageMonitor {
       const now = new Date().toISOString();
       monitor.usageDetailsCheckedAt = Date.now();
       this.update(monitor, { details_json: detailsJson, last_checked_at: now, last_success_at: now });
-      this.requestUsage(monitor);
+      this.requestUsage(monitor, true);
       return { ...result, after: current };
     } finally {
       this.resetCreditRedemptions.delete(key);
@@ -578,12 +928,22 @@ export class UsageMonitor {
     });
   }
 
-  // 공급자 인터랙티브 CLI를 상태 조회 전용 PTY로 실행한다.
-  private startProvider(monitor: MonitorState): void {
-    this.update(monitor, { monitor_status: "starting", data_status: "unavailable", error_code: null });
+  // 공급자 인터랙티브 CLI를 상태 조회 전용 PTY로 실행한다. 아직 인증 안 된 계정은 PTY를 아예
+  // 띄우지 않는다 — 띄우면 codex·claude 모두 로그인·온보딩 화면에 계속 걸려서 파싱이 안 됐다
+  // (실사용 보고). CliAuthManager가 로그인 완료를 감지하면 notifyAuthenticated()로 다시 불린다.
+  private startProvider(monitor: MonitorState, options: { keepLastValue?: boolean } = {}): void {
+    if (this.isAuthenticated && !this.isAuthenticated(monitor.adapter.id, monitor.account.id)) {
+      this.update(monitor, { monitor_status: "error", data_status: "unavailable", error_code: "auth_required" });
+      return;
+    }
+    // 수명 만료로 갈아타는 중이면 직전 정상값이 여전히 유효하므로 data_status를 내리지 않는다.
+    this.update(monitor, options.keepLastValue
+      ? { monitor_status: "starting", error_code: null }
+      : { monitor_status: "starting", data_status: "unavailable", error_code: null });
     try {
       const terminal = this.spawnProviderTerminal(monitor);
       monitor.terminal = terminal;
+      monitor.terminalStartedAt = Date.now();
       terminal.onData((data) => monitor.screen.write(data));
       terminal.onExit(() => {
         monitor.terminal = undefined;
@@ -591,6 +951,14 @@ export class UsageMonitor {
         if (monitor.timer) clearInterval(monitor.timer);
         if (monitor.parseTimer) clearTimeout(monitor.parseTimer);
         if (this.stopping) return;
+        // 수명이 다해 우리가 일부러 끊은 것이면 실패가 아니므로, error를 띄우거나 백오프를 기다리지
+        // 않고 곧바로 새 PTY로 갈아탄다. 마지막 정상값은 그대로 두어 화면에서 사용량이 사라지지 않게 한다.
+        if (monitor.recycling) {
+          monitor.recycling = false;
+          monitor.screen.reset();
+          this.startProvider(monitor, { keepLastValue: true });
+          return;
+        }
         this.update(monitor, { monitor_status: "error", data_status: "stale", error_code: "cli_exited" });
         this.scheduleRestart(monitor);
       });
@@ -625,9 +993,261 @@ export class UsageMonitor {
     monitor.retryTimer.unref();
   }
 
+  // 초기화 고정을 "1분 뒤 조회 PTY 재시작 → 그 뒤 고정 메시지" 순서로 예약한다.
+  // 감지 즉시 보내면 CLI가 아직 옛 창을 들고 있는 경계 구간(#52·#56에서 실측)에 걸려, 고정하려는
+  // 창과 CLI가 인식하는 창이 어긋날 수 있다. 재시작으로 새 창을 잡은 뒤 보낸다.
+  private scheduleKeepaliveAfterRestart(monitor: MonitorState, trigger: UsageKeepaliveTrigger): void {
+    monitor.pendingKeepalive = prioritizeUsageKeepaliveTrigger(monitor.pendingKeepalive, trigger);
+    monitor.keepaliveNotBeforeAt ??= Date.now() + KEEPALIVE_RESTART_DELAY_MS;
+    if (monitor.keepaliveTimer) return;
+    const retryAt = monitor.lastKeepaliveAttemptAt ? monitor.lastKeepaliveAttemptAt + KEEPALIVE_RETRY_INTERVAL_MS : 0;
+    const delay = Math.max(0, Math.max(monitor.keepaliveNotBeforeAt, retryAt) - Date.now());
+    monitor.keepaliveTimer = setTimeout(() => {
+      monitor.keepaliveTimer = undefined;
+      void this.restartThenSendKeepalive(monitor);
+    }, delay);
+    monitor.keepaliveTimer.unref();
+  }
+
+  // 같은 0% 에피소드의 성공 기록이 있으면 쿨다운 동안 PTY 재시작 자체를 예약하지 않는다.
+  private isStoredUsageKeepaliveDue(monitor: MonitorState, trigger: UsageKeepaliveTrigger): boolean {
+    const row = this.database.prepare("SELECT sent_at, window_key FROM usage_keepalive_prompts WHERE provider = ? AND account_id = ?")
+      .get(monitor.adapter.id, monitor.account.id) as { sent_at: string; window_key: string | null } | undefined;
+    return isUsageKeepaliveDue(row?.sent_at, row?.window_key, trigger.windowKey, new Date());
+  }
+
+  // 최신 정상 조회가 끝난 시점에 pending 작업을 조정한다. 실제 사용량이 이미 양수면 늦은 단답을
+  // 취소하고, 타이머가 busy에 막힌 뒤라면 새 1분을 기다리지 않고 즉시 이어서 처리한다.
+  private async reconcileKeepaliveAfterUsage(monitor: MonitorState, trigger: UsageKeepaliveTrigger | null): Promise<void> {
+    if (monitor.keepaliveConfirmation) {
+      const latest = this.database.prepare("SELECT details_json FROM usage_status WHERE provider = ? AND account_id = ? AND data_status = 'fresh'")
+        .get(monitor.adapter.id, monitor.account.id) as { details_json: string | null } | undefined;
+      const result = evaluateCodexKeepaliveConfirmation(monitor.keepaliveConfirmation, latest?.details_json);
+      if (result.status === "confirmed") {
+        this.confirmCodexUsageKeepalive(monitor, monitor.keepaliveConfirmation);
+        return;
+      }
+      if (result.status === "retry") {
+        usageLog.warn("keepalive_unconfirmed", { provider: monitor.adapter.id, accountId: monitor.account.id, reason: monitor.keepaliveConfirmation.trigger.reason });
+        const confirmation = monitor.keepaliveConfirmation;
+        monitor.keepaliveConfirmation = undefined;
+        this.continueOrFinishCodexKeepalive(monitor, trigger, confirmation);
+        return;
+      }
+      monitor.keepaliveConfirmation = result.confirmation;
+      return;
+    }
+    const latestDetails = this.database.prepare("SELECT details_json FROM usage_status WHERE provider = ? AND account_id = ? AND data_status = 'fresh'")
+      .get(monitor.adapter.id, monitor.account.id) as { details_json: string | null } | undefined;
+    const pinned = monitor.adapter.id === "codex" ? pinnedCodexKeepaliveTrigger(latestDetails?.details_json) : null;
+    if (pinned) {
+      if (this.isStoredUsageKeepaliveDue(monitor, pinned)) {
+        const sentAt = monitor.lastKeepaliveAttemptAt ? new Date(monitor.lastKeepaliveAttemptAt).toISOString() : new Date().toISOString();
+        this.confirmCodexUsageKeepalive(monitor, { trigger: pinned, sentAt, targetWindowIds: ["five_hour"] });
+      } else {
+        if (monitor.keepaliveTimer) clearTimeout(monitor.keepaliveTimer);
+        monitor.keepaliveTimer = undefined;
+        monitor.pendingKeepalive = undefined;
+        monitor.keepaliveNotBeforeAt = undefined;
+        monitor.keepalivePromptAttempt = undefined;
+      }
+      return;
+    }
+    if (!trigger) {
+      if (monitor.keepaliveTimer) clearTimeout(monitor.keepaliveTimer);
+      monitor.keepaliveTimer = undefined;
+      monitor.pendingKeepalive = undefined;
+      monitor.keepaliveNotBeforeAt = undefined;
+      monitor.keepalivePromptAttempt = undefined;
+      return;
+    }
+    // 새 초기화의 keyed pending은 같은 0% 에피소드의 후속 폴링이 null 키만 돌려줘도 우선한다.
+    // null 키로 DB 쿨다운을 먼저 검사하면 60초 폴링이 1분 실행 타이머를 지우는 운영 장애가 난다.
+    const prioritizedTrigger = prioritizeUsageKeepaliveTrigger(monitor.pendingKeepalive, trigger);
+    if (!this.isStoredUsageKeepaliveDue(monitor, prioritizedTrigger)) {
+      if (monitor.keepaliveTimer) clearTimeout(monitor.keepaliveTimer);
+      monitor.keepaliveTimer = undefined;
+      monitor.pendingKeepalive = undefined;
+      monitor.keepaliveNotBeforeAt = undefined;
+      monitor.keepalivePromptAttempt = undefined;
+      return;
+    }
+    monitor.pendingKeepalive = prioritizedTrigger;
+    if (monitor.keepaliveNotBeforeAt === undefined) {
+      this.scheduleKeepaliveAfterRestart(monitor, prioritizedTrigger);
+      return;
+    }
+    const retryAt = monitor.lastKeepaliveAttemptAt ? monitor.lastKeepaliveAttemptAt + KEEPALIVE_RETRY_INTERVAL_MS : 0;
+    if (!monitor.keepaliveTimer && Date.now() >= Math.max(monitor.keepaliveNotBeforeAt, retryAt)) {
+      await this.restartThenSendKeepalive(monitor);
+      return;
+    }
+    this.scheduleKeepaliveAfterRestart(monitor, prioritizedTrigger);
+  }
+
+  // 조회 PTY를 새로 띄운 뒤 고정 메시지를 보낸다. 실패하면 예약을 남겨 다음 조회 주기에 다시 시도한다.
+  private async restartThenSendKeepalive(monitor: MonitorState): Promise<void> {
+    // 응답 뒤 reset 안정성을 확인하는 동안에는 새 요청을 보내지 않는다. 안정 판정은 75초가
+    // 필요한데 재시도 타이머는 60초라, 여기서 확인을 폐기하면 성공 판정 전에 매분 다시 보내게 된다.
+    if (monitor.keepaliveConfirmation) {
+      this.requestUsage(monitor);
+      return;
+    }
+    if (monitor.keepaliveSendInFlight) return;
+    let trigger = monitor.pendingKeepalive;
+    if (!trigger) return;
+    // 조회가 진행 중이면 끊지 않는다. finishUsage가 busy를 내린 직후 위 조정 함수를 호출해, 이미
+    // 지난 not-before 시각의 같은 작업을 즉시 이어서 처리한다.
+    if (monitor.busy) return;
+    // fallback·로딩의 보존 숫자로 고정을 보내면 안 되지만, 세션 0%·Resets 없음처럼
+    // 현재 화면에서 잡은 고정 사유는 fresh가 아니어도 보낸다.
+    if (monitor.usageObservationFresh === false && !monitor.usageKeepaliveTrusted) return;
+    const latest = this.database.prepare("SELECT details_json FROM usage_status WHERE provider = ? AND account_id = ? AND data_status = 'fresh'")
+      .get(monitor.adapter.id, monitor.account.id) as { details_json: string | null } | undefined;
+    // 마지막 조회가 fallback·로딩·파싱 실패라면 보존된 숫자가 양수인지 0%인지 현재 상태를 확정할
+    // 수 없다. pending은 지우지 않되 비용이 드는 턴도 보내지 않고 다음 fresh 관측이 재개하게 한다.
+    if (latest) {
+      const latestTrigger = detectUsageKeepaliveTrigger(monitor.adapter.id, latest.details_json, latest.details_json, new Date());
+      if (!latestTrigger) {
+        monitor.pendingKeepalive = undefined;
+        monitor.keepaliveNotBeforeAt = undefined;
+        return;
+      }
+      // 최초 양수→0% 전환에서 만든 새 창 키는 latest/latest 재검사로는 다시 만들 수 없다. 예약된
+      // 키를 유지해야 직전 5시간 쿨다운이 이번 새 초기화까지 막지 않는다.
+      trigger = trigger.windowKey && !latestTrigger.windowKey
+        ? { ...latestTrigger, windowKey: trigger.windowKey }
+        : latestTrigger;
+      monitor.pendingKeepalive = trigger;
+    }
+    if ((monitor.keepalivePromptAttempt ?? 0) >= CODEX_USAGE_KEEPALIVE_MAX_ATTEMPTS) {
+      this.continueOrFinishCodexKeepalive(monitor, trigger);
+      return;
+    }
+    monitor.keepaliveSendInFlight = true;
+    monitor.lastKeepaliveAttemptAt = Date.now();
+    this.recycleTerminal(monitor);
+    // 새 PTY가 준비될 시간을 준다. 고정 메시지는 별도 임시 PTY로 나가므로 여기서 엄밀히 기다릴
+    // 필요는 없고, 조회 PTY가 새 창을 읽기 시작하는 것만 보장하면 된다.
+    try {
+      await wait(5_000);
+      // 실패하면 예약을 남겨 다음 조회 주기에 다시 시도한다(로그·DB 롤백은 그쪽에서 처리한다).
+      const result = await this.maybeSendUsageKeepalive(monitor, trigger);
+      if (result === true) {
+        monitor.pendingKeepalive = undefined;
+        monitor.keepaliveNotBeforeAt = undefined;
+        monitor.keepalivePromptAttempt = undefined;
+      } else if (result === false) {
+        if (monitor.adapter.id === "codex") {
+          this.continueOrFinishCodexKeepalive(monitor, trigger);
+          return;
+        }
+        monitor.keepaliveNotBeforeAt = Date.now() + KEEPALIVE_RETRY_INTERVAL_MS;
+        this.scheduleKeepaliveAfterRestart(monitor, trigger);
+      } else {
+        // 응답은 왔지만 사용량 사후 확인 전이다. 10초 뒤 조회만 당기며, 확인 결과가 명시적으로
+        // retry일 때에만 1분 뒤 긴 문구를 보낸다. 확인 중에는 비용이 드는 exec를 예약하지 않는다.
+        monitor.keepaliveNotBeforeAt = undefined;
+        if (monitor.keepaliveVerificationTimer) clearTimeout(monitor.keepaliveVerificationTimer);
+        monitor.keepaliveVerificationTimer = setTimeout(() => {
+          monitor.keepaliveVerificationTimer = undefined;
+          this.requestUsage(monitor);
+        }, KEEPALIVE_VERIFY_DELAY_MS);
+        monitor.keepaliveVerificationTimer.unref();
+      }
+    } finally {
+      monitor.keepaliveSendInFlight = false;
+    }
+  }
+
+  // 확인 실패 뒤 다음 시도가 남아 있으면 1분 뒤 재시도하고, 10회를 다 쓰면 현재 창을 기록하고 멈춘다.
+  private continueOrFinishCodexKeepalive(
+    monitor: MonitorState,
+    trigger: UsageKeepaliveTrigger | null | undefined,
+    confirmation?: CodexKeepaliveConfirmation,
+  ): void {
+    const completedAttempt = monitor.keepalivePromptAttempt ?? 0;
+    if (!usageKeepaliveHasRemainingAttempts(monitor.adapter.id, completedAttempt)) {
+      const finished = confirmation ?? (trigger ? {
+        trigger,
+        sentAt: monitor.lastKeepaliveAttemptAt ? new Date(monitor.lastKeepaliveAttemptAt).toISOString() : new Date().toISOString(),
+        targetWindowIds: [],
+      } : null);
+      if (finished) {
+        this.confirmCodexUsageKeepalive(monitor, finished);
+        this.notifyCodexKeepaliveExhausted(monitor, finished);
+      } else {
+        monitor.pendingKeepalive = undefined;
+        monitor.keepaliveNotBeforeAt = undefined;
+        monitor.keepalivePromptAttempt = undefined;
+      }
+      return;
+    }
+    monitor.keepalivePromptAttempt = completedAttempt + 1;
+    monitor.keepaliveNotBeforeAt = Date.now() + KEEPALIVE_RETRY_INTERVAL_MS;
+    if (trigger) this.scheduleKeepaliveAfterRestart(monitor, trigger);
+  }
+
+  // 10회를 다 썼는데도 창이 안 고정되면 기존 운영 알림 채널로 알린다.
+  private notifyCodexKeepaliveExhausted(monitor: MonitorState, confirmation: CodexKeepaliveConfirmation): void {
+    const label = monitor.adapter.displayLabel ?? "Codex";
+    const title = `${label} 세션 유지 실패`;
+    const body = `${label} keepalive를 ${CODEX_USAGE_KEEPALIVE_MAX_ATTEMPTS}회 보냈지만 5시간 창이 확정되지 않았습니다.`;
+    const eventId = `usage-keepalive-exhausted:${monitor.adapter.id}:${monitor.account.id}:${confirmation.trigger.windowKey ?? confirmation.sentAt}`;
+    usageLog.warn("keepalive_attempts_exhausted", {
+      provider: monitor.adapter.id,
+      accountId: monitor.account.id,
+      attempts: CODEX_USAGE_KEEPALIVE_MAX_ATTEMPTS,
+    });
+    void this.notifications?.notify(eventId, "usage_keepalive_exhausted", body, { title });
+    this.realtime.broadcast("usage_keepalive_exhausted", {
+      provider: monitor.adapter.id,
+      accountId: monitor.account.id,
+      title,
+      body,
+    });
+  }
+
+  private confirmCodexUsageKeepalive(monitor: MonitorState, confirmation: CodexKeepaliveConfirmation): void {
+    this.database.prepare(`
+      INSERT INTO usage_keepalive_prompts(provider, account_id, reason, sent_at, window_key) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(provider, account_id) DO UPDATE SET reason = excluded.reason, sent_at = excluded.sent_at, window_key = excluded.window_key
+    `).run(monitor.adapter.id, monitor.account.id, confirmation.trigger.reason, confirmation.sentAt, confirmation.trigger.windowKey);
+    if (monitor.keepaliveTimer) clearTimeout(monitor.keepaliveTimer);
+    if (monitor.keepaliveVerificationTimer) clearTimeout(monitor.keepaliveVerificationTimer);
+    monitor.keepaliveTimer = undefined;
+    monitor.keepaliveVerificationTimer = undefined;
+    monitor.pendingKeepalive = undefined;
+    monitor.keepaliveConfirmation = undefined;
+    monitor.keepaliveNotBeforeAt = undefined;
+    monitor.keepalivePromptAttempt = undefined;
+    monitor.keepaliveSendInFlight = undefined;
+    usageLog.info("keepalive_confirmed", { provider: monitor.adapter.id, accountId: monitor.account.id, reason: confirmation.trigger.reason });
+    this.realtime.broadcast("usage_updated", { provider: monitor.adapter.id, accountId: monitor.account.id });
+  }
+
+  // 조회 PTY를 지금 끊어 새 프로세스로 갈아탄다. onExit이 recycling을 보고 곧바로 다시 띄운다.
+  private recycleTerminal(monitor: MonitorState): void {
+    if (monitor.recycling || !monitor.terminal) return;
+    monitor.recycling = true;
+    monitor.terminal.kill();
+  }
+
+  // 조회 PTY 수명이 다했으면 이번 주기를 건너뛰고 새 프로세스로 갈아탄다(MONITOR_PTY_MAX_AGE_MS 참고).
+  // 조회 중(busy)에는 건드리지 않고 다음 주기에 처리해, 진행 중인 파싱을 끊지 않는다.
+  private recycleTerminalIfAged(monitor: MonitorState): boolean {
+    const now = Date.now();
+    if (monitor.recycling || !isMonitorTerminalAged(monitor.terminalStartedAt, now)) return false;
+    usageLog.info("pty_recycled", { provider: monitor.adapter.id, accountId: monitor.account.id, ageMinutes: Math.round((now - monitor.terminalStartedAt!) / 60_000) });
+    this.recycleTerminal(monitor);
+    return true;
+  }
+
   // 중복 실행을 막고 공급자별 실제 슬래시 명령을 순서대로 전달한다.
-  private requestUsage(monitor: MonitorState): void {
+  private requestUsage(monitor: MonitorState, force = false): void {
     if (!monitor.terminal || monitor.busy) return;
+    if (!force && monitor.usagePollNotBeforeAt && Date.now() < monitor.usagePollNotBeforeAt) return;
+    if (this.recycleTerminalIfAged(monitor)) return;
     monitor.busy = true;
     monitor.commandIndex = 0;
     const now = Date.now();
@@ -691,20 +1311,27 @@ export class UsageMonitor {
     const rawParsed = monitor.adapter.parseUsage(screenText);
     // TODO(임시 상세 로그): 사용량 파싱 오판 추적용. 안정화되면 제거하거나 레벨을 낮춘다.
     usageLog.debug("parse", { provider: monitor.adapter.id, out: rawParsed, in: screenText });
-    // Claude만 겪는 "리셋 시각이 지나도 예전 스냅샷을 계속 돌려줌" 보정(위 reconcileStaleClaudeSessionWindow 참고).
-    const parsed = monitor.adapter.id === "claude" ? reconcileStaleClaudeSessionWindow(rawParsed, new Date()) : rawParsed;
-    // "stale"은 파싱 자체는 성공했지만 CLI가 오래된 스냅샷을 돌려준 것으로 의심되는 상태라(위
-    // isExpiredResetTime 참고), 연결 자체는 정상이므로 monitor_status를 error로 떨어뜨리지 않는다.
-    const success = parsed.data_status !== "unavailable";
-    if (success) monitor.failureCount = 0;
     // 같은 리셋 시각의 창에서 사용량이 줄었다면 CLI가 돌려준 옛 스냅샷이므로, 이 값으로 마지막
     // 정상값을 덮어쓰지 않고 stale 표시만 남긴다(detectUsageRegression 참고). 다음 주기에 CLI가
     // 다시 최신 값을 주면 퍼센트가 증가 방향이라 그대로 통과돼 자동 복구된다.
     const previous = this.database.prepare("SELECT details_json, reset_at FROM usage_status WHERE provider = ? AND account_id = ?")
       .get(monitor.adapter.id, monitor.account.id) as { details_json: string | null; reset_at: string | null } | undefined;
+    // Claude만 겪는 "리셋 시각이 지나도 예전 스냅샷을 계속 돌려줌" 보정(위 reconcileStaleClaudeSessionWindow 참고).
+    // 새 화면에 세션 Resets가 없으면 직전 저장 창의 만료로 0%를 채운다.
+    let parsed = monitor.adapter.id === "claude" ? reconcileStaleClaudeSessionWindow(rawParsed, new Date(), previous?.details_json) : rawParsed;
+    // 오직 오류 코드 없는 fresh만 권위 있는 직접 관측이다. stale/unavailable 화면에 정상 모양 숫자가
+    // 있어도 DB·알림·keepalive에 절대 채택하지 않는 공급자 공통 불변조건으로 둔다.
+    const authoritativeFresh = parsed.data_status === "fresh" && parsed.error_code == null;
+    monitor.usageObservationFresh = authoritativeFresh;
+    monitor.usageKeepaliveTrusted = authoritativeFresh;
+    if (authoritativeFresh) {
+      monitor.failureCount = 0;
+      monitor.usageFallbackStreak = 0;
+      monitor.usagePollNotBeforeAt = undefined;
+    }
     // TODO(임시 상세 로그): 리셋 직후 reset_at 표기가 폴링마다 안정화되기 전까지 계속 바뀌는지
     // 추적하기 위한 로그. 리셋 시각이 실제로 몇 번의 폴링만에 고정되는지 확인되면 제거한다.
-    if (success && previous?.reset_at && rawParsed.reset_at && previous.reset_at !== rawParsed.reset_at) {
+    if (authoritativeFresh && previous?.reset_at && rawParsed.reset_at && previous.reset_at !== rawParsed.reset_at) {
       usageLog.info("reset_at_changed", { provider: monitor.adapter.id, accountId: monitor.account.id, from: previous.reset_at, to: rawParsed.reset_at });
     }
     if (monitor.adapter.id === "codex" && rawParsed.details_json) {
@@ -713,94 +1340,168 @@ export class UsageMonitor {
         : null;
       rawParsed.details_json = mergeCodexResetCredits(rawParsed.details_json, resetCredits, previous?.details_json);
     }
-    // 세션 리셋 시각이 물리적으로 불가능할 만큼 먼 값(5시간짜리 롤링 윈도우인데 8시간 넘게 남음 등)도
-    // 옛 스냅샷과 같은 종류의 오검출이라 같은 방식(stale만 남기고 마지막 정상값 유지)으로 처리한다.
-    const implausibleSessionReset = monitor.adapter.id === "claude" && success && isImplausibleClaudeSessionReset(parsed.details_json, new Date());
-    const rejected = success && (detectUsageRegression(previous?.details_json ?? null, parsed.details_json) || implausibleSessionReset);
-    monitor.rejectedStreak = rejected ? monitor.rejectedStreak + 1 : 0;
-    // 거부가 계속 이어지면 마지막 정상값이 굳어버리므로 임계치를 넘긴 뒤에는 최신값을 채택한다.
-    const adoptRejected = rejected && shouldAdoptRejectedUsage(monitor.rejectedStreak);
-    if (adoptRejected) {
-      usageLog.warn("rejected-adopted", { provider: monitor.adapter.id, accountId: monitor.account.id, streak: monitor.rejectedStreak, out: parsed });
-      monitor.rejectedStreak = 0;
-    }
     let keepaliveTrigger: UsageKeepaliveTrigger | null = null;
-    if (rejected && !adoptRejected) {
-      this.update(monitor, { monitor_status: "ready", data_status: "stale" });
-    } else {
+    let keepaliveObservationAccepted = false;
+    if (!authoritativeFresh) {
+      // non-fresh가 사이에 끼면 감소 거부는 연속이 아니다. 과거처럼 streak 4가 남아 다음 한 번의
+      // 낮은 값에서 강제 채택되는 경로를 없앤다.
+      monitor.rejectedStreak = 0;
+      if (monitor.adapter.id === "claude" && isClaudeUsageFallbackError(parsed.error_code)) {
+        monitor.usageFallbackStreak = (monitor.usageFallbackStreak ?? 0) + 1;
+        monitor.usagePollNotBeforeAt = Date.now() + claudeUsageBackoffMs(monitor.usageFallbackStreak);
+      }
       this.update(monitor, {
-        ...parsed,
-        monitor_status: success ? "ready" : "error",
-        last_success_at: success ? new Date().toISOString() : undefined,
+        monitor_status: parsed.data_status === "unavailable" ? "error" : "ready",
+        data_status: previous?.details_json ? "stale" : parsed.data_status,
+        error_code: parsed.error_code ?? null,
       });
-      if (success) {
-        this.resetNotifier?.observe(monitor.adapter.id, parsed.details_json);
+      // 세션 블록 누락이나 0%·Resets 없음은 숫자를 덮지 않지만, 초기화 고정은 현재 화면으로 계산한다.
+      if (monitor.adapter.id === "claude" && parsed.details_json && !isClaudeUsageFallbackError(parsed.error_code) && parsed.error_code !== "usage_refreshing") {
         keepaliveTrigger = detectUsageKeepaliveTrigger(monitor.adapter.id, previous?.details_json, parsed.details_json);
+        keepaliveObservationAccepted = !!keepaliveTrigger;
+        if (keepaliveTrigger) monitor.usageKeepaliveTrusted = true;
+      }
+    } else {
+      // 세션 리셋 시각이 물리적으로 불가능할 만큼 먼 값(5시간짜리 롤링 윈도우인데 8시간 넘게 남음 등)도
+      // 옛 스냅샷과 같은 종류의 오검출이라 같은 방식(stale만 남기고 마지막 정상값 유지)으로 처리한다.
+      const implausibleSessionReset = monitor.adapter.id === "claude" && isImplausibleClaudeSessionReset(parsed.details_json, new Date());
+      const decision = implausibleSessionReset
+        ? { kind: "reject" as const, zeroConfirm: { streak: 0, recycled: false } }
+        : decideFreshUsageAdoption(parsed, previous?.details_json, monitor.adapter.usageWindowId, {
+          streak: monitor.zeroConfirmStreak ?? 0,
+          recycled: !!monitor.zeroConfirmRecycled,
+        });
+      monitor.zeroConfirmStreak = decision.zeroConfirm.streak;
+      monitor.zeroConfirmRecycled = decision.zeroConfirm.recycled;
+      if (decision.kind === "reject") {
+        monitor.rejectedStreak += 1;
+        if (monitor.rejectedStreak >= REJECTED_ADOPT_STREAK) {
+          usageLog.warn("rejected-recheck", { provider: monitor.adapter.id, accountId: monitor.account.id, streak: monitor.rejectedStreak, out: parsed });
+          monitor.rejectedStreak = 0;
+          this.recycleTerminal(monitor);
+        }
+        this.update(monitor, { monitor_status: "ready", data_status: "stale", error_code: null });
+      } else {
+        monitor.rejectedStreak = 0;
+        parsed = decision.record;
+        if (decision.kind === "hold-zero" && decision.recycle) {
+          usageLog.info("zero-confirm-recheck", { provider: monitor.adapter.id, accountId: monitor.account.id, streak: decision.zeroConfirm.streak });
+          this.recycleTerminal(monitor);
+        }
+        this.update(monitor, {
+          ...parsed,
+          monitor_status: "ready",
+          last_success_at: new Date().toISOString(),
+        });
+        this.resetNotifier?.observe(monitor.adapter.id, parsed.details_json, new Date(), monitor.account.id);
+        keepaliveTrigger = detectUsageKeepaliveTrigger(monitor.adapter.id, previous?.details_json, parsed.details_json);
+        keepaliveObservationAccepted = true;
       }
     }
     monitor.collectUsageDetails = false;
-    monitor.terminal?.write("\u001b");
-    if (keepaliveTrigger) await this.maybeSendUsageKeepalive(monitor, keepaliveTrigger);
+    if (!monitor.recycling) monitor.terminal?.write("\u001b");
     monitor.busy = false;
+    if (keepaliveObservationAccepted) await this.reconcileKeepaliveAfterUsage(monitor, keepaliveTrigger);
   }
 
   // 계정별 초기화 창 중복 기록을 DB에서 확인하고 조회 PTY에 최소 단답 턴을 보낸다.
-  private async maybeSendUsageKeepalive(monitor: MonitorState, trigger: UsageKeepaliveTrigger): Promise<void> {
+  // 실제로 보냈거나 보낼 필요가 없으면 true, 실패면 false, Codex 사후 확인 중이면 별도 상태를 돌려준다.
+  private async maybeSendUsageKeepalive(monitor: MonitorState, trigger: UsageKeepaliveTrigger): Promise<boolean | "awaiting_confirmation"> {
     const row = this.database.prepare("SELECT reason, sent_at, window_key FROM usage_keepalive_prompts WHERE provider = ? AND account_id = ?")
       .get(monitor.adapter.id, monitor.account.id) as { reason: UsageKeepaliveReason; sent_at: string; window_key: string | null } | undefined;
     const now = new Date();
     if (!row?.window_key && row?.sent_at && trigger.windowKey && isLegacyKeepaliveFromCurrentWindow(row.sent_at, trigger.windowKey)) {
       this.database.prepare("UPDATE usage_keepalive_prompts SET window_key = ? WHERE provider = ? AND account_id = ? AND window_key IS NULL")
         .run(trigger.windowKey, monitor.adapter.id, monitor.account.id);
-      return;
+      return true;
     }
-    if (!isUsageKeepaliveDue(row?.sent_at, row?.window_key, trigger.windowKey, now)) return;
+    if (!isUsageKeepaliveDue(row?.sent_at, row?.window_key, trigger.windowKey, now)) return true;
     const sentAt = now.toISOString();
-    this.database.prepare(`
-      INSERT INTO usage_keepalive_prompts(provider, account_id, reason, sent_at, window_key) VALUES (?, ?, ?, ?, ?)
-      ON CONFLICT(provider, account_id) DO UPDATE SET reason = excluded.reason, sent_at = excluded.sent_at, window_key = excluded.window_key
-    `).run(monitor.adapter.id, monitor.account.id, trigger.reason, sentAt, trigger.windowKey);
     try {
-      await this.sendUsageKeepalivePrompt(monitor);
+      await this.sendUsageKeepalivePrompt(monitor, monitor.keepalivePromptAttempt ?? 0);
+      if (monitor.adapter.id === "codex") {
+        const latest = this.database.prepare("SELECT details_json FROM usage_status WHERE provider = ? AND account_id = ? AND data_status = 'fresh'")
+          .get(monitor.adapter.id, monitor.account.id) as { details_json: string | null } | undefined;
+        const targetWindowIds = parseWindows(latest?.details_json)
+          .filter((window) => (window.id === "five_hour" || window.id === "weekly") && window.usedPercent === 0)
+          .map((window) => window.id);
+        const confirmation = { trigger, sentAt, targetWindowIds };
+        // 전송을 마치는 사이 실제 대화가 먼저 창을 1% 이상으로 올렸다면 확인할 0% 대상이 없다.
+        // 방금 보낸 기록은 남기되 불필요한 확인·재시도는 만들지 않는다.
+        if (!targetWindowIds.length) {
+          this.confirmCodexUsageKeepalive(monitor, confirmation);
+          return true;
+        }
+        monitor.keepaliveConfirmation = confirmation;
+        usageLog.info("keepalive_awaiting_confirmation", { provider: monitor.adapter.id, accountId: monitor.account.id, reason: trigger.reason, targetWindowIds });
+        return "awaiting_confirmation";
+      }
+      this.database.prepare(`
+        INSERT INTO usage_keepalive_prompts(provider, account_id, reason, sent_at, window_key) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(provider, account_id) DO UPDATE SET reason = excluded.reason, sent_at = excluded.sent_at, window_key = excluded.window_key
+      `).run(monitor.adapter.id, monitor.account.id, trigger.reason, sentAt, trigger.windowKey);
       usageLog.info("keepalive", { provider: monitor.adapter.id, accountId: monitor.account.id, reason: trigger.reason });
       this.realtime.broadcast("usage_updated", { provider: monitor.adapter.id, accountId: monitor.account.id });
+      return true;
     } catch (error) {
-      if (row) {
-        this.database.prepare("UPDATE usage_keepalive_prompts SET reason = ?, sent_at = ?, window_key = ? WHERE provider = ? AND account_id = ? AND sent_at = ?")
-          .run(row.reason, row.sent_at, row.window_key, monitor.adapter.id, monitor.account.id, sentAt);
-      } else {
-        this.database.prepare("DELETE FROM usage_keepalive_prompts WHERE provider = ? AND account_id = ? AND sent_at = ?")
-          .run(monitor.adapter.id, monitor.account.id, sentAt);
-      }
       usageLog.warn("keepalive_failed", { provider: monitor.adapter.id, accountId: monitor.account.id, reason: trigger.reason, error });
+      return false;
     }
   }
 
-  // 누적 조회 문맥이 모델 입력에 섞이지 않도록 새 PTY에서 최소 턴만 실행하고 즉시 폐기한다.
-  private async sendUsageKeepalivePrompt(monitor: MonitorState): Promise<void> {
+  // Codex 고정 턴은 격리 exec로 보낸다. 대화형 TUI는 스레드만 열고 모델 턴을 제출하지 못했다.
+  private async sendUsageKeepalivePrompt(monitor: MonitorState, retryOrAttempt: boolean | number = false): Promise<void> {
+    const attempt = typeof retryOrAttempt === "number" ? retryOrAttempt : (retryOrAttempt ? Math.max(1, monitor.keepalivePromptAttempt ?? 1) : (monitor.keepalivePromptAttempt ?? 0));
+    if (monitor.adapter.id === "codex") {
+      const startedAt = Date.now();
+      const summary = await this.runCodexKeepalive({
+        command: monitor.adapter.createLaunch(os.tmpdir()).command,
+        env: { ...process.env, ...this.accounts.environment(monitor.account) } as Record<string, string>,
+        prompt: usageKeepalivePrompt(monitor.adapter.id, attempt),
+        minimumResponseChars: usageKeepaliveMinimumResponseChars(monitor.adapter.id, attempt),
+      });
+      usageLog.info("keepalive_exec_completed", {
+        provider: monitor.adapter.id,
+        accountId: monitor.account.id,
+        attempt,
+        elapsedMs: Date.now() - startedAt,
+        responseChars: summary.responseChars,
+      });
+      return;
+    }
     const terminal = this.spawnProviderTerminal(monitor);
     const screen = new TerminalScreen();
     let exited = false;
     terminal.onData((data) => screen.write(data));
     terminal.onExit(() => { exited = true; });
     try {
-      const readyDeadline = Date.now() + 15_000;
+      // 15초로는 Codex가 뜨기 전에 포기해 초기화 고정이 통째로 실패했다(실측 #57: keepalive_failed
+      // "세션 유지용 터미널이 준비되지 않았습니다"가 반복되고 그 창은 끝내 고정되지 못함).
+      // 초기화 창마다 한 번뿐인 동작이라 넉넉히 기다리는 편이 비용이 훨씬 싸다.
+      const readyDeadline = Date.now() + KEEPALIVE_READY_TIMEOUT_MS;
       while (!exited && !monitor.adapter.isReady(screen.text()) && Date.now() < readyDeadline) await wait(100);
       if (exited || !monitor.adapter.isReady(screen.text())) throw new Error("세션 유지용 터미널이 준비되지 않았습니다.");
       await wait(250);
       screen.reset();
-      terminal.write(USAGE_KEEPALIVE_PROMPT);
+      terminal.write(usageKeepalivePrompt(monitor.adapter.id, attempt));
       await wait(monitor.adapter.promptQuirks?.pasteSubmitDelayMs ?? 160);
+      // Enter를 누르기 전, 프롬프트 에코만 있는 상태를 기준선으로 잡는다. Enter 뒤에 잡으면 에코가
+      // 그대로 "응답이 왔다"로 읽히고, 반대로 응답이 아주 빨리 끝나면 기준선에 응답까지 들어가
+      // 증가가 안 보인다.
+      const baseline = screen.text().trim();
       terminal.write("\r");
       const startedAt = Date.now();
-      const deadline = startedAt + 15_000;
+      const deadline = startedAt + 30_000;
       let retried = false;
       let sawBusy = false;
       while (!exited && Date.now() < deadline) {
         const snapshot = screen.text();
         const busy = monitor.adapter.isBusy(snapshot);
         if (busy) sawBusy = true;
-        const answered = snapshot.split("\n").some((line) => line.trim() === "1");
+        // 예전에는 고정 프롬프트에 맞춰 정확히 "1"인 줄을 찾았는데, 프롬프트가 바뀌면 그대로 깨진다.
+        // 무엇을 물었든 모델이 턴을 돌면 기준선(프롬프트 에코만 있는 화면)보다 내용이 늘어나므로
+        // 그것으로 판정한다(#57). 조기 판정은 아래 300ms 하한이 막는다.
+        const answered = screen.text().trim().length > baseline.length;
         if (monitor.adapter.isReady(snapshot) && (sawBusy || answered) && Date.now() - startedAt >= 300) return;
         if (!retried && Date.now() - startedAt >= 1_000 && !busy) {
           terminal.write("\r");

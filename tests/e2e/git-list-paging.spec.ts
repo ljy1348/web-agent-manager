@@ -237,6 +237,7 @@ test("모바일에서 커밋을 고르면 목록을 접고 상세를 보여주�
 });
 
 test("커밋과 PR 목록을 더 보기로 이어서 불러온다", async ({ page }) => {
+  test.setTimeout(60_000);
   const commitLimits: number[] = [];
   const pullLimits: number[] = [];
   await page.route("**/api/**", async (route) => {

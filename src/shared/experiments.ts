@@ -1,14 +1,15 @@
 import type { Provider } from "./types";
 
-// 실험실이 실제로 돌릴 수 있는 공급자. 채팅 코어는 grok까지 지원하지만 실험실은 아직 하네스·평가자·DB
-// 제약이 codex·claude만 다루므로, 채팅용 Provider와 구분해 실험실 경계에서 좁힌다.
-// TODO: 실험실이 grok 실행·평가를 지원하게 되면 이 별칭을 없애고 Provider로 되돌린다(experiment_* 테이블의
-// provider CHECK 제약과 실험 생성 UI도 함께 넓혀야 한다).
-export type ExperimentProvider = Extract<Provider, "codex" | "claude">;
+// 실험실이 실제로 돌릴 수 있는 공급자. 지금은 채팅 코어와 같은 세 공급자를 모두 다루지만, 하네스·평가자
+// Runtime과 experiment_* 테이블 제약이 함께 넓혀져야 실행할 수 있으므로 채팅용 Provider와는 계속 구분한다
+// (채팅만 되는 공급자가 새로 붙어도 실험실 경계에서 걸러지도록).
+export const EXPERIMENT_PROVIDERS = ["codex", "claude", "grok"] as const;
+
+export type ExperimentProvider = Extract<Provider, typeof EXPERIMENT_PROVIDERS[number]>;
 
 // 실험실이 다룰 수 있는 공급자인지 확인한다. 실험 설정을 만드는 입구에서 이 검사로 좁힌다.
 export function isExperimentProvider(value: Provider): value is ExperimentProvider {
-  return value === "codex" || value === "claude";
+  return (EXPERIMENT_PROVIDERS as readonly string[]).includes(value);
 }
 
 export const EXPERIMENT_RUN_STATUSES = [
@@ -54,6 +55,29 @@ export type ExperimentFixtureSizeClass = typeof EXPERIMENT_FIXTURE_SIZE_CLASSES[
 export const EXPERIMENT_FIXTURE_STATUSES = ["draft", "ready", "rejected"] as const;
 export type ExperimentFixtureStatus = typeof EXPERIMENT_FIXTURE_STATUSES[number];
 
+// 실험이 무엇을 산출물로 남기는지. task_kind(상황)와 독립이며 기존 실험은 code_change다.
+export const EXPERIMENT_OUTPUT_CONTRACTS = ["code_change", "finding_report"] as const;
+export type ExperimentOutputContract = typeof EXPERIMENT_OUTPUT_CONTRACTS[number];
+
+export const EXPERIMENT_FINDING_SEVERITIES = ["blocker", "major", "minor"] as const;
+export type ExperimentFindingSeverity = typeof EXPERIMENT_FINDING_SEVERITIES[number];
+
+export interface ExperimentReviewTarget {
+  baseCommit: string;
+  headCommit: string;
+}
+
+export interface GroundTruthFinding {
+  id: string;
+  file: string;
+  lineStart: number;
+  lineEnd: number;
+  category: string;
+  severity: ExperimentFindingSeverity;
+  mustFind: boolean;
+  rationale: string;
+}
+
 export interface ExperimentFixtureInput {
   name: string;
   url: string;
@@ -65,6 +89,38 @@ export interface ExperimentFixtureInput {
   // shell 없이 execFile로 실행하기 위해 argv 배열로 고정한다. 임의 shell 문자열은 저장하지 않는다.
   setupCommand: string[];
   testCommand: string[];
+  reviewTarget: ExperimentReviewTarget | null;
+  findingTaxonomy: string | null;
+  groundTruth: GroundTruthFinding[] | null;
+}
+
+// 에이전트 보고. 매칭 id와 상위 K는 채점기가 배열 순서로 부여·절단하므로 id·confidence는 두지 않는다.
+export interface FindingReportItem {
+  file: string;
+  lineStart: number;
+  lineEnd: number;
+  category: string;
+  severity: ExperimentFindingSeverity;
+  title: string;
+  evidence: string | null;
+  suggestion: string | null;
+}
+
+export interface FindingReport {
+  findings: FindingReportItem[];
+}
+
+// 피험 에이전트에게 정답·rationale·존재/개수 힌트를 숨긴다. null로 두면 []와 구분되어 새므로 필드를 뺀다.
+export function omitFixtureGroundTruth<T extends object>(fixture: T): Omit<T, "groundTruth"> {
+  const { groundTruth: _hidden, ...visible } = fixture as T & { groundTruth?: unknown };
+  return visible;
+}
+
+export function omitFixtureListGroundTruth(fixtures: unknown): unknown {
+  if (!Array.isArray(fixtures)) return fixtures;
+  return fixtures.map((entry) => (
+    entry && typeof entry === "object" && !Array.isArray(entry) ? omitFixtureGroundTruth(entry) : entry
+  ));
 }
 
 export interface ExperimentRuntimeConfig {
@@ -218,7 +274,10 @@ function optionalNumber(value: unknown, minimum: number, maximum: number, label:
 }
 
 // API·DB·런타임이 공유할 버전 1 실험 변형 설정을 검증하고 기본값을 채운다.
-export function parseExperimentVariantConfig(value: unknown): ExperimentVariantConfig {
+export function parseExperimentVariantConfig(
+  value: unknown,
+  options?: { outputContract?: ExperimentOutputContract | null },
+): ExperimentVariantConfig {
   const root = objectValue(value, "실험 변형");
   if (root.schemaVersion !== 1) throw new Error("지원하지 않는 실험 변형 스키마 버전입니다.");
   const runtime = objectValue(root.runtime, "런타임");
@@ -232,11 +291,15 @@ export function parseExperimentVariantConfig(value: unknown): ExperimentVariantC
   const config: ExperimentVariantConfig = {
     schemaVersion: 1,
     runtime: {
-      provider: enumValue(runtime.provider, ["codex", "claude"] as const, "공급자"),
+      provider: enumValue(runtime.provider, EXPERIMENT_PROVIDERS, "공급자"),
       accountId,
       model: optionalString(runtime.model, "모델"),
       reasoningEffort: optionalString(runtime.reasoningEffort, "추론 강도"),
-      sandbox: enumValue(runtime.sandbox ?? "workspace-write", ["read-only", "workspace-write", "danger-full-access"] as const, "샌드박스"),
+      sandbox: enumValue(
+        runtime.sandbox ?? (options?.outputContract === "finding_report" ? "read-only" : "workspace-write"),
+        ["read-only", "workspace-write", "danger-full-access"] as const,
+        "샌드박스",
+      ),
       maxTurns: runtime.maxTurns === undefined || runtime.maxTurns === null
         ? null
         : integerValue(runtime.maxTurns, 0, 1, 10_000, "공급자 최대 turn 수"),
@@ -262,7 +325,7 @@ export function parseExperimentVariantConfig(value: unknown): ExperimentVariantC
       maxNoImprovement: integerValue(harness.maxNoImprovement, 1, 0, 100, "무개선 허용 횟수"),
       workerCount: integerValue(harness.workerCount, 2, 1, 8, "작업자 수"),
       secondaryRuntime: secondaryRuntime ? {
-        provider: enumValue(secondaryRuntime.provider, ["codex", "claude"] as const, "보조 공급자"),
+        provider: enumValue(secondaryRuntime.provider, EXPERIMENT_PROVIDERS, "보조 공급자"),
         accountId: secondaryRuntime.accountId == null
           ? null
           : integerValue(secondaryRuntime.accountId, 0, 1, Number.MAX_SAFE_INTEGER, "보조 계정 ID"),
@@ -299,6 +362,27 @@ export function parseExperimentVariantConfig(value: unknown): ExperimentVariantC
       throw new Error("SessionStart 스킬 활성화는 현재 Claude single 런타임에서만 지원합니다.");
     }
   }
+  // Grok headless는 스킬을 끄거나(mode:none) 고정할(overlay) 수단이 없어 실행 직전에 거부된다.
+  // graph에서는 primary가 다른 공급자라도 secondary가 같은 skills 설정을 그대로 받으므로
+  // (graph-harness의 withSandbox가 runtime만 갈아끼운다) 둘 중 하나라도 Grok이면 저장에서 막는다.
+  const usesGrok = config.runtime.provider === "grok" || config.harness.secondaryRuntime?.provider === "grok";
+  if (usesGrok && (config.skills.profile !== "native" || config.skills.mode !== "all" || config.skills.disabled.length > 0)) {
+    throw new Error("Grok 런타임은 스킬 격리를 지원하지 않습니다. primary·secondary 중 하나라도 Grok이면 skills는 profile:native·mode:all이고 disabled가 비어 있어야 합니다.");
+  }
+  // Claude CLI는 selected·disabled를 정확히 격리하지 못해 실행 시 거부한다. 저장 단계에서 같은 계약을 강제한다.
+  const usesClaude = config.runtime.provider === "claude" || config.harness.secondaryRuntime?.provider === "claude";
+  if (usesClaude && config.skills.profile !== "isolated_overlay" && (config.skills.mode === "selected" || config.skills.disabled.length > 0)) {
+    throw new Error("현재 Claude CLI는 개별 스킬 활성화·비활성화를 격리하지 못합니다. primary·secondary 중 하나라도 Claude이면 skills.mode는 all 또는 none이고 disabled가 비어 있어야 합니다.");
+  }
+  // 현재 Codex exec에는 --max-turns가 없어 저장만 되면 무제한으로 달린다.
+  if (config.runtime.provider === "codex" && config.runtime.maxTurns !== null) {
+    throw new Error("현재 Codex CLI는 runtime.maxTurns를 지원하지 않습니다.");
+  }
+  // 탐지 채점은 single worker 산출물만 기록한다. graph는 어느 node를 채점할지 합의되지 않아
+  // 저장되면 completed인데 점수가 없는 조용한 누락이 된다.
+  if (options?.outputContract === "finding_report" && config.harness.type !== "single") {
+    throw new Error("finding_report 실험은 single 하네스만 사용할 수 있습니다.");
+  }
   return config;
 }
 
@@ -307,7 +391,7 @@ export function parseExperimentEvaluators(value: unknown): ExperimentEvaluatorCo
   if (!Array.isArray(value) || value.length < 1 || value.length > 4) throw new Error("evaluator는 1~4개가 필요합니다.");
   const evaluators = value.map((entry, index) => {
     const root = objectValue(entry, `evaluator ${index + 1}`);
-    const provider = enumValue(root.provider, ["codex", "claude"] as const, "evaluator 공급자");
+    const provider = enumValue(root.provider, EXPERIMENT_PROVIDERS, "evaluator 공급자");
     const accountId = root.accountId === undefined || root.accountId === null
       ? null
       : integerValue(root.accountId, 0, 1, Number.MAX_SAFE_INTEGER, "evaluator 계정 ID");
@@ -357,28 +441,98 @@ function commandArgv(value: unknown, label: string): string[] {
   });
 }
 
+const MAX_FINDING_COUNT = 1_000;
+const MAX_FILE_PATH = 1_000;
+const MAX_FINDING_TITLE = 200;
+const MAX_FINDING_TEXT = 5_000;
+
+// 짧은 SHA는 저장소가 커지면 모호해지므로 40자 전체를 요구한다.
+function gitSha(value: unknown, label: string): string {
+  const sha = requiredShortString(value, label);
+  if (!/^[0-9a-f]{40}$/i.test(sha)) throw new Error(`${label}은 40자 SHA여야 합니다.`);
+  return sha.toLowerCase();
+}
+
+// Git 좌표는 POSIX라 `\`를 `/`로 바꾼 뒤에 절대·탈출 세그먼트를 검사한다. 순서가 바뀌면 `src\..\..\etc\passwd`가 통과한다.
+function posixRelativeFile(value: unknown, label: string): string {
+  if (typeof value !== "string") throw new Error(`${label}은 문자열이어야 합니다.`);
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > MAX_FILE_PATH) throw new Error(`${label}은 1자 이상 ${MAX_FILE_PATH}자 이하여야 합니다.`);
+  if (trimmed.includes("\0")) throw new Error(`${label}은 저장소 상대 POSIX 경로여야 합니다.`);
+  const normalized = trimmed.replaceAll("\\", "/");
+  if (normalized.startsWith("/")) throw new Error(`${label}은 저장소 상대 POSIX 경로여야 합니다.`);
+  const segments = normalized.split("/");
+  if (segments.some((segment) => !segment || segment === "." || segment === "..")) {
+    throw new Error(`${label}은 저장소 상대 POSIX 경로여야 합니다.`);
+  }
+  return normalized;
+}
+
+function findingLine(value: unknown, label: string): number {
+  if (!Number.isInteger(value) || Number(value) < 1 || Number(value) > 10_000_000) {
+    throw new Error(`${label}은 1 이상의 1-indexed 정수여야 합니다.`);
+  }
+  return Number(value);
+}
+
+function findingSpan(lineStart: unknown, lineEnd: unknown): { lineStart: number; lineEnd: number } {
+  const start = findingLine(lineStart, "시작 줄");
+  const end = findingLine(lineEnd, "끝 줄");
+  if (end < start) throw new Error("끝 줄은 시작 줄 이상이어야 합니다.");
+  return { lineStart: start, lineEnd: end };
+}
+
+// 동의어를 스키마에서 거르면 탐지 실패가 형식 실패로 바뀌므로 자유 문자열로 둔다.
+function findingCategory(value: unknown): string {
+  const normalized = optionalString(value, "결함 분류");
+  if (!normalized) throw new Error("결함 분류가 필요합니다.");
+  return normalized;
+}
+
+function findingSeverity(value: unknown): ExperimentFindingSeverity {
+  return enumValue(value, EXPERIMENT_FINDING_SEVERITIES, "결함 심각도");
+}
+
+function requiredLongString(value: unknown, maximum: number, label: string): string {
+  if (typeof value !== "string") throw new Error(`${label}은 문자열이어야 합니다.`);
+  const normalized = value.trim();
+  if (!normalized || normalized.length > maximum) throw new Error(`${label}은 1자 이상 ${maximum}자 이하여야 합니다.`);
+  return normalized;
+}
+
+function optionalLongString(value: unknown, maximum: number, label: string): string | null {
+  if (value === undefined || value === null || value === "") return null;
+  return requiredLongString(value, maximum, label);
+}
+
+function parseFindingList<T>(value: unknown, label: string, parseItem: (entry: unknown, index: number) => T): T[] {
+  if (!Array.isArray(value)) throw new Error(`${label}은 배열이어야 합니다.`);
+  if (value.length > MAX_FINDING_COUNT) throw new Error(`${label}은 최대 ${MAX_FINDING_COUNT}개여야 합니다.`);
+  return value.map((entry, index) => parseItem(entry, index));
+}
+
 // 외부 공개 저장소 fixture 정의를 검증한다. 임의 URL·짧은 commit·shell 문자열을 받지 않는다.
 export function parseExperimentFixtureInput(value: unknown): ExperimentFixtureInput {
   const root = objectValue(value, "저장소 fixture");
   const url = requiredShortString(root.url, "fixture URL");
   // 공개 저장소만 대상으로 하며 file은 로컬 고정 fixture용이다. ssh·git 프로토콜은 받지 않는다.
   if (!/^(https:\/\/|file:\/\/)/.test(url)) throw new Error("fixture URL은 https:// 또는 file://이어야 합니다.");
-  const pinnedCommit = requiredShortString(root.pinnedCommit, "fixture 기준 commit");
-  // 짧은 SHA는 저장소가 커지면 모호해지므로 40자 전체를 요구한다.
-  if (!/^[0-9a-f]{40}$/i.test(pinnedCommit)) throw new Error("fixture 기준 commit은 40자 SHA여야 합니다.");
   const linesOfCode = root.linesOfCode === undefined || root.linesOfCode === null
     ? null
     : integerValue(root.linesOfCode, 0, 0, 1_000_000_000, "fixture LOC");
   return {
     name: requiredShortString(root.name, "fixture 이름"),
     url,
-    pinnedCommit: pinnedCommit.toLowerCase(),
+    pinnedCommit: gitSha(root.pinnedCommit, "fixture 기준 commit"),
     sizeClass: enumValue(root.sizeClass, EXPERIMENT_FIXTURE_SIZE_CLASSES, "fixture 규모"),
     language: optionalString(root.language, "fixture 언어"),
     license: optionalString(root.license, "fixture 라이선스"),
     linesOfCode,
     setupCommand: commandArgv(root.setupCommand, "fixture 준비 명령"),
     testCommand: commandArgv(root.testCommand, "fixture 검증 명령"),
+    reviewTarget: parseExperimentReviewTarget(root.reviewTarget),
+    findingTaxonomy: optionalString(root.findingTaxonomy, "결함 분류 체계"),
+    groundTruth: parseExperimentGroundTruth(root.groundTruth),
   };
 }
 
@@ -386,4 +540,64 @@ export function parseExperimentFixtureInput(value: unknown): ExperimentFixtureIn
 export function parseExperimentTaskKind(value: unknown): ExperimentTaskKind | null {
   if (value === undefined || value === null || value === "") return null;
   return enumValue(value, EXPERIMENT_TASK_KINDS, "과제 유형");
+}
+
+// 생략·기존 행은 현행 코드 변경 실험으로 본다. 알 수 없는 값은 조용히 통과시키지 않는다.
+export function parseExperimentOutputContract(value: unknown): ExperimentOutputContract {
+  if (value === undefined || value === null || value === "") return "code_change";
+  return enumValue(value, EXPERIMENT_OUTPUT_CONTRACTS, "산출물 계약");
+}
+
+export function parseExperimentReviewTarget(value: unknown): ExperimentReviewTarget | null {
+  if (value === undefined || value === null || value === "") return null;
+  const root = objectValue(value, "리뷰 대상");
+  return {
+    baseCommit: gitSha(root.baseCommit, "리뷰 기준 commit"),
+    headCommit: gitSha(root.headCommit, "리뷰 대상 commit"),
+  };
+}
+
+function parseGroundTruthFinding(value: unknown, index: number): GroundTruthFinding {
+  const root = objectValue(value, `정답 ${index + 1}`);
+  const span = findingSpan(root.lineStart, root.lineEnd);
+  if (typeof root.mustFind !== "boolean") throw new Error(`정답 ${index + 1} mustFind는 boolean이어야 합니다.`);
+  return {
+    id: requiredShortString(root.id, `정답 ${index + 1} id`),
+    file: posixRelativeFile(root.file, `정답 ${index + 1} 파일`),
+    lineStart: span.lineStart,
+    lineEnd: span.lineEnd,
+    category: findingCategory(root.category),
+    severity: findingSeverity(root.severity),
+    mustFind: root.mustFind,
+    rationale: requiredLongString(root.rationale, MAX_FINDING_TEXT, `정답 ${index + 1} 근거`),
+  };
+}
+
+export function parseExperimentGroundTruth(value: unknown): GroundTruthFinding[] | null {
+  if (value === undefined || value === null || value === "") return null;
+  const findings = parseFindingList(value, "정답 목록", parseGroundTruthFinding);
+  if (new Set(findings.map((entry) => entry.id)).size !== findings.length) {
+    throw new Error("정답 id는 한 fixture 안에서 중복될 수 없습니다.");
+  }
+  return findings;
+}
+
+function parseFindingReportItem(value: unknown, index: number): FindingReportItem {
+  const root = objectValue(value, `보고 ${index + 1}`);
+  const span = findingSpan(root.lineStart, root.lineEnd);
+  return {
+    file: posixRelativeFile(root.file, `보고 ${index + 1} 파일`),
+    lineStart: span.lineStart,
+    lineEnd: span.lineEnd,
+    category: findingCategory(root.category),
+    severity: findingSeverity(root.severity),
+    title: requiredLongString(root.title, MAX_FINDING_TITLE, `보고 ${index + 1} 제목`),
+    evidence: optionalLongString(root.evidence, MAX_FINDING_TEXT, `보고 ${index + 1} 근거`),
+    suggestion: optionalLongString(root.suggestion, MAX_FINDING_TEXT, `보고 ${index + 1} 제안`),
+  };
+}
+
+export function parseFindingReport(value: unknown): FindingReport {
+  const root = objectValue(value, "결함 보고");
+  return { findings: parseFindingList(root.findings, "결함 보고 findings", parseFindingReportItem) };
 }

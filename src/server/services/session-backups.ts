@@ -9,6 +9,7 @@ import type { Provider } from "../../shared/types";
 import type { ProviderAdapter, HistorySession } from "../providers/provider";
 import type { HistoryCache } from "./history-cache";
 import { tokenUsageSnapshotForChat, type TokenUsageLedger, type TokenUsageSnapshot } from "./token-usage-ledger";
+import type { AgentAccountService } from "./agent-accounts";
 
 interface ChatBackupMetadata {
   version: 1;
@@ -84,6 +85,7 @@ export class SessionBackupService {
     private readonly database: AppDatabase,
     adapters: ProviderAdapter[],
     private readonly historyCache: HistoryCache,
+    private readonly accounts: AgentAccountService,
     private readonly tokenUsage?: TokenUsageLedger,
   ) {
     this.adapters = new Map(adapters.map((adapter) => [adapter.id, adapter]));
@@ -95,7 +97,7 @@ export class SessionBackupService {
     const chat = this.getChat(chatId);
     if (!chat.provider_session_id || !chat.history_file) throw new Error("백업할 세션 기록이 아직 없습니다.");
     const adapter = this.getAdapter(chat.provider);
-    const root = fs.realpathSync(adapter.historyRoot);
+    const root = this.historyRootFor(chat.provider, chat.account_id, adapter);
     const historyFile = fs.realpathSync(chat.history_file);
     assertInside(root, historyFile);
     const stat = fs.statSync(historyFile);
@@ -151,8 +153,7 @@ export class SessionBackupService {
     if (!fs.existsSync(backupFile)) throw new Error("백업 세션 파일을 찾을 수 없습니다.");
     const projectPath = assertAllowedPath(metadata.projectPath, this.config.allowedRoots);
     if (!fs.existsSync(projectPath) || !fs.statSync(projectPath).isDirectory()) throw new Error("복원할 프로젝트 경로가 없습니다.");
-    fs.mkdirSync(adapter.historyRoot, { recursive: true, mode: 0o700 });
-    const root = fs.realpathSync(adapter.historyRoot);
+    const root = this.historyRootFor(metadata.provider, metadata.accountId ?? null, adapter, true);
     const relative = metadata.historyRelativePath || `${metadata.provider}/restored-${id}.jsonl`;
     const wanted = path.resolve(root, relative);
     assertInside(root, wanted);
@@ -187,7 +188,7 @@ export class SessionBackupService {
     this.recordChatUsage(chat, true);
     this.tokenUsage?.markChatDeleted(chatId);
     if (chat.history_file && fs.existsSync(chat.history_file)) {
-      const root = fs.realpathSync(adapter.historyRoot);
+      const root = this.historyRootFor(chat.provider, chat.account_id, adapter);
       const historyFile = fs.realpathSync(chat.history_file);
       assertInside(root, historyFile);
       fs.rmSync(historyFile, { force: true });
@@ -212,6 +213,15 @@ export class SessionBackupService {
     const adapter = this.adapters.get(provider);
     if (!adapter) throw new Error("지원하지 않는 공급자입니다.");
     return adapter;
+  }
+
+  // 서버 프로세스의 HOME이 아니라 채팅에 연결된 CLI 계정의 설정 디렉터리를 기준으로 기록 루트를
+  // 계산한다. 기본 Codex는 설치 사용자 ~/.codex를 명시적으로 쓰므로 둘이 다를 수 있다.
+  private historyRootFor(provider: Provider, accountId: number | null | undefined, adapter: ProviderAdapter, create = false): string {
+    const account = this.accounts.resolveForChat(provider, accountId);
+    const candidate = adapter.historyRootFor(this.accounts.cliConfigDir(account));
+    if (create) fs.mkdirSync(candidate, { recursive: true, mode: 0o700 });
+    return fs.realpathSync(candidate);
   }
 
   private backupDir(id: string): string {

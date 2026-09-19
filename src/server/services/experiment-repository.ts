@@ -4,18 +4,23 @@ import type { DeterministicCheckStatus } from "../experiments/deterministic-chec
 import {
   parseExperimentDesign,
   parseExperimentFixtureInput,
+  parseExperimentGroundTruth,
+  parseExperimentOutputContract,
+  parseExperimentReviewTarget,
   parseExperimentTaskKind,
   parseExperimentVariantConfig,
   type ExperimentDesign,
   type ExperimentFixtureInput,
   type ExperimentFixtureSizeClass,
   type ExperimentFixtureStatus,
+  type ExperimentOutputContract,
   type ExperimentTaskKind,
   type ExperimentCheckpointRecord,
   type ExperimentEventRecord,
   type ExperimentRunStatus,
   type ExperimentStatus,
   type ExperimentTerminationReason,
+  type ExperimentProvider,
   type ExperimentVariantConfig,
 } from "../../shared/experiments";
 
@@ -29,6 +34,7 @@ export interface ExperimentRecord {
   rubric: Record<string, unknown>;
   suiteId: string | null;
   taskKind: ExperimentTaskKind | null;
+  outputContract: ExperimentOutputContract;
   fixtureId: string | null;
   status: ExperimentStatus;
   createdAt: string;
@@ -73,6 +79,8 @@ export interface ExperimentRunRecord {
   checkExitCode: number | null;
   checkDurationMs: number | null;
   checkOutput: string | null;
+  outputStatus: "ok" | "malformed" | "missing" | "not_applicable" | null;
+  observation: Record<string, unknown>;
   startedAt: string | null;
   finishedAt: string | null;
   createdAt: string;
@@ -87,7 +95,7 @@ export interface ExperimentNodeRecord {
   ordinal: number;
   attempt: number;
   status: "queued" | "running" | "completed" | "failed" | "cancelled";
-  provider: "codex" | "claude" | null;
+  provider: ExperimentProvider | null;
   model: string | null;
   input: Record<string, unknown>;
   output: Record<string, unknown> | null;
@@ -115,10 +123,10 @@ export interface ExperimentJudgmentRecord {
   runId: string;
   evaluatorLabel: string;
   evaluatorKind: "agent" | "human" | "deterministic";
-  evaluatorProvider: "codex" | "claude" | null;
+  evaluatorProvider: ExperimentProvider | null;
   evaluatorModel: string | null;
   evaluatorFamily: string | null;
-  subjectProvider: "codex" | "claude" | null;
+  subjectProvider: ExperimentProvider | null;
   subjectModel: string | null;
   subjectFamily: string | null;
   sameFamily: boolean;
@@ -169,7 +177,7 @@ export interface ExperimentEvaluationCallRecord {
   evaluationId: string;
   idempotencyKey: string;
   evaluatorLabel: string;
-  evaluatorProvider: "codex" | "claude";
+  evaluatorProvider: ExperimentProvider;
   evaluatorModel: string | null;
   evaluatorFamily: string | null;
   evaluatorAccountId: number | null;
@@ -214,6 +222,9 @@ interface FixtureRow {
   status: ExperimentFixtureStatus;
   gate_json: string;
   mirror_path: string | null;
+  review_target_json: string | null;
+  finding_taxonomy: string | null;
+  ground_truth_json: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -277,6 +288,7 @@ interface ExperimentRow {
   rubric_json: string;
   suite_id: string | null;
   task_kind: ExperimentTaskKind | null;
+  output_contract: ExperimentOutputContract;
   fixture_id: string | null;
   status: ExperimentStatus;
   created_at: string;
@@ -321,6 +333,8 @@ interface RunRow {
   check_exit_code: number | null;
   check_duration_ms: number | null;
   check_output: string | null;
+  output_status: "ok" | "malformed" | "missing" | "not_applicable" | null;
+  observation_json: string;
   started_at: string | null;
   finished_at: string | null;
   created_at: string;
@@ -345,7 +359,7 @@ interface NodeRow {
   ordinal: number;
   attempt: number;
   status: ExperimentNodeRecord["status"];
-  provider: "codex" | "claude" | null;
+  provider: ExperimentProvider | null;
   model: string | null;
   input_json: string;
   output_json: string | null;
@@ -383,10 +397,10 @@ interface JudgmentRow {
   run_id: string;
   evaluator_label: string;
   evaluator_kind: ExperimentJudgmentRecord["evaluatorKind"];
-  evaluator_provider: "codex" | "claude" | null;
+  evaluator_provider: ExperimentProvider | null;
   evaluator_model: string | null;
   evaluator_family: string | null;
-  subject_provider: "codex" | "claude" | null;
+  subject_provider: ExperimentProvider | null;
   subject_model: string | null;
   subject_family: string | null;
   same_family: number;
@@ -427,7 +441,7 @@ interface EvaluationCallRow {
   evaluation_id: string;
   idempotency_key: string;
   evaluator_label: string;
-  evaluator_provider: "codex" | "claude";
+  evaluator_provider: ExperimentProvider;
   evaluator_model: string | null;
   evaluator_family: string | null;
   evaluator_account_id: number | null;
@@ -526,6 +540,13 @@ function fixtureRecord(row: FixtureRow): ExperimentFixtureRecord {
     sizeClass: row.size_class, language: row.language, license: row.license, linesOfCode: row.lines_of_code,
     setupCommand: JSON.parse(row.setup_command_json) as string[],
     testCommand: JSON.parse(row.test_command_json) as string[],
+    reviewTarget: row.review_target_json == null || row.review_target_json === ""
+      ? null
+      : parseExperimentReviewTarget(JSON.parse(row.review_target_json)),
+    findingTaxonomy: row.finding_taxonomy,
+    groundTruth: row.ground_truth_json == null || row.ground_truth_json === ""
+      ? null
+      : parseExperimentGroundTruth(JSON.parse(row.ground_truth_json)),
     status: row.status, gate: parseObjectJson(row.gate_json, "fixture 게이트"), mirrorPath: row.mirror_path,
     createdAt: row.created_at, updatedAt: row.updated_at,
   };
@@ -535,7 +556,8 @@ function experimentRecord(row: ExperimentRow): ExperimentRecord {
   return {
     id: row.id, projectId: row.project_id, createdBy: row.created_by, name: row.name, command: row.command,
     design: parseExperimentDesign(JSON.parse(row.design_json)), rubric: parseObjectJson(row.rubric_json, "평가 기준"),
-    suiteId: row.suite_id, taskKind: row.task_kind, fixtureId: row.fixture_id, status: row.status,
+    suiteId: row.suite_id, taskKind: row.task_kind, outputContract: parseExperimentOutputContract(row.output_contract),
+    fixtureId: row.fixture_id, status: row.status,
     createdAt: row.created_at, updatedAt: row.updated_at,
   };
 }
@@ -564,6 +586,7 @@ function runRecord(row: RunRow): ExperimentRunRecord {
     waitedSeconds: row.waited_seconds, waitCount: row.wait_count,
     checkStatus: row.check_status, checkExitCode: row.check_exit_code,
     checkDurationMs: row.check_duration_ms, checkOutput: row.check_output,
+    outputStatus: row.output_status, observation: parseObjectJson(row.observation_json ?? "{}", "실행 관찰"),
     startedAt: row.started_at, finishedAt: row.finished_at,
     createdAt: row.created_at, updatedAt: row.updated_at,
   };
@@ -782,11 +805,16 @@ export class ExperimentRepository {
     const parsed = parseExperimentFixtureInput(input);
     const id = crypto.randomUUID();
     this.database.prepare(`
-      INSERT INTO experiment_fixtures(id, name, url, pinned_commit, size_class, language, license, lines_of_code, setup_command_json, test_command_json)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO experiment_fixtures(
+        id, name, url, pinned_commit, size_class, language, license, lines_of_code,
+        setup_command_json, test_command_json, review_target_json, finding_taxonomy, ground_truth_json
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id, parsed.name, parsed.url, parsed.pinnedCommit, parsed.sizeClass, parsed.language, parsed.license,
       parsed.linesOfCode, JSON.stringify(parsed.setupCommand), JSON.stringify(parsed.testCommand),
+      parsed.reviewTarget ? JSON.stringify(parsed.reviewTarget) : null, parsed.findingTaxonomy,
+      parsed.groundTruth ? JSON.stringify(parsed.groundTruth) : null,
     );
     return this.getFixture(id)!;
   }
@@ -825,6 +853,7 @@ export class ExperimentRepository {
     design?: unknown;
     rubric?: Record<string, unknown>;
     taskKind?: unknown;
+    outputContract?: unknown;
     fixtureId?: string | null;
     suiteId?: string | null;
   }): ExperimentRecord {
@@ -834,12 +863,13 @@ export class ExperimentRepository {
       schemaVersion: 1, hypothesis: null, controlledVariables: [], treatmentVariables: [], repetitions: 1, randomizeOrder: true,
     });
     this.database.prepare(`
-      INSERT INTO experiments(id, project_id, created_by, name, command, design_json, rubric_json, task_kind, fixture_id, suite_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO experiments(id, project_id, created_by, name, command, design_json, rubric_json, task_kind, output_contract, fixture_id, suite_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id, input.projectId, input.createdBy ?? null, requiredString(input.name, 200, "실험 이름"),
       requiredString(input.command, 100_000, "실험 명령"), JSON.stringify(design), JSON.stringify(input.rubric ?? {}),
-      parseExperimentTaskKind(input.taskKind), input.fixtureId ?? null, input.suiteId ?? null,
+      parseExperimentTaskKind(input.taskKind), parseExperimentOutputContract(input.outputContract),
+      input.fixtureId ?? null, input.suiteId ?? null,
     );
     return this.getExperiment(id)!;
   }
@@ -864,8 +894,9 @@ export class ExperimentRepository {
     config: unknown;
     ordinal?: number;
   }): ExperimentVariantRecord {
-    if (!this.getExperiment(input.experimentId)) throw new Error("실험을 찾을 수 없습니다.");
-    const config = parseExperimentVariantConfig(input.config);
+    const experiment = this.getExperiment(input.experimentId);
+    if (!experiment) throw new Error("실험을 찾을 수 없습니다.");
+    const config = parseExperimentVariantConfig(input.config, { outputContract: experiment.outputContract });
     const ordinal = input.ordinal ?? 0;
     if (!Number.isInteger(ordinal) || ordinal < 0 || ordinal > 10_000) throw new Error("변형 순서가 올바르지 않습니다.");
     const id = crypto.randomUUID();
@@ -945,7 +976,7 @@ export class ExperimentRepository {
     runId: string;
     parentNodeId?: string | null;
     role: string;
-    provider?: "codex" | "claude" | null;
+    provider?: ExperimentProvider | null;
     model?: string | null;
     payload?: Record<string, unknown>;
   }): ExperimentNodeRecord {
@@ -1091,7 +1122,7 @@ export class ExperimentRepository {
     evaluationId: string;
     idempotencyKey: string;
     evaluatorLabel: string;
-    evaluatorProvider: "codex" | "claude";
+    evaluatorProvider: ExperimentProvider;
     evaluatorModel?: string | null;
     evaluatorFamily?: string | null;
     evaluatorAccountId?: number | null;
@@ -1187,10 +1218,10 @@ export class ExperimentRepository {
     runId: string;
     evaluatorLabel: string;
     evaluatorKind?: ExperimentJudgmentRecord["evaluatorKind"];
-    evaluatorProvider?: "codex" | "claude" | null;
+    evaluatorProvider?: ExperimentProvider | null;
     evaluatorModel?: string | null;
     evaluatorFamily?: string | null;
-    subjectProvider?: "codex" | "claude" | null;
+    subjectProvider?: ExperimentProvider | null;
     subjectModel?: string | null;
     subjectFamily?: string | null;
     blindLabel?: string | null;
@@ -1370,6 +1401,18 @@ export class ExperimentRepository {
       SET check_status = ?, check_exit_code = ?, check_duration_ms = ?, check_output = ?, updated_at = CURRENT_TIMESTAMP
       WHERE id = ?
     `).run(result.status, result.exitCode, Math.max(0, Math.round(result.durationMs)), nullableString(result.output, 20_000, "검증 출력"), runId);
+    return this.getRun(runId)!;
+  }
+
+  // finding_report 산출물 상태와 관찰 열을 남긴다. 형식 실패도 run 종료 이유가 아니라 여기만 적는다.
+  recordRunObservation(runId: string, input: {
+    outputStatus: "ok" | "malformed" | "missing" | "not_applicable";
+    observation: Record<string, unknown>;
+  }): ExperimentRunRecord {
+    if (!this.getRun(runId)) throw new Error("실험 실행을 찾을 수 없습니다.");
+    this.database.prepare(`
+      UPDATE experiment_runs SET output_status = ?, observation_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
+    `).run(input.outputStatus, JSON.stringify(input.observation), runId);
     return this.getRun(runId)!;
   }
 

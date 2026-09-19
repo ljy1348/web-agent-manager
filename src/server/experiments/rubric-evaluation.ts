@@ -1,4 +1,4 @@
-import type { ExperimentEvaluatorConfig, ExperimentVariantConfig } from "../../shared/experiments";
+import type { ExperimentEvaluatorConfig, ExperimentVariantConfig, ExperimentProvider} from "../../shared/experiments";
 import { RuntimeBudgetPolicy, type AgentRuntime, type RuntimeEvent, type RuntimeUsageSnapshot } from "./agent-runtime";
 import { ExperimentRepository, type ExperimentEvaluationRecord } from "../services/experiment-repository";
 import type { BlindSubjectPacket } from "./blind-subject-packet";
@@ -18,7 +18,7 @@ export interface RubricEvaluationInput {
   workingDirectory: string;
   task: string;
   candidate: BlindSubjectPacket;
-  subjectProvider: "codex" | "claude";
+  subjectProvider: ExperimentProvider;
   subjectModel: string | null;
   subjectFamily: string;
   evaluators: RubricEvaluatorRuntime[];

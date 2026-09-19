@@ -61,32 +61,67 @@ function terminalRowsForHeight(instance: Terminal, hostElement: HTMLElement): nu
   return Math.max(TERMINAL_MIN_ROWS, Math.min(TERMINAL_MAX_ROWS, Math.floor(available / cellHeight)));
 }
 
+type TerminalSubscribeSocket = Pick<WebSocket, "readyState" | "send" | "addEventListener" | "removeEventListener">;
+
+// 소켓이 열려 있으면 즉시, 연결 중이면 open에서 터미널을 재구독한다.
+export function subscribeTerminalWhenReady(options: {
+  socket: TerminalSubscribeSocket;
+  chatId: number;
+  resolveRows: () => number;
+  onReady?: () => void;
+}): () => void {
+  const send = (): void => {
+    if (options.socket.readyState !== WebSocket.OPEN) return;
+    options.onReady?.();
+    options.socket.send(JSON.stringify({ type: "subscribe_terminal", chatId: options.chatId, rows: options.resolveRows() }));
+  };
+  if (options.socket.readyState === WebSocket.OPEN) {
+    send();
+    return () => undefined;
+  }
+  if (options.socket.readyState === WebSocket.CONNECTING) {
+    options.socket.addEventListener("open", send);
+    return () => options.socket.removeEventListener("open", send);
+  }
+  return () => undefined;
+}
+
 // 선택한 채팅의 실제 tmux PTY를 xterm 화면과 WebSocket으로 연결한다.
 // 선택 채팅의 원본 PTY 출력을 xterm에 표시하고 키 입력과 크기를 동기화한다.
 export function TerminalPanel({ chat, socket }: { chat: Json | null; socket: WebSocket | null }): React.ReactElement {
   const host = useRef<HTMLDivElement>(null);
   const terminal = useRef<Terminal | null>(null);
   const terminalRows = useRef(TERMINAL_DEFAULT_ROWS);
+  const socketRef = useRef(socket);
+  const chatRef = useRef(chat);
   const controlRef = useRef(false);
   const altRef = useRef(false);
   const [controlActive, setControlActive] = useState(false);
   const [altActive, setAltActive] = useState(false);
+  socketRef.current = socket;
+  chatRef.current = chat;
   controlRef.current = controlActive;
   altRef.current = altActive;
 
   // 현재 채팅의 PTY 입력 채널로 원시 터미널 바이트를 보낸다.
   function sendTerminalInput(data: string): void {
-    if (chat && socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "terminal_input", chatId: chat.id, data }));
+    const currentChat = chatRef.current;
+    const currentSocket = socketRef.current;
+    if (currentChat && currentSocket?.readyState === WebSocket.OPEN) currentSocket.send(JSON.stringify({ type: "terminal_input", chatId: currentChat.id, data }));
   }
 
   // 현재 채팅의 tmux 기록(copy-mode)을 lines만큼 옮기도록 요청한다. 양수가 과거 방향이다.
   function sendTerminalScroll(lines: number): void {
-    if (chat && socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "terminal_scroll", chatId: chat.id, lines }));
+    const currentChat = chatRef.current;
+    const currentSocket = socketRef.current;
+    if (currentChat && currentSocket?.readyState === WebSocket.OPEN) currentSocket.send(JSON.stringify({ type: "terminal_scroll", chatId: currentChat.id, lines }));
   }
 
   // 브라우저 xterm과 서버 tmux가 같은 세로 행 수를 사용하도록 리사이즈를 요청한다.
   function sendTerminalResize(rows: number): void {
-    if (chat && socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "terminal_resize", chatId: chat.id, rows }));
+    const currentChat = chatRef.current;
+    const currentSocket = socketRef.current;
+    if (currentChat && currentSocket?.readyState === WebSocket.OPEN) currentSocket.send(JSON.stringify({ type: "terminal_resize", chatId: currentChat.id, rows }));
   }
 
   // 모바일 보조 키를 전송하고 일회성 modifier 상태를 정리한다.
@@ -99,6 +134,7 @@ export function TerminalPanel({ chat, socket }: { chat: Json | null; socket: Web
   useEffect(() => {
     const hostElement = host.current;
     if (!hostElement) return;
+    // 채팅이 바뀔 때만 xterm을 다시 만든다. 소켓 교체는 파괴 없이 재구독한다.
     // 스크롤백을 클라이언트에 쌓지 않는다(서버 TerminalScreen도 같은 `scrollback: 0` 계약이다).
     // 여기 쌓이는 건 tmux가 pane을 다시 그리며 흘려보낸 잔해라 진짜 CLI 기록이 아닌데, 그게 남아 있으면
     // 휠이 그 잔해 안에서만 맴돌아 실제 tmux 기록까지 닿지 못하고 타이핑해도 맨 아래로 돌아오지 않았다
@@ -236,7 +272,7 @@ export function TerminalPanel({ chat, socket }: { chat: Json | null; socket: Web
       instance.dispose();
       terminal.current = null;
     };
-  }, [chat?.id, socket]);
+  }, [chat?.id]);
 
   useEffect(() => {
     if (!socket) return;
@@ -249,12 +285,23 @@ export function TerminalPanel({ chat, socket }: { chat: Json | null; socket: Web
   }, [socket, chat?.id]);
 
   useEffect(() => {
-    if (!chat || !socket || socket.readyState !== WebSocket.OPEN) return;
-    const frame = requestAnimationFrame(() => {
-      terminal.current?.clear();
-      socket.send(JSON.stringify({ type: "subscribe_terminal", chatId: chat.id, rows: terminalRows.current }));
+    if (!chat || !socket) return;
+    // 복귀 직후 놓친 크기 변경을 구독 행 수에 반영한다.
+    const resolveRows = (): number => {
+      const instance = terminal.current;
+      const hostElement = host.current;
+      if (!instance || !hostElement) return terminalRows.current;
+      const rows = terminalRowsForHeight(instance, hostElement);
+      if (rows !== instance.rows) instance.resize(TERMINAL_COLS, rows);
+      terminalRows.current = rows;
+      return rows;
+    };
+    return subscribeTerminalWhenReady({
+      socket,
+      chatId: chat.id,
+      resolveRows,
+      onReady: () => { terminal.current?.clear(); },
     });
-    return () => cancelAnimationFrame(frame);
   }, [chat?.id, socket]);
 
   return <div className="terminal-console">

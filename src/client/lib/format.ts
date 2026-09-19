@@ -39,6 +39,26 @@ export function usageErrorLabel(code: string | null | undefined): string {
     timeout: "조회 시간이 초과되었습니다",
     parse_failed: "사용량 화면을 해석하지 못했습니다",
     cli_exited: "조회용 CLI가 종료되었습니다",
+    rate_limited: "상세 조회가 제한되어 마지막 직접 확인값을 유지합니다",
+    usage_seeded_headers_throttled: "상세 조회가 제한되어 마지막 직접 확인값을 유지합니다",
+    usage_seeded_persisted_throttled: "상세 조회가 제한되어 마지막 직접 확인값을 유지합니다",
+    usage_seeded_headers_refresh_failed: "상세 갱신에 실패해 마지막 직접 확인값을 유지합니다",
+    usage_seeded_persisted_refresh_failed: "상세 갱신에 실패해 마지막 직접 확인값을 유지합니다",
+    usage_endpoint_throttled: "사용량 상세 조회 응답을 기다리는 중입니다",
+    usage_refreshing: "사용량 상세 정보를 갱신하는 중입니다",
   };
   return labels[code] ?? code;
+}
+
+// 최근 직접 확인값을 안전하게 보존한 Claude fallback은 사용자 quota 초과나 계정 장애가 아니다.
+export function isUsageFallbackNotice(code: string | null | undefined): boolean {
+  return !!code && [
+    "rate_limited",
+    "usage_seeded_headers_throttled",
+    "usage_seeded_persisted_throttled",
+    "usage_seeded_headers_refresh_failed",
+    "usage_seeded_persisted_refresh_failed",
+    "usage_endpoint_throttled",
+    "usage_refreshing",
+  ].includes(code);
 }

@@ -1,6 +1,6 @@
 import type { AppConfig } from "../core/config";
 import type { AppDatabase } from "../core/database";
-import type { Notifier } from "./notifier";
+import type { NotificationPresentation, Notifier } from "./notifier";
 
 interface NtfySettingsRow {
   topic: string | null;
@@ -15,6 +15,7 @@ function presentationFor(eventType: string): { title: string; tags: string[]; pr
   if (eventType === "rate_limit_hit") return { title: "사용량 한도 도달", tags: ["hourglass"], priority: 4 };
   if (eventType === "rate_limit_reset") return { title: "사용량 한도 초기화", tags: ["large_green_circle"], priority: 3 };
   if (eventType === "usage_session_reset") return { title: "사용량 세션 초기화", tags: ["large_green_circle"], priority: 3 };
+  if (eventType === "usage_keepalive_exhausted") return { title: "세션 유지 실패", tags: ["warning"], priority: 4 };
   if (eventType === "terminal_exited") return { title: "터미널 종료", tags: ["octagonal_sign"], priority: 4 };
   if (eventType === "test") return { title: "알림 테스트", tags: ["bell"], priority: 3 };
   return { title: "웹 에이전트 관리자", tags: [], priority: 3 };
@@ -35,7 +36,7 @@ export class NtfyNotifier implements Notifier {
   }
 
   // 이벤트 ID를 기준으로 알림을 한 번만 전송한다.
-  async notify(eventId: string, eventType: string, text: string): Promise<void> {
+  async notify(eventId: string, eventType: string, text: string, presentation?: NotificationPresentation): Promise<void> {
     const existing = this.database.prepare("SELECT status FROM ntfy_deliveries WHERE event_id = ?").get(eventId) as { status: string } | undefined;
     if (existing?.status === "sent") return;
     const { topic, serverUrl } = this.getEffectiveSettings();
@@ -45,14 +46,15 @@ export class NtfyNotifier implements Notifier {
       VALUES (?, ?, 'sending', 1)
       ON CONFLICT(event_id) DO UPDATE SET status = 'sending', attempts = attempts + 1, updated_at = CURRENT_TIMESTAMP
     `).run(eventId, eventType);
-    const { title, tags, priority } = presentationFor(eventType);
+    const defaults = presentationFor(eventType);
+    const title = presentation?.title ?? defaults.title;
     try {
       // 메시지가 한글이라 헤더(X-Title 등)에 그대로 실으면 인코딩 문제가 생길 수 있어, ASCII만 쓰는
       // JSON 발행 API를 쓴다(https://docs.ntfy.sh/publish/#publish-as-json).
       const response = await fetch(serverUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json; charset=utf-8" },
-        body: JSON.stringify({ topic, message: text, title, tags, priority }),
+        body: JSON.stringify({ topic, message: text, title, tags: defaults.tags, priority: defaults.priority }),
         signal: AbortSignal.timeout(10_000),
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);

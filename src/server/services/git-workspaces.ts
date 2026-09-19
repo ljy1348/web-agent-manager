@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import crypto from "node:crypto";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -21,6 +22,16 @@ interface ChatWorkspaceRow {
   git_branch: string | null;
   worktree_path: string | null;
   project_path: string;
+}
+
+export interface WorkspaceValidation {
+  status: "valid" | "needs_review";
+  profileVersionId: string | null;
+  profilePinned: boolean;
+  files: Array<{ name: string; expected: boolean; sourcePresent: boolean; workspacePresent: boolean; contentMatches: boolean }>;
+  claudeImportsAgents: boolean | null;
+  issues: string[];
+  checkedAt: string;
 }
 
 export interface GitBranchInfo {
@@ -141,6 +152,37 @@ export class GitWorkspaceService {
     if (!chat.worktree_path) return project.path;
     if (!fs.existsSync(chat.worktree_path)) throw new Error("채팅에 연결된 worktree 경로가 없습니다.");
     return fs.realpathSync(chat.worktree_path);
+  }
+
+  validateChatWorkspace(projectId: number, chatId: number): WorkspaceValidation {
+    const project = this.project(projectId);
+    const chat = this.database.prepare("SELECT provider, preset_version_id, preset_config_json FROM chats WHERE id=? AND project_id=?")
+      .get(chatId, projectId) as { provider: string; preset_version_id: string | null; preset_config_json: string | null } | undefined;
+    if (!chat) throw new Error("채팅 작업공간을 찾을 수 없습니다.");
+    const workspace = this.workspacePath(projectId, chatId);
+    let config: Record<string, any> = {};
+    try { config = chat.preset_config_json ? JSON.parse(chat.preset_config_json) : {}; } catch { /* 아래 profile issue로 드러낸다. */ }
+    const expectedFiles = new Set(Array.isArray(config.instructions?.files) ? config.instructions.files.filter((item: unknown) => typeof item === "string") : []);
+    const hash = (file: string): string | null => fs.existsSync(file) && fs.statSync(file).isFile() ? crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex") : null;
+    const files = PROJECT_INSTRUCTION_FILES.map((name) => {
+      const sourceHash = hash(path.join(project.path, name)); const workspaceHash = hash(path.join(workspace, name));
+      return { name, expected: expectedFiles.has(name), sourcePresent: sourceHash !== null, workspacePresent: workspaceHash !== null, contentMatches: sourceHash === workspaceHash };
+    });
+    let claudeImportsAgents: boolean | null = null;
+    if (chat.provider === "claude" && expectedFiles.has("AGENTS.md")) {
+      const claude = path.join(workspace, "CLAUDE.md");
+      claudeImportsAgents = fs.existsSync(claude) && fs.readFileSync(claude, "utf8").slice(0, 256 * 1024).split(/\r?\n/).some((line) => /^\s*@(?:\.\/)?AGENTS\.md\s*$/.test(line));
+    }
+    const issues = [
+      ...(!chat.preset_version_id || !chat.preset_config_json ? ["profile_not_pinned"] : []),
+      ...files.filter((file) => file.expected && !file.workspacePresent).map((file) => `instruction_missing:${file.name}`),
+      ...files.filter((file) => file.sourcePresent !== file.workspacePresent || file.sourcePresent && !file.contentMatches).map((file) => `instruction_mismatch:${file.name}`),
+      ...(claudeImportsAgents === false ? ["claude_agents_import_mismatch"] : []),
+    ];
+    const result: WorkspaceValidation = { status: issues.length ? "needs_review" : "valid", profileVersionId: chat.preset_version_id, profilePinned: Boolean(chat.preset_version_id && chat.preset_config_json), files, claudeImportsAgents, issues, checkedAt: new Date().toISOString() };
+    this.database.prepare("UPDATE chats SET workspace_validation_status=?, workspace_validation_json=?, updated_at=CURRENT_TIMESTAMP WHERE id=?")
+      .run(result.status, JSON.stringify(result), chatId);
+    return result;
   }
 
   // 조회 화면이 지정한 작업공간 경로를 검증해 실제 경로로 바꾼다.

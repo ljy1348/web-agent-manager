@@ -26,7 +26,7 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: "web_agent_manager_list_chats",
-    description: "프로젝트의 Claude·Codex 채팅 번호와 상태를 조회합니다.",
+    description: "프로젝트의 Claude·Codex·Grok 채팅 번호와 상태를 조회합니다.",
     inputSchema: {
       type: "object",
       properties: {
@@ -45,7 +45,7 @@ const TOOL_DEFINITIONS = [
         chatId: { type: "integer" },
         projectId: { type: "integer" },
         projectPath: { type: "string" },
-        provider: { type: "string", enum: ["codex", "claude"] },
+        provider: { type: "string", enum: ["codex", "claude", "grok"] },
         limit: { type: "integer", minimum: 1, maximum: 200 },
       },
       additionalProperties: false,
@@ -75,7 +75,7 @@ const TOOL_DEFINITIONS = [
         parentDelegationId: { type: "string" },
         projectId: { type: "integer" },
         projectPath: { type: "string" },
-        provider: { type: "string", enum: ["codex", "claude"] },
+        provider: { type: "string", enum: ["codex", "claude", "grok"] },
         prompt: { type: "string", minLength: 1, maxLength: 100000 },
         idempotencyKey: { type: "string", maxLength: 200 },
         createNew: { type: "boolean", description: "기존 채팅 대신 새 자식 채팅을 생성합니다." },
@@ -86,7 +86,7 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: "web_agent_manager_delegate_and_wait",
-    description: "새 Claude·Codex 자식 채팅에 작업을 전달하고 완료 응답을 기다려 부모에게 결과를 반환합니다.",
+    description: "새 Claude·Codex·Grok 자식 채팅에 작업을 전달하고 완료 응답을 기다려 부모에게 결과를 반환합니다.",
     inputSchema: {
       type: "object",
       properties: {
@@ -95,7 +95,7 @@ const TOOL_DEFINITIONS = [
         parentDelegationId: { type: "string" },
         projectId: { type: "integer" },
         projectPath: { type: "string" },
-        provider: { type: "string", enum: ["codex", "claude"] },
+        provider: { type: "string", enum: ["codex", "claude", "grok"] },
         prompt: { type: "string", minLength: 1, maxLength: 100000 },
         idempotencyKey: { type: "string", maxLength: 200 },
         createNew: { type: "boolean", description: "기본값 true. false면 최근 공급자 채팅을 재사용합니다." },
@@ -194,7 +194,7 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: "web_agent_manager_experiment_fixtures",
-    description: "등록된 저장소 fixture와 적격성 게이트 상태를 조회합니다.",
+    description: "등록된 저장소 fixture와 적격성 게이트 상태를 조회합니다. 채점용 정답은 포함하지 않습니다.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
 ] as const;
@@ -238,6 +238,22 @@ function resolveSocketPath(): string {
   return candidates.find((candidate) => fs.existsSync(candidate)) ?? candidates[0];
 }
 
+// CLI가 떠 있는 채팅 번호를 정수로 읽고, 없거나 이상한 값이면 기본 부모를 넣지 않는다.
+function envSourceChatId(): number | undefined {
+  const parsed = Number(process.env.WEB_AGENT_MANAGER_CHAT_ID ?? process.env.MYAGENT_CHAT_ID);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+// 호출 cwd와 기본 부모 채팅을 채운 뒤, 호출자가 명시한 params가 그 값을 덮어쓰게 한다.
+function withCallerContext(params: Record<string, unknown>): Record<string, unknown> {
+  const sourceChatId = envSourceChatId();
+  return {
+    cwd: process.env.WEB_AGENT_MANAGER_CALLER_CWD ?? process.env.MYAGENT_CALLER_CWD ?? process.cwd(),
+    ...(sourceChatId !== undefined ? { sourceChatId } : {}),
+    ...params,
+  };
+}
+
 // Unix 소켓에 한 줄 JSON 요청을 보내 첫 응답을 반환한다.
 async function callBridge(method: string, params: Record<string, unknown>): Promise<unknown> {
   const id = crypto.randomUUID();
@@ -251,7 +267,7 @@ async function callBridge(method: string, params: Record<string, unknown>): Prom
       : 30_000;
     socket.setTimeout(waitTimeout);
     socket.once("connect", () => {
-      socket.write(`${JSON.stringify({ id, method, params: { cwd: process.env.WEB_AGENT_MANAGER_CALLER_CWD ?? process.env.MYAGENT_CALLER_CWD ?? process.cwd(), ...params } })}\n`);
+      socket.write(`${JSON.stringify({ id, method, params: withCallerContext(params) })}\n`);
     });
     socket.on("data", (chunk: string) => {
       buffer += chunk;

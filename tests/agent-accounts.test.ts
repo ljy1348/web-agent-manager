@@ -45,6 +45,22 @@ describe("계정 슬롯", () => {
     expect(accounts.environment(base)).toEqual({});
   });
 
+  it("기본 Codex 계정은 설치 홈의 ~/.codex를 CODEX_HOME으로 가리킨다", () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "web-agent-manager-accounts-"));
+    cleanup.push(() => fs.rmSync(dataDir, { recursive: true, force: true }));
+    const homeDir = path.join(dataDir, "home");
+    const config = { dataDir, homeDir, allowedRoots: ["/"], publicUrl: "http://127.0.0.1:4317" } as AppConfig;
+    const database = openDatabase(config);
+    cleanup.push(() => database.close());
+    const accounts = new AgentAccountService(config, database);
+    const base = accounts.defaultAccount("codex");
+
+    expect(base.config_dir).toBeNull();
+    expect(accounts.cliConfigDir(base)).toBe(path.join(homeDir, ".codex"));
+    expect(accounts.environment(base)).toEqual({ CODEX_HOME: path.join(homeDir, ".codex") });
+    expect(fs.existsSync(path.join(homeDir, ".codex"))).toBe(true);
+  });
+
   it("추가 계정은 전용 설정 디렉터리를 만들고 그 경로를 환경변수로 넘긴다", () => {
     const { accounts } = prepare();
     const account = accounts.create("claude", "회사 계정");

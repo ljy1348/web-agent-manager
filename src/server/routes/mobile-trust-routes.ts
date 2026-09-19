@@ -2,7 +2,7 @@ import { Router, type Response } from "express";
 import type { AppConfig } from "../core/config";
 import type { AppDatabase } from "../core/database";
 import { createWebSession, requireAdmin, setWebSessionCookie, type AuthenticatedRequest } from "../core/auth";
-import { writeAudit } from "../core/audit";
+import { loginRequestIdentifiers, writeAudit } from "../core/audit";
 import { LoginRateLimiter, type LoginRateLimitDecision } from "../core/login-rate-limit";
 import type { MobileDeviceTrustService } from "../services/mobile-device-trust";
 
@@ -40,7 +40,7 @@ function requestOrigin(request: AuthenticatedRequest, config: AppConfig): string
 }
 
 // 로그인 쿠키가 없는 새 앱 origin에 기기 서명으로 신뢰 웹 세션을 발급한다.
-export function createMobileTrustBootstrapRouter(database: AppDatabase, config: AppConfig, trust: MobileDeviceTrustService, rateLimiter = new LoginRateLimiter()): Router {
+export function createMobileTrustBootstrapRouter(database: AppDatabase, config: AppConfig, trust: MobileDeviceTrustService, rateLimiter = new LoginRateLimiter(database)): Router {
   const router = Router();
   router.post("/mobile/trust/session/challenge", (request, response, next) => {
     const deviceId = typeof request.body?.deviceId === "string" ? request.body.deviceId : "";
@@ -76,10 +76,19 @@ export function createMobileTrustBootstrapRouter(database: AppDatabase, config: 
       return response.status(403).json({ error: "앱 기기 로그인 서명 인증에 실패했습니다." });
     }
     rateLimiter.resetAccount(clientAddress, deviceId || "<invalid>");
-    const session = createWebSession(database, config, identity.userId, identity.deviceId);
+    const session = createWebSession(database, config, identity.userId, identity.deviceId, { reauthenticated: false });
     if (!session) return response.status(403).json({ error: "앱 기기 로그인 계정을 찾을 수 없습니다." });
     setWebSessionCookie(response, config, session.token);
-    writeAudit(database, identity.userId, "mobile.trust.session", "mobile_trusted_device", identity.deviceId, {});
+    // 기기 서명도 로그인 경로이므로 비밀번호·일회용 코드와 같은 식별자를 남긴다.
+    writeAudit(database, identity.userId, "mobile.trust.session", "mobile_trusted_device", identity.deviceId, {
+      method: "mobile_device_signature",
+      username: session.user.username,
+      role: session.user.role,
+      temporary: false,
+      networkTrusted: true,
+      sessionExpiresAt: session.expiresAt,
+      ...loginRequestIdentifiers(request as AuthenticatedRequest),
+    });
     response.json({ user: session.user, csrfToken: session.csrfToken, networkTrusted: true });
   });
   return router;

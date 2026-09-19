@@ -1442,3 +1442,9 @@
 - 중복 체크: `copyText`(클립보드 쓰기, HTTPS 아닌 환경 폴백 포함) 함수가 TerminalPanel.tsx에 비공개로 있던 걸 `src/client/lib/clipboard.ts` 공용 유틸로 뽑아 두 컴포넌트가 같이 쓰게 했다.
 - Ctrl+V는 브라우저 네이티브 paste 이벤트를 통해 xterm이 자체적으로 처리하는 방식이라(별도 clipboard 권한 불필요, HTTP에서도 동작), focus 수정만으로 해결될 가능성이 높다고 판단해 별도 커스텀 paste 핸들러는 추가하지 않았다 — 사용자 실사용 확인 후에도 여전히 안 되면 명시적 처리를 추가하기로 함.
 - 검증: `typecheck`·전체 vitest 665개·`build` 통과, 기존 e2e `CLI 인증은 페이지 레이아웃 밖의 독립 팝업으로 열린다` 재통과 확인. 실제 붙여넣기 동작 자체는 Playwright로 클립보드 권한을 흉내내기 까다로워 브라우저 실사용으로 검증을 미뤘다.
+
+## 2026-09-19 Codex - v0.6.0 공개 릴리스 준비
+
+- 작업 전 정의: 사용자가 private PR #104의 변경을 공개 저장소에 정리해 버전 갱신, push, PR, 병합, GitHub Release까지 완료하라고 승인했다. Codex는 공개 `main`의 최신 `v0.5.2`에서 `release/v0.6.0-public` 브랜치를 만들었다. 대규모 하위 호환 기능 추가이므로 버전은 semantic minor `0.6.0`, Android `versionCode`는 10에서 11로 결정했다.
+- 공개 정제 결정: private 작업 브랜치의 코드·테스트·문서 상태를 옮기되, private 저장소 URL과 1,500여 줄의 내부 운영 이력은 공개 후보에 복사하지 않는다. 공개 `history.md`에는 이 작업의 의사결정과 검증·PR·릴리스 결과만 기록한다. 자격증명·로컬 데이터·빌드 산출물·다른 프로젝트 경로를 검사하고, package/lockfile·Android·worker·canary 버전과 CHANGELOG·README를 맞춘 뒤 전체 검증한다. private CI gate가 통과한 뒤 공개 브랜치를 push하고 PR CI 통과 후 squash merge, `v0.6.0` 태그 push로 기존 release workflow를 실행한다.
+- 공개 후보 준비 완료: private commit `d3e2930`의 Android·UI·verify gate가 모두 성공했다. 공개 후보의 staged tree를 해당 commit과 직접 대조해 차이가 `history.md` 정제와 8개 버전·문서 파일뿐임을 확인했고, 실제 자격증명·private remote URL·절대경로 심볼릭 링크·환경 파일이 추가되지 않았음을 검사했다. `npm ci`와 `npm audit --audit-level=high`는 취약점 0건, `npm run verify`는 TypeScript·170파일 1,289테스트·client/server/canary production build·공개 경로 검사까지 통과했다. Codex는 이 상태를 공개 단일 릴리스 커밋으로 push하고 PR CI를 확인한다.

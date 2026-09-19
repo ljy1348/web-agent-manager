@@ -2,7 +2,7 @@ import { loadConfig } from "../src/server/core/config";
 import { openDatabase } from "../src/server/core/database";
 import { AgentIntegrationManager } from "../src/server/services/agent-integration";
 
-// 설치된 Claude·Codex CLI를 찾아 web-agent-manager 스킬과 MCP 연결을 사용자 범위에 구성한다.
+// 설치된 Claude·Codex·Grok CLI를 찾아 web-agent-manager 스킬과 MCP 연결을 사용자 범위에 구성한다.
 async function main(): Promise<void> {
   const config = loadConfig();
   const database = openDatabase(config);

@@ -26,13 +26,14 @@ function seedChat(database: AppDatabase, options: {
   busy?: number;
   historyFile?: string | null;
   updatedAtLiteral?: string;
+  lastUserActivityAt?: string | null;
 }): number {
   const projectRow = database.prepare("SELECT id FROM projects WHERE path = '/tmp/idle-test'").get() as { id: number } | undefined;
   const projectId = projectRow?.id ?? Number(database.prepare("INSERT INTO projects(name, path) VALUES ('테스트', '/tmp/idle-test')").run().lastInsertRowid);
   const updatedAt = options.updatedAtLiteral ?? new Date(NOW - options.hoursIdle * HOUR).toISOString();
   const result = database.prepare(`
-    INSERT INTO chats(project_id, provider, tmux_name, status, title, busy, history_file, updated_at)
-    VALUES (?, 'claude', ?, ?, '테스트 채팅', ?, ?, ?)
+    INSERT INTO chats(project_id, provider, tmux_name, status, title, busy, history_file, updated_at, last_user_activity_at)
+    VALUES (?, 'claude', ?, ?, '테스트 채팅', ?, ?, ?, ?)
   `).run(
     projectId,
     `tmux_${Math.random().toString(36).slice(2)}`,
@@ -40,8 +41,29 @@ function seedChat(database: AppDatabase, options: {
     options.busy ?? 0,
     options.historyFile ?? null,
     updatedAt,
+    options.lastUserActivityAt ?? null,
   );
   return Number(result.lastInsertRowid);
+}
+
+// 위임으로 만들어진 서브에이전트 채팅과 그 위임 기록을 만든다.
+function seedDelegationChat(database: AppDatabase, options: {
+  minutesIdle: number;
+  completed: boolean;
+  busy?: number;
+  status?: string;
+}): number {
+  const chatId = seedChat(database, {
+    hoursIdle: options.minutesIdle / 60,
+    busy: options.busy ?? 0,
+    status: options.status,
+  });
+  database.prepare("UPDATE chats SET origin = 'delegation' WHERE id = ?").run(chatId);
+  database.prepare(`
+    INSERT INTO delegations(id, idempotency_key, depth, target_chat_id, prompt, status, baseline_message_count, completed_at)
+    VALUES (?, ?, 0, ?, '작업', 'sent', 0, ?)
+  `).run(`del-${chatId}`, `key-${chatId}`, chatId, options.completed ? new Date(NOW).toISOString() : null);
+  return chatId;
 }
 
 // 종료 호출을 기록하는 reaper를 만든다.
@@ -127,6 +149,105 @@ describe("유휴 채팅 자동 종료", () => {
 
     expect(await reaper.sweep()).toBe(1);
     expect(stopped).toEqual([chatId]);
+    database.close();
+  });
+
+  it("JSONL이 오래됐어도 사용자가 웹에서 방금 보낸 시각이 있으면 종료하지 않는다", async () => {
+    const database = createDatabase();
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "web-agent-manager-idle-user-activity-"));
+    cleanup.push(dataDir);
+    const historyFile = path.join(dataDir, "session.jsonl");
+    fs.writeFileSync(historyFile, "{}\n");
+    const old = new Date(NOW - 30 * HOUR);
+    fs.utimesSync(historyFile, old, old);
+    seedChat(database, {
+      hoursIdle: 30,
+      historyFile,
+      lastUserActivityAt: new Date(NOW - HOUR).toISOString(),
+    });
+    const { reaper, stopped } = createReaper(database);
+
+    expect(await reaper.sweep()).toBe(0);
+    expect(stopped).toEqual([]);
+    database.close();
+  });
+
+  it("후보 수집 뒤 웹 활동이 생긴 채팅은 stop 직전에 다시 확인해 건너뛴다", async () => {
+    const database = createDatabase();
+    seedChat(database, { hoursIdle: 30 });
+    seedChat(database, { hoursIdle: 30 });
+    const stopped: number[] = [];
+    const reaper = new IdleChatReaper(database, async (chatId) => {
+      stopped.push(chatId);
+      database.prepare("UPDATE chats SET last_user_activity_at = ? WHERE id != ?").run(new Date(NOW).toISOString(), chatId);
+    }, () => NOW);
+
+    expect(await reaper.sweep()).toBe(1);
+    expect(stopped).toHaveLength(1);
+    database.close();
+  });
+
+  it("감사 로그에는 stop이 JSONL을 바꾸기 전 실제 판정 시각을 남긴다", async () => {
+    const database = createDatabase();
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "web-agent-manager-idle-audit-time-"));
+    cleanup.push(dataDir);
+    const historyFile = path.join(dataDir, "session.jsonl");
+    fs.writeFileSync(historyFile, "{}\n");
+    const old = new Date(NOW - 30 * HOUR);
+    fs.utimesSync(historyFile, old, old);
+    const chatId = seedChat(database, { hoursIdle: 30, historyFile });
+    const reaper = new IdleChatReaper(database, async () => {
+      fs.utimesSync(historyFile, new Date(NOW), new Date(NOW));
+    }, () => NOW);
+
+    expect(await reaper.sweep()).toBe(1);
+    const row = database.prepare("SELECT details FROM audit_logs WHERE action = 'chat.idle_auto_stop' AND target_id = ?").get(String(chatId)) as { details: string };
+    expect(JSON.parse(row.details).lastActivityAt).toBe(old.toISOString());
+    database.close();
+  });
+
+  it("맡긴 위임이 끝난 서브에이전트 채팅은 기준 시간을 기다리지 않고 정리한다", async () => {
+    const database = createDatabase();
+    // AgentBridge가 완료 시점에 한 번 정리하지만 그때 busy면 영영 남는다. 주기 스윕이 회복시켜야 한다.
+    const done = seedDelegationChat(database, { minutesIdle: 30, completed: true });
+    const { reaper, stopped } = createReaper(database);
+
+    expect(await reaper.sweep()).toBe(1);
+    expect(stopped).toEqual([done]);
+    database.close();
+  });
+
+  it("미확정 위임만 있고 대상이 놀고 있으면 유예 후 정리한다", async () => {
+    const database = createDatabase();
+    const idleOpen = seedDelegationChat(database, { minutesIdle: 30, completed: false });
+    seedDelegationChat(database, { minutesIdle: 1, completed: true });
+    const { reaper, stopped } = createReaper(database);
+
+    expect(await reaper.sweep()).toBe(1);
+    expect(stopped).toEqual([idleOpen]);
+    database.close();
+  });
+
+  it("대상이 실제로 일하는 중이면 미확정 위임이 정리를 막는다", async () => {
+    const database = createDatabase();
+    seedDelegationChat(database, { minutesIdle: 30, completed: false, busy: 1 });
+    seedDelegationChat(database, { minutesIdle: 30, completed: false, status: "starting" });
+    const { reaper, stopped } = createReaper(database);
+
+    expect(await reaper.sweep()).toBe(0);
+    expect(stopped).toEqual([]);
+    database.close();
+  });
+
+  it("사람이 쓰기 시작해 승격된 채팅은 서브에이전트 규칙으로 정리하지 않는다", async () => {
+    const database = createDatabase();
+    const promoted = seedDelegationChat(database, { minutesIdle: 30, completed: true });
+    database.prepare("UPDATE chats SET origin = 'user' WHERE id = ?").run(promoted);
+    const { reaper, stopped } = createReaper(database);
+
+    // origin이 user면 짧은 유예가 아니라 기존 기준 시간(24시간) 규칙만 적용된다.
+    expect(await reaper.sweep()).toBe(0);
+    expect(stopped).toEqual([]);
     database.close();
   });
 

@@ -14,7 +14,21 @@ export interface AppConfig {
   trustedNetworks?: string[];
   trustedProxies?: string[];
   sessionTtlHours: number;
+  sessionIdleMinutes?: number;
+  reauthenticationWindowMinutes?: number;
+  allowInsecureHttp?: boolean;
   runtimeEnabled: boolean;
+  taskLedgerEnabled?: boolean;
+  codexAppServerShadowEnabled?: boolean;
+  codexInteractiveTransportCandidateEnabled?: boolean;
+  codexInteractiveTransportCandidateCohort?: string;
+  codexInteractiveTransportMaxNewChats?: number;
+  verificationArtifactRetentionDays?: number;
+  providerCanaryHarnessDir?: string;
+  providerCanaryCredentialsDir?: string;
+  providerCandidateCliDir?: string;
+  previewBrowserExecutable?: string;
+  sshExecutable?: string;
   slack: {
     botToken?: string;
     userToken?: string;
@@ -80,7 +94,21 @@ export function loadConfig(): AppConfig {
     trustedNetworks: parseList(readProductEnv("TRUSTED_NETWORKS")),
     trustedProxies: parseList(readProductEnv("TRUSTED_PROXIES")),
     sessionTtlHours: Number.parseInt(readProductEnv("SESSION_TTL_HOURS") ?? "168", 10),
+    sessionIdleMinutes: Math.min(10_080, Math.max(5, Number.parseInt(readProductEnv("SESSION_IDLE_MINUTES") ?? "720", 10) || 720)),
+    reauthenticationWindowMinutes: Math.min(60, Math.max(1, Number.parseInt(readProductEnv("REAUTH_WINDOW_MINUTES") ?? "15", 10) || 15)),
+    allowInsecureHttp: readProductEnv("ALLOW_INSECURE_HTTP") === "1",
     runtimeEnabled: readProductEnv("DISABLE_RUNTIME") !== "1",
+    taskLedgerEnabled: readProductEnv("TASK_LEDGER_V1") !== "0",
+    codexAppServerShadowEnabled: readProductEnv("CODEX_APP_SERVER_SHADOW") === "1",
+    codexInteractiveTransportCandidateEnabled: readProductEnv("CODEX_INTERACTIVE_TRANSPORT_CANDIDATE") === "1",
+    codexInteractiveTransportCandidateCohort: readProductEnv("CODEX_INTERACTIVE_TRANSPORT_COHORT")?.trim() || undefined,
+    codexInteractiveTransportMaxNewChats: Math.min(20, Math.max(0, Number.parseInt(readProductEnv("CODEX_INTERACTIVE_TRANSPORT_MAX_NEW_CHATS") ?? "0", 10) || 0)),
+    verificationArtifactRetentionDays: Math.max(1, Number.parseInt(readProductEnv("VERIFICATION_ARTIFACT_RETENTION_DAYS") ?? "30", 10) || 30),
+    providerCanaryHarnessDir: readProductEnv("PROVIDER_CANARY_HARNESS_DIR") ? path.resolve(readProductEnv("PROVIDER_CANARY_HARNESS_DIR")!) : undefined,
+    providerCanaryCredentialsDir: readProductEnv("PROVIDER_CANARY_CREDENTIALS_DIR") ? path.resolve(readProductEnv("PROVIDER_CANARY_CREDENTIALS_DIR")!) : undefined,
+    providerCandidateCliDir: readProductEnv("PROVIDER_CANDIDATE_CLI_DIR") ? path.resolve(readProductEnv("PROVIDER_CANDIDATE_CLI_DIR")!) : undefined,
+    previewBrowserExecutable: readProductEnv("PREVIEW_BROWSER_EXECUTABLE") ? path.resolve(readProductEnv("PREVIEW_BROWSER_EXECUTABLE")!) : undefined,
+    sshExecutable: readProductEnv("SSH_EXECUTABLE") ? path.resolve(readProductEnv("SSH_EXECUTABLE")!) : undefined,
     slack: {
       botToken: process.env.SLACK_BOT_TOKEN,
       userToken: process.env.SLACK_USER_TOKEN,

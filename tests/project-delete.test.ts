@@ -71,6 +71,7 @@ describe("프로젝트 삭제 API", () => {
     const { base, homeDir } = await startServer();
     const data = await (await fetch(`${base}/projects`)).json();
     expect(data.defaultPath).toBe(homeDir);
+    expect(data.defaultWorkspacePath).toBe(path.join(homeDir, "Projects"));
   });
 
   it("DELETE는 실제로 지우지 않고 active=0으로만 표시해 목록에서 숨긴다", async () => {
@@ -93,6 +94,21 @@ describe("프로젝트 삭제 API", () => {
 
     const row = database.prepare("SELECT active FROM projects WHERE id = ?").get(projectId) as { active: number };
     expect(row.active).toBe(0);
+  });
+
+  it("POST /projects create 모드는 워크스페이스에 새 Git 프로젝트를 만든다", async () => {
+    const { base, homeDir } = await startServer();
+
+    const response = await fetch(`${base}/projects`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mode: "create", workspacePath: homeDir, directoryName: "study", name: "스터디" }),
+    });
+    const data = await response.json();
+
+    expect(response.status).toBe(201);
+    expect(data.project).toMatchObject({ name: "스터디", path: path.join(homeDir, "study") });
+    expect(fs.statSync(path.join(homeDir, "study", ".git")).isDirectory()).toBe(true);
   });
 
   it("이미 삭제된(active=0) 프로젝트를 다시 삭제하면 오류를 반환한다", async () => {

@@ -11,6 +11,7 @@ import type { NtfyNotifier } from "../src/server/services/ntfy";
 import { createOperationsRouter } from "../src/server/routes/operations-routes";
 import { CodexAdapter } from "../src/server/providers/codex";
 import type { IdleChatReaper } from "../src/server/services/idle-chat-reaper";
+import type { SessionManager } from "../src/server/services/session-manager";
 
 let closeServer: (() => Promise<void>) | undefined;
 
@@ -31,6 +32,28 @@ function buildApp(
   metricsSnapshot: unknown = { latest: null, recent: [] },
   trustedNetwork = true,
   usageMonitor = { list: () => [] } as unknown as UsageMonitor,
+  sessions = { restartProviderTerminals: async () => ({ restartedChatIds: [], failures: [] }) } as unknown as SessionManager,
+  runCliUpdate: (command: string, args: string[]) => Promise<void> = async () => undefined,
+  codexShadow?: { snapshot: () => Record<string, unknown>; probeChat: (chatId: number) => Promise<unknown> },
+  providerCanaries = {
+    run: async () => ({}), list: () => [], latest: () => [],
+    authorizeUpdate: (_provider: string, runId: string, _currentVersion: string | null) => {
+      if (runId !== "canary-passed") throw Object.assign(new Error("통과한 canary가 필요합니다."), { statusCode: 409 });
+      return { canaryRunId: runId, candidateVersion: "codex-cli 2.0.0" };
+    },
+  },
+  providerUpdates = {
+    findByIdempotency: () => undefined,
+    latest: () => [],
+    start: () => ({ run: { id: "update-run" } }),
+    transition: () => ({}),
+    invariantsPreserved: () => true,
+    setBackupManifest: () => undefined,
+    beginRollback: () => ({ replay: false, record: {} }),
+    backupManifest: () => ({}),
+    get: () => ({ run: {} }),
+  },
+  providerBackups = { prepare: () => ({}), restore: () => undefined },
 ) {
   const app = express();
   app.use(express.json());
@@ -45,6 +68,12 @@ function buildApp(
     [new CodexAdapter()],
     { settings: () => ({ enabled: true, timeoutHours: 24 }) } as unknown as IdleChatReaper,
     readVersion,
+    sessions,
+    runCliUpdate,
+    codexShadow as never,
+    providerCanaries as never,
+    providerUpdates as never,
+    providerBackups as never,
   ));
   // 실제 서버(index.ts)와 같은 오류 처리 규약: 던져진 Error 메시지를 400으로 변환한다.
   app.use((error: unknown, _request: express.Request, response: express.Response, _next: express.NextFunction) => {
@@ -123,8 +152,151 @@ describe("프로세스 종료 API 안전장치", () => {
     const response = await fetch(`http://127.0.0.1:${port}/providers`);
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toEqual({
-      providers: [{ id: "codex", label: "Codex", usageWindowId: "weekly", supportsPermissionMode: false }],
+      providers: [{
+        id: "codex",
+        label: "Codex",
+        usageWindowId: "five_hour",
+        usageWindowLabels: { five_hour: "5시간", weekly: "주간" },
+        supportsSessionRename: true,
+        supportsPermissionMode: false,
+        supportsCliUpdate: true,
+      }],
     });
+  });
+
+  it("CLI 버전과 현재 구조화 신호·TUI 폴백 capability를 반환한다", async () => {
+    const port = await listen(buildApp("admin", async (command) => command === "codex" ? "codex-cli 9.9.9" : `${command} 1.0.0`));
+    const response = await fetch(`http://127.0.0.1:${port}/providers/capabilities`);
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      providers: [{
+        provider: "codex",
+        cliVersion: "codex-cli 9.9.9",
+        transport: "hook_jsonl_tui",
+        structuredSession: false,
+        deliveryAcknowledgement: false,
+        evidencePriority: ["hook", "jsonl", "tui"],
+      }],
+    });
+  });
+
+  it("관리자에게만 Codex shadow 7일 요약과 수동 probe를 제공한다", async () => {
+    const probes: number[] = [];
+    const shadow = {
+      snapshot: () => ({ enabled: true, mode: "read_only_shadow", windowDays: 7, summary: { match: 3 }, latest: [] }),
+      probeChat: async (chatId: number) => { probes.push(chatId); return { chatId, comparison: "match" }; },
+    };
+    const adminPort = await listen(buildApp("admin", undefined, undefined, true, undefined, undefined, undefined, shadow));
+    const summary = await fetch(`http://127.0.0.1:${adminPort}/admin/providers/codex/shadow`);
+    expect(summary.status).toBe(200);
+    await expect(summary.json()).resolves.toMatchObject({ enabled: true, summary: { match: 3 } });
+    const probe = await fetch(`http://127.0.0.1:${adminPort}/admin/providers/codex/shadow/chats/17/probe`, { method: "POST" });
+    expect(probe.status).toBe(200);
+    await expect(probe.json()).resolves.toEqual({ observation: { chatId: 17, comparison: "match" } });
+    expect(probes).toEqual([17]);
+
+    await closeServer?.();
+    closeServer = undefined;
+    const userPort = await listen(buildApp("user", undefined, undefined, true, undefined, undefined, undefined, shadow));
+    expect((await fetch(`http://127.0.0.1:${userPort}/admin/providers/codex/shadow`)).status).toBe(403);
+  });
+
+  it("공급자 CLI 업데이트 뒤 버전 캐시와 조회·채팅 터미널을 모두 갱신한다", async () => {
+    let installed = false;
+    const updateCalls: Array<{ command: string; args: string[] }> = [];
+    const usageRestarts: string[] = [];
+    const chatRestarts: string[] = [];
+    const usage = {
+      list: () => [],
+      restartProviderTerminals: (provider: string) => { usageRestarts.push(provider); return 2; },
+    } as unknown as UsageMonitor;
+    const sessions = {
+      restartProviderTerminals: async (provider: string) => {
+        chatRestarts.push(provider);
+        return { restartedChatIds: [3, 7], failures: [] };
+      },
+    } as unknown as SessionManager;
+    const port = await listen(buildApp(
+      "admin",
+      async (command) => command === "codex" ? `codex-cli ${installed ? "2.0.0" : "1.0.0"}` : `${command} 1.0.0`,
+      undefined,
+      true,
+      usage,
+      sessions,
+      async (command, args) => { updateCalls.push({ command, args }); installed = true; },
+    ));
+
+    const response = await fetch(`http://127.0.0.1:${port}/providers/codex/update`, {
+      method: "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": "update-1" }, body: JSON.stringify({ canaryRunId: "canary-passed" }),
+    });
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      status: "completed",
+      provider: "codex",
+      canaryRunId: "canary-passed",
+      updateRunId: "update-run",
+      previousVersion: "codex-cli 1.0.0",
+      currentVersion: "codex-cli 2.0.0",
+      restartedMonitorCount: 2,
+      restartedChatIds: [3, 7],
+      failures: [],
+    });
+    expect(updateCalls).toEqual([{ command: "codex", args: ["update"] }]);
+    expect(usageRestarts).toEqual(["codex"]);
+    expect(chatRestarts).toEqual(["codex"]);
+
+    const runtime = await fetch(`http://127.0.0.1:${port}/runtime`);
+    await expect(runtime.json()).resolves.toMatchObject({ codex: "codex-cli 2.0.0" });
+  });
+
+  it("업데이트 후 버전이 후보와 다르면 모든 터미널 재시작을 중단한다", async () => {
+    let installed = false;
+    const usageRestarts: string[] = [];
+    const chatRestarts: string[] = [];
+    const usage = {
+      list: () => [],
+      restartProviderTerminals: (provider: string) => { usageRestarts.push(provider); return 1; },
+    } as unknown as UsageMonitor;
+    const sessions = {
+      restartProviderTerminals: async (provider: string) => {
+        chatRestarts.push(provider);
+        return { restartedChatIds: [4], failures: [] };
+      },
+    } as unknown as SessionManager;
+    const port = await listen(buildApp(
+      "admin",
+      async (command) => command === "codex" ? (installed ? null : "codex-cli 1.0.0") : `${command} 1.0.0`,
+      undefined,
+      true,
+      usage,
+      sessions,
+      async () => { installed = true; },
+    ));
+
+    const response = await fetch(`http://127.0.0.1:${port}/providers/codex/update`, {
+      method: "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": "update-2" }, body: JSON.stringify({ canaryRunId: "canary-passed" }),
+    });
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({ error: "설치된 CLI 버전이 canary 후보와 달라 터미널 재시작을 중단했습니다." });
+    expect(usageRestarts).toEqual([]);
+    expect(chatRestarts).toEqual([]);
+  });
+
+  it("통과 canary ID가 없으면 설치 명령 자체를 실행하지 않는다", async () => {
+    let updateCalled = false;
+    const port = await listen(buildApp("admin", undefined, undefined, true, undefined, undefined, async () => { updateCalled = true; }));
+    const response = await fetch(`http://127.0.0.1:${port}/providers/codex/update`, { method: "POST" });
+    expect(response.status).toBe(400);
+    expect(updateCalled).toBe(false);
+  });
+
+  it("일반 사용자는 공급자 CLI 업데이트를 실행할 수 없다", async () => {
+    const port = await listen(buildApp("user"));
+    const response = await fetch(`http://127.0.0.1:${port}/providers/codex/update`, { method: "POST" });
+    expect(response.status).toBe(403);
   });
 
   it("런타임 버전은 서버 시작 시 한 번만 조회하고 반복 요청에서 재사용한다", async () => {
@@ -199,16 +371,16 @@ describe("프로세스 종료 API 안전장치", () => {
     await expect(response.json()).resolves.toMatchObject({ error: "이미 종료된 프로세스입니다." });
   });
 
-  it("외부 네트워크에서는 프로세스 종료를 거부한다", async () => {
-    // 되돌릴 수 없는 작업이라 내부망에서만 허용한다(파일 탭의 민감 경로 정책과 같은 기준).
+  it("외부 네트워크의 관리자도 프로세스를 종료할 수 있다", async () => {
     const port = await listen(buildApp("admin", undefined, { latest: null, recent: [] }, false));
 
     const response = await fetch(`http://127.0.0.1:${port}/system/processes/999999999/kill`, {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ force: false }),
     });
 
-    expect(response.status).toBe(403);
-    await expect(response.json()).resolves.toMatchObject({ error: "되돌릴 수 없는 작업은 내부망에서만 할 수 있습니다." });
+    // 네트워크 제한을 통과해 실제 process.kill까지 도달했으므로 존재하지 않는 PID 오류가 반환된다.
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({ error: "이미 종료된 프로세스입니다." });
   });
 
   it("존재하지 않는 프로세스는 이미 종료된 것으로 안내한다", async () => {
@@ -220,5 +392,42 @@ describe("프로세스 종료 API 안전장치", () => {
     expect(response.status).toBe(400);
     const body = await response.json();
     expect(body.error).toContain("이미 종료");
+  });
+});
+
+describe("사용량 조회 터미널 재시작 API", () => {
+  it("조회 전용 터미널만 재시작하고 채팅 세션은 건드리지 않는다", async () => {
+    const usageRestarts: string[] = [];
+    const chatRestarts: string[] = [];
+    const usage = {
+      list: () => [],
+      restartProviderTerminals: (provider: string) => { usageRestarts.push(provider); return 2; },
+    } as unknown as UsageMonitor;
+    const sessions = {
+      restartProviderTerminals: async (provider: string) => {
+        chatRestarts.push(provider);
+        return { restartedChatIds: [], failures: [] };
+      },
+    } as unknown as SessionManager;
+    const port = await listen(buildApp("user", undefined, undefined, true, usage, sessions));
+
+    const response = await fetch(`http://127.0.0.1:${port}/usage/codex/restart`, { method: "POST" });
+
+    expect(response.status).toBe(202);
+    await expect(response.json()).resolves.toEqual({ accepted: true, restartedMonitorCount: 2 });
+    expect(usageRestarts).toEqual(["codex"]);
+    expect(chatRestarts).toEqual([]);
+  });
+
+  it("지원하지 않는 공급자는 거부한다", async () => {
+    const usage = {
+      list: () => [],
+      restartProviderTerminals: () => { throw new Error("호출되면 안 됩니다."); },
+    } as unknown as UsageMonitor;
+    const port = await listen(buildApp("admin", undefined, undefined, true, usage));
+
+    const response = await fetch(`http://127.0.0.1:${port}/usage/unknown/restart`, { method: "POST" });
+
+    expect(response.status).toBe(400);
   });
 });

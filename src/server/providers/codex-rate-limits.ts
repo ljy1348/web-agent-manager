@@ -1,7 +1,7 @@
-import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
-import path from "node:path";
+import { CodexAppServerClient, codexAppServerClientVersion } from "./codex-app-server";
+
+export { codexAppServerClientVersion } from "./codex-app-server";
 
 export interface CodexResetCredits {
   availableCount: number;
@@ -39,13 +39,6 @@ const MONTHS: Record<string, number> = {
   jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
   jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11,
 };
-
-// 실행 루트 package.json의 버전을 Codex app-server clientInfo에 사용한다.
-export function codexAppServerClientVersion(rootDir = process.cwd()): string {
-  const value = (JSON.parse(readFileSync(path.join(rootDir, "package.json"), "utf8")) as { version?: unknown }).version;
-  if (typeof value !== "string" || !value.trim()) throw new Error("package.json 버전을 확인할 수 없습니다.");
-  return value;
-}
 
 // Codex `/usage` 초기화권 상세 화면에서 개수와 Full reset 기한을 추출한다.
 export function parseCodexResetCreditsScreen(screen: string): CodexResetCredits | null {
@@ -110,42 +103,16 @@ export function parseCodexResetCreditConsumeOutcome(message: unknown): CodexRese
 }
 
 // app-server 요청 하나를 초기화부터 응답 수신까지 수행하고 프로세스를 즉시 정리한다.
-function requestCodexAppServer(environment: Record<string, string>, method: string, params: Record<string, unknown>, timeoutMs: number): Promise<CodexRateLimitMessage | null> {
-  return new Promise((resolve) => {
-    const child = spawn("codex", ["app-server"], {
-      cwd: process.cwd(),
-      env: { ...process.env, ...environment },
-      stdio: ["pipe", "pipe", "ignore"],
-    });
-    let settled = false;
-    let buffered = "";
-    const finish = (result: CodexRateLimitMessage | null): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      child.kill();
-      resolve(result);
-    };
-    const timer = setTimeout(() => finish(null), timeoutMs);
-    timer.unref();
-    child.once("error", () => finish(null));
-    child.once("exit", () => finish(null));
-    child.stdin.once("error", () => finish(null));
-    child.stdout.on("data", (chunk: Buffer) => {
-      buffered += chunk.toString("utf8");
-      const lines = buffered.split("\n");
-      buffered = lines.pop() ?? "";
-      for (const line of lines) {
-        try {
-          const message = JSON.parse(line) as CodexRateLimitMessage;
-          if (message.id === 1) finish(message.error ? null : message);
-        } catch {
-          // app-server의 비 JSON 진단 행은 무시하고 요청 응답만 기다린다.
-        }
-      }
-    });
-    child.stdin.write(`${JSON.stringify({ method: "initialize", id: 0, params: { clientInfo: { name: "web_agent_manager", title: "web-agent-manager", version: codexAppServerClientVersion() } } })}\n${JSON.stringify({ method: "initialized", params: {} })}\n${JSON.stringify({ method, id: 1, params })}\n`);
-  });
+async function requestCodexAppServer(environment: Record<string, string>, method: string, params: Record<string, unknown>, timeoutMs: number): Promise<CodexRateLimitMessage | null> {
+  let client: CodexAppServerClient | undefined;
+  try {
+    client = await CodexAppServerClient.connect({ environment, requestTimeoutMs: timeoutMs, clientVersion: codexAppServerClientVersion() });
+    return { result: await client.request(method, params) as CodexRateLimitMessage["result"] };
+  } catch {
+    return null;
+  } finally {
+    client?.close();
+  }
 }
 
 // 현재 Codex 계정의 구조화된 한도 정보를 읽는다.

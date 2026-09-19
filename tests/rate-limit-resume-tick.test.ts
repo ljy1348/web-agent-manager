@@ -29,12 +29,40 @@ function buildService(config: AppConfig, sendPrompt: () => Promise<void>, termin
   const notified: string[] = [];
   const notifications: Notifier = { notify: async (eventId) => { notified.push(eventId); } };
   const realtime = { broadcast: () => undefined } as unknown as RealtimeHub;
-  const adapters = [{ id: "codex", displayLabel: "Codex" } as unknown as ProviderAdapter];
+  const adapters = [{ id: "codex", displayLabel: "Codex", usageWindowId: "five_hour" } as unknown as ProviderAdapter];
   const service = new RateLimitResumeService(database, sessions, notifications, realtime, adapters);
   return { database, service, notified };
 }
 
 describe("RateLimitResumeService.tick", () => {
+  it("주간 잔여량이 있어도 대표 5시간 창이 소진됐으면 미래 대기를 조기 재개하지 않는다", async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "web-agent-manager-rate-tick-"));
+    const config = { dataDir } as unknown as AppConfig;
+    let resumed = false;
+    const { database, service } = buildService(config, async () => { resumed = true; });
+
+    database.prepare("INSERT INTO projects(name, path, source) VALUES ('p', '/tmp/p', 'discovered')").run();
+    const project = database.prepare("SELECT id FROM projects WHERE path = '/tmp/p'").get() as { id: number };
+    database.prepare("INSERT INTO chats(project_id, provider, tmux_name, status, title, busy) VALUES (?, 'codex', 'tmux-five-hour', 'running', 'ui', 0)").run(project.id);
+    const chat = database.prepare("SELECT id FROM chats").get() as { id: number };
+    const future = new Date(Date.now() + 30 * 60_000);
+    const resetAt = `${String(future.getHours()).padStart(2, "0")}:${String(future.getMinutes()).padStart(2, "0")}`;
+    database.prepare("INSERT INTO rate_limit_waits(chat_id, provider, resume_after) VALUES (?, 'codex', ?)").run(chat.id, future.toISOString());
+    database.prepare(`
+      INSERT INTO usage_status(provider, account_id, monitor_status, data_status, used_percent, remaining_percent, reset_at, details_json)
+      VALUES ('codex', (SELECT id FROM agent_accounts WHERE provider = 'codex' AND is_default = 1), 'ready', 'fresh', 4, 96, '23:14 on 1 Sep', ?)
+    `).run(JSON.stringify({ windows: [
+      { id: "weekly", remainingPercent: 96, resetAt: "23:14 on 1 Sep" },
+      { id: "five_hour", remainingPercent: 0, resetAt },
+    ] }));
+
+    await (service as unknown as { tick: () => Promise<void> }).tick();
+
+    expect(resumed).toBe(false);
+    expect(database.prepare("SELECT * FROM rate_limit_waits WHERE chat_id = ?").get(chat.id)).toBeDefined();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+
   it("예정 재개 시각이 지나도 방금 재확인한 사용량이 여전히 한도에 걸려 있으면 재개하지 않는다", async () => {
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "web-agent-manager-rate-tick-"));
     const config = { dataDir } as unknown as AppConfig;

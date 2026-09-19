@@ -4,7 +4,7 @@ import android.content.Intent;
 import android.widget.RemoteViews;
 import android.widget.RemoteViewsService;
 
-// 1×1 위젯에서 Claude·Codex 카드를 스와이프할 수 있는 두 항목 컬렉션을 제공한다.
+// 1×1 위젯에서 서버가 준 공급자 카드를 스와이프할 수 있는 컬렉션을 제공한다.
 public final class WidgetStackService extends RemoteViewsService {
     // 런처가 요청한 StackView 데이터 팩토리를 생성한다.
     @Override
@@ -12,7 +12,7 @@ public final class WidgetStackService extends RemoteViewsService {
         return new Factory();
     }
 
-    // 저장된 최신 위젯 스냅샷을 두 장의 RemoteViews로 변환한다.
+    // 저장된 최신 위젯 스냅샷을 공급자 수만큼 RemoteViews로 변환한다.
     private final class Factory implements RemoteViewsFactory {
         private WidgetSnapshot snapshot;
 
@@ -22,14 +22,14 @@ public final class WidgetStackService extends RemoteViewsService {
         @Override public void onDataSetChanged() { snapshot = WidgetDataStore.load(WidgetStackService.this); }
         // 별도 자원이 없어 정리할 내용이 없다.
         @Override public void onDestroy() {}
-        // Claude·Codex 두 장을 반환한다.
-        @Override public int getCount() { return 2; }
+        // 서버가 준 공급자 수만큼 카드를 반환한다.
+        @Override public int getCount() { return snapshot == null || snapshot.usages == null ? 0 : snapshot.usages.length; }
 
         // 지정 위치의 공급자 카드와 앱 열기 fill-in intent를 만든다.
         @Override public RemoteViews getViewAt(int position) {
             RemoteViews views = new RemoteViews(getPackageName(), R.layout.widget_stack_item);
-            WidgetSnapshot.Usage usage = snapshot == null ? null : (position == 0 ? snapshot.claude : snapshot.codex);
-            views.setTextViewText(R.id.stack_provider, position == 0 ? "Claude" : "Codex");
+            WidgetSnapshot.Usage usage = snapshot == null || snapshot.usages == null || position < 0 || position >= snapshot.usages.length ? null : snapshot.usages[position];
+            views.setTextViewText(R.id.stack_provider, usage == null ? "" : usage.label);
             int percent = usage == null ? -1 : usage.usedPercent;
             views.setTextViewText(R.id.stack_value, UsageWidgetProvider.percentText(percent));
             views.setProgressBar(R.id.stack_progress, 100, Math.max(0, percent), percent < 0);
@@ -43,7 +43,7 @@ public final class WidgetStackService extends RemoteViewsService {
         @Override public int getViewTypeCount() { return 1; }
         // 위치를 안정 ID로 그대로 사용한다.
         @Override public long getItemId(int position) { return position; }
-        // 두 공급자 순서가 고정이라 안정 ID를 사용한다.
+        // 공급자 순서가 스냅샷 배열과 같아 안정 ID를 사용한다.
         @Override public boolean hasStableIds() { return true; }
     }
 }

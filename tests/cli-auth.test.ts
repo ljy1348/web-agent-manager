@@ -107,6 +107,10 @@ describe("CLI 인증 상태 캐시", () => {
     };
     expect((await claudeStatus('{\n  "loggedIn": true,\n  "authMethod": "claude.ai"\n}')).authenticated).toBe(true);
     expect((await claudeStatus('{\n  "loggedIn": false,\n  "authMethod": "none"\n}')).authenticated).toBe(false);
+    // loggedIn: false 문자열이 없다고 "인증됨"으로 오판하면 안 된다 — 예상 밖 출력(에러 메시지, 빈 값,
+    // 손상된 JSON 등)은 확실한 "true" 신호가 없으니 미인증으로 본다(실패 시 닫힘).
+    expect((await claudeStatus("")).authenticated).toBe(false);
+    expect((await claudeStatus("Error: command failed unexpectedly")).authenticated).toBe(false);
   });
 
   it("로그인 PTY 종료 뒤 해당 공급자만 한 번 재검사한다", async () => {
@@ -146,6 +150,31 @@ describe("CLI 인증 상태 캐시", () => {
   afterEach(() => {
     vi.useRealTimers();
   });
+  it("기본 계정 로그인 PTY는 설치 홈이 달라도 프로세스 HOME을 그대로 쓴다", async () => {
+    const spawnEnvs: Array<Record<string, string | undefined>> = [];
+    const statusEnvs: Array<Record<string, string> | undefined> = [];
+    const runtime: CliAuthRuntime = {
+      findExecutable: (command) => `/usr/local/bin/${command}`,
+      commandSucceeds: async (_command, _args, _cwd, env) => {
+        statusEnvs.push(env);
+        return false;
+      },
+      spawn: (_command, _args, options) => {
+        spawnEnvs.push((options.env ?? {}) as Record<string, string | undefined>);
+        return terminal(() => undefined);
+      },
+    };
+    const manager = new CliAuthManager(config(), realtime([]), accounts(), runtime);
+    await manager.initialize();
+    manager.start("codex", 2);
+
+    expect(statusEnvs[0]?.HOME).toBeUndefined();
+    expect(statusEnvs[0]?.CODEX_HOME).toBe(path.join(config().homeDir, ".codex"));
+    expect(spawnEnvs[0]?.HOME).toBe(process.env.HOME);
+    expect(spawnEnvs[0]?.HOME).not.toBe(config().homeDir);
+    expect(spawnEnvs[0]?.CODEX_HOME).toBe(path.join(config().homeDir, ".codex"));
+  });
+
   it("로그인 PTY가 안 끝나도 살아있는 동안 주기적으로 재확인해 인증 완료를 반영한다", async () => {
     vi.useFakeTimers();
     const events: Array<{ type: string; payload: unknown }> = [];

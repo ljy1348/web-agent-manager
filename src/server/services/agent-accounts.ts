@@ -15,6 +15,12 @@ export const CONFIG_DIR_ENV: Record<Provider, string> = {
   grok: "GROK_HOME",
 };
 
+// 기본 Codex 계정이 쓰는 설정 디렉터리. 로그인 PTY가 설치 계정 홈의 ~/.codex에 인증을 저장하므로
+// 프로세스 HOME이 달라도 그 경로를 CODEX_HOME으로 가리킨다.
+export function defaultCodexHome(homeDir: string): string {
+  return path.join(homeDir, ".codex");
+}
+
 // 라벨에서 디렉터리로 쓸 수 있는 slug를 만든다. 한글 라벨도 흔해 사용 가능한 문자가 하나도 안 남을 수 있어,
 // 그런 경우 호출부에서 순번을 붙여 유일한 값을 만든다.
 export function toAccountSlug(label: string): string {
@@ -119,11 +125,20 @@ export class AgentAccountService {
     return resolved.startsWith(`${path.resolve(root)}${path.sep}`);
   }
 
-  // 계정 실행에 필요한 환경변수를 만든다. 기본 계정은 아무것도 주입하지 않아 CLI 기본 경로를 그대로 쓴다.
+  // 기록 스캔·실행에 쓸 설정 디렉터리. 기본 Codex는 설치 계정 홈의 ~/.codex를 쓴다.
+  cliConfigDir(account: AgentAccountRecord): string | null {
+    if (account.config_dir) return account.config_dir;
+    if (account.provider === "codex" && this.config.homeDir) return defaultCodexHome(this.config.homeDir);
+    return null;
+  }
+
+  // 계정 실행에 필요한 환경변수를 만든다. 기본 Claude·Grok은 프로세스 HOME을 그대로 쓰고,
+  // 기본 Codex만 설치 계정 홈의 ~/.codex를 CODEX_HOME으로 가리킨다.
   environment(account: AgentAccountRecord): Record<string, string> {
-    if (!account.config_dir) return {};
-    fs.mkdirSync(account.config_dir, { recursive: true, mode: 0o700 });
-    return { [CONFIG_DIR_ENV[account.provider]]: account.config_dir };
+    const configDir = this.cliConfigDir(account);
+    if (!configDir) return {};
+    fs.mkdirSync(configDir, { recursive: true, mode: 0o700 });
+    return { [CONFIG_DIR_ENV[account.provider]]: configDir };
   }
 
   // 사용량 조회 대상 계정을 설정에 따라 고른다. 기본은 공급자별 기본 계정 하나뿐이다.

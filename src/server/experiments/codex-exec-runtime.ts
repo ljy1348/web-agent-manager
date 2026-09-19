@@ -1,3 +1,5 @@
+import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -12,6 +14,7 @@ import {
   type RuntimeUsageSnapshot,
 } from "./agent-runtime";
 import { JsonlProcessExitError, JsonlProcessRunner } from "./jsonl-process";
+import { detectOsSandboxSupport } from "./os-sandbox";
 
 const execFileAsync = promisify(execFile);
 
@@ -27,6 +30,7 @@ export interface CodexExecRuntimeOptions {
   inheritProcessEnvironment?: boolean;
   processRunner?: JsonlProcessRunner;
   readVersion?: () => Promise<string>;
+  detectSandbox?: () => Promise<boolean>;
   skillManifest?: (input: RuntimePrepareInput) => Promise<CodexSkillManifestEntry[]>;
   skillOverlay?: (input: RuntimePrepareInput) => Promise<ExperimentSkillOverlaySnapshot | null>;
   verifySkillOverlay?: (snapshot: ExperimentSkillOverlaySnapshot) => void;
@@ -74,6 +78,11 @@ function tomlString(value: string): string {
 }
 
 // 실행 스냅샷의 전체 스킬 manifest를 Codex skills.config TOML 배열로 만든다.
+// OS 샌드박스를 걸 수 없으면 요청한 read-only를 붙이지 않는다. Codex는 초기화 실패 뒤 읽기까지 거부한다.
+function resolvedCodexSandbox(input: RuntimeRunInput): RuntimeRunInput["config"]["runtime"]["sandbox"] {
+  return input.snapshot.toolProfile.supportsSandbox === false ? "danger-full-access" : input.config.runtime.sandbox;
+}
+
 function skillConfigOverride(input: RuntimeRunInput): string | null {
   const manifest = input.snapshot.skillManifest;
   const enabled = new Set(input.config.skills.enabled);
@@ -107,10 +116,15 @@ export function buildCodexExecArgs(input: RuntimeRunInput, resumeSessionId?: str
   // 현재 Codex CLI의 resume 하위 명령에는 --color가 없으므로 새 실행에만 적용한다.
   if (!resumeSessionId) args.push("--color", "never");
   if (input.config.runtime.model) args.push("--model", input.config.runtime.model);
-  if (resumeSessionId) args.push("--config", `sandbox_mode=${tomlString(input.config.runtime.sandbox)}`);
-  else args.push("--sandbox", input.config.runtime.sandbox, "--cd", input.workingDirectory);
+  const sandbox = resolvedCodexSandbox(input);
+  if (resumeSessionId) args.push("--config", `sandbox_mode=${tomlString(sandbox)}`);
+  else args.push("--sandbox", sandbox, "--cd", input.workingDirectory);
   if (input.config.runtime.reasoningEffort) {
     args.push("--config", `model_reasoning_effort=${tomlString(input.config.runtime.reasoningEffort)}`);
+  }
+  // 현재 `codex exec --help`에는 --max-turns가 없다. 저장된 상한을 조용히 무시하면 무제한으로 달리므로 거부한다.
+  if (input.config.runtime.maxTurns !== null) {
+    throw new Error("현재 Codex CLI는 runtime.maxTurns를 지원하지 않습니다.");
   }
   const skills = skillConfigOverride(input);
   if (skills) args.push("--config", skills);
@@ -139,6 +153,7 @@ export function normalizeCodexExecEvent(raw: Record<string, unknown>, occurredAt
       const text = typeof item.text === "string" ? item.text : typeof item.content === "string" ? item.content : "";
       return text ? [{ type: "message", role: "assistant", text, occurredAt }] : [];
     }
+    // allowlist 밖 item(예: 이후 file_read)은 버려져 finding_report의 toolCallCount가 0으로 보일 수 있다.
     if (["command_execution", "file_change", "mcp_tool_call", "web_search", "plan_update"].includes(itemType)) {
       const name = typeof item.command === "string" ? item.command : typeof item.name === "string" ? item.name : itemType;
       return [{
@@ -175,6 +190,7 @@ export class CodexExecRuntime implements AgentRuntime {
   private readonly inheritProcessEnvironment: boolean;
   private readonly runner: JsonlProcessRunner;
   private readonly readVersion: () => Promise<string>;
+  private readonly detectSandbox: () => Promise<boolean>;
   private readonly skillManifest: (input: RuntimePrepareInput) => Promise<CodexSkillManifestEntry[]>;
   private readonly skillOverlay: (input: RuntimePrepareInput) => Promise<ExperimentSkillOverlaySnapshot | null>;
   private readonly verifySkillOverlay: (snapshot: ExperimentSkillOverlaySnapshot) => void;
@@ -189,6 +205,7 @@ export class CodexExecRuntime implements AgentRuntime {
       const result = await execFileAsync(this.executable, ["--version"], { timeout: 15_000, env });
       return result.stdout.trim();
     });
+    this.detectSandbox = options.detectSandbox ?? detectOsSandboxSupport;
     this.skillManifest = options.skillManifest ?? (async () => []);
     this.skillOverlay = options.skillOverlay ?? (async () => null);
     this.verifySkillOverlay = options.verifySkillOverlay ?? (() => undefined);
@@ -196,15 +213,25 @@ export class CodexExecRuntime implements AgentRuntime {
 
   // CLI 버전과 요청한 모델·권한·스킬 manifest를 실행 환경 스냅샷으로 고정한다.
   async prepare(input: RuntimePrepareInput): Promise<RuntimeSnapshot> {
-    const [cliVersion, skillManifest, skillOverlay] = await Promise.all([
-      this.readVersion(), this.skillManifest(input), this.skillOverlay(input),
+    const [cliVersion, supportsSandbox, skillManifest, skillOverlay] = await Promise.all([
+      this.readVersion(), this.detectSandbox(), this.skillManifest(input), this.skillOverlay(input),
     ]);
+    let outputSchemaPath: string | null = null;
+    if (input.outputSchema) {
+      outputSchemaPath = path.join(os.tmpdir(), `wam-codex-schema-${input.runId}.json`);
+      await fs.writeFile(outputSchemaPath, `${JSON.stringify(input.outputSchema)}\n`, { encoding: "utf8", mode: 0o600 });
+    }
+    const requested = input.config.runtime.sandbox;
     return {
       provider: "codex",
       cliVersion,
       resolvedModel: input.config.runtime.model,
-      toolProfile: { transport: "exec-jsonl", outputSchemaPath: null },
-      permissionProfile: { sandbox: input.config.runtime.sandbox },
+      toolProfile: { transport: "exec-jsonl", outputSchemaPath, supportsSandbox },
+      permissionProfile: {
+        sandbox: requested,
+        enforced: supportsSandbox ? requested : "danger-full-access",
+        enforcement: supportsSandbox ? "codex-os-sandbox" : "none-os-sandbox-unavailable",
+      },
       skillManifest,
       skillOverlay,
       preparedAt: new Date().toISOString(),

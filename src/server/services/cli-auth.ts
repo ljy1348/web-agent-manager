@@ -4,7 +4,7 @@ import type { AppConfig } from "../core/config";
 import type { AuthUser } from "../../shared/types";
 import type { RealtimeHub } from "./realtime";
 import { findExecutable } from "./agent-integration";
-import { CONFIG_DIR_ENV, type AgentAccountService } from "./agent-accounts";
+import { CONFIG_DIR_ENV, defaultCodexHome, type AgentAccountService } from "./agent-accounts";
 
 export type CliAuthProvider = "codex" | "claude" | "grok" | "github";
 
@@ -52,12 +52,14 @@ const AUTH_COMMANDS: Record<CliAuthProvider, { executable: string; args: string[
 
 // unauthenticatedPattern이 있는 공급자는 종료 코드 대신 출력으로 판정한다(grok은 미인증 상태에서도
 // 상태 명령이 0으로 끝나 종료 코드만 보면 항상 "로그인됨"으로 잘못 표시된다).
-const STATUS_COMMANDS: Record<CliAuthProvider, { executable: string; args: string[]; unauthenticatedPattern?: RegExp }> = {
+const STATUS_COMMANDS: Record<CliAuthProvider, { executable: string; args: string[]; unauthenticatedPattern?: RegExp; authenticatedPattern?: RegExp }> = {
   codex: { executable: "codex", args: ["login", "status"] },
   // claude도 grok과 같은 함정이 있다: 로그인하지 않아도 "auth status --json"이 정상 종료(exit 0)하고
-  // 본문에 loggedIn: false만 찍는다(실측: 종료 코드만 보던 앱이 항상 "인증됨"으로 오판). JSON 본문의
-  // loggedIn 값으로 판정한다.
-  claude: { executable: "claude", args: ["auth", "status", "--json"], unauthenticatedPattern: /"loggedIn"\s*:\s*false/ },
+  // 본문에 loggedIn: false만 찍는다(실측: 종료 코드만 보던 앱이 항상 "인증됨"으로 오판). unauthenticatedPattern
+  // (없으면 인증됨으로 판정)이 아니라 authenticatedPattern(있어야만 인증됨으로 판정)을 쓴다 — CLI 출력이
+  // 예상과 다른 형식이거나 깨졌을 때 "false가 안 보이니 인증됨"으로 잘못 판단하는 것보다, 확실한 신호가
+  // 없으면 미인증으로 보는 쪽이 안전하다(실패 시 닫힘).
+  claude: { executable: "claude", args: ["auth", "status", "--json"], authenticatedPattern: /"loggedIn"\s*:\s*true/ },
   grok: { executable: "grok", args: ["models"], unauthenticatedPattern: /not authenticated|not logged in/i },
   github: { executable: "gh", args: ["auth", "status", "--hostname", "github.com"] },
 };
@@ -93,6 +95,9 @@ export class CliAuthManager {
     private readonly realtime: RealtimeHub,
     private readonly accounts: AgentAccountService,
     private readonly runtime: CliAuthRuntime = DEFAULT_RUNTIME,
+    // 로그인 완료 시 그 계정의 사용량 조회를 바로 시작하려는 쪽(UsageMonitor)이 구독한다 —
+    // 인증 안 된 계정을 무작정 폴링하면 codex·claude 모두 로그인 화면에 계속 걸리는 문제가 있었다.
+    private readonly onAuthenticated?: (provider: CliAuthProvider, accountId: number | null) => void,
   ) {
     realtime.setAuthTerminalHandlers(
       (key, data, user) => this.input(key, data, user),
@@ -120,6 +125,12 @@ export class CliAuthManager {
       })).then(() => undefined);
     }
     return this.initialization;
+  }
+
+  // 캐시된 인증 여부만 동기로 읽는다(UsageMonitor가 폴링 시작 전 게이트로 사용). 아직 한 번도 검사
+  // 안 된 대상은 initialize()/status()를 먼저 호출한 뒤에만 정확하다 — 서버 시작 시 이미 그렇게 한다.
+  isAuthenticatedCached(provider: CliAuthProvider, accountId: number | null): boolean {
+    return this.statuses.get(authSessionKey(provider, accountId))?.authenticated ?? false;
   }
 
   // 캐시된 인증 결과와 현재 로그인 PTY 실행 상태를 반환한다.
@@ -160,6 +171,10 @@ export class CliAuthManager {
   // 상태 명령으로 로그인 여부를 판정한다. 미인증 문구가 정의된 공급자는 종료 코드가 아니라 그 문구로 본다.
   private async isAuthenticated(executable: string, statusCommand: (typeof STATUS_COMMANDS)[CliAuthProvider], target: { provider: CliAuthProvider; configDir: string | null }): Promise<boolean> {
     const environment = this.targetEnvironment(target);
+    if (statusCommand.authenticatedPattern && this.runtime.commandOutput) {
+      const output = await this.runtime.commandOutput(executable, statusCommand.args, this.config.homeDir, environment);
+      return statusCommand.authenticatedPattern.test(output);
+    }
     if (statusCommand.unauthenticatedPattern && this.runtime.commandOutput) {
       const output = await this.runtime.commandOutput(executable, statusCommand.args, this.config.homeDir, environment);
       return !!output.trim() && !statusCommand.unauthenticatedPattern.test(output);
@@ -167,16 +182,21 @@ export class CliAuthManager {
     return this.runtime.commandSucceeds(executable, statusCommand.args, this.config.homeDir, environment);
   }
 
-  // 계정 슬롯의 설정 디렉터리를 환경변수로 만든다. 기본 계정과 GitHub은 주입하지 않는다.
+  // 계정 슬롯의 설정 디렉터리를 환경변수로 만든다. 기본 Codex는 설치 계정 홈의 ~/.codex를 가리키고,
+  // 기본 Claude·Grok과 GitHub은 프로세스 HOME을 그대로 쓴다.
   private targetEnvironment(target: { provider: CliAuthProvider; configDir: string | null }): Record<string, string> {
-    if (target.provider === "github" || !target.configDir) return {};
-    return { [CONFIG_DIR_ENV[target.provider]]: target.configDir };
+    if (target.provider === "github") return {};
+    if (target.configDir) return { [CONFIG_DIR_ENV[target.provider]]: target.configDir };
+    if (target.provider === "codex") return { CODEX_HOME: defaultCodexHome(this.config.homeDir) };
+    return {};
   }
 
   // 로그인 종료 뒤 해당 대상만 재검사하고 갱신 이벤트를 보낸다.
   private async refreshAfterExit(target: { provider: CliAuthProvider; accountId: number | null; accountLabel: string | null; configDir: string | null }, exitCode: number): Promise<void> {
-    this.statuses.set(authSessionKey(target.provider, target.accountId), await this.inspectTarget(target));
+    const status = await this.inspectTarget(target);
+    this.statuses.set(authSessionKey(target.provider, target.accountId), status);
     this.realtime.broadcast("cli_auth_changed", { provider: target.provider, accountId: target.accountId, exitCode });
+    if (status.authenticated) this.onAuthenticated?.(target.provider, target.accountId);
   }
 
   // 선택한 계정의 공식 로그인 명령을 새 PTY에서 시작한다. 계정 슬롯의 설정 디렉터리를 지정해 실행하므로
@@ -197,7 +217,9 @@ export class CliAuthManager {
       cwd: this.config.homeDir,
       env: {
         ...process.env,
-        HOME: this.config.homeDir,
+        // 기본 계정 인증은 채팅·상태 확인과 같은 HOME을 써야 한다. 설치 경로에서 구한
+        // config.homeDir로 HOME을 바꾸면(서버가 root로 뜰 때 설치 계정 홈과 프로세스 홈이 다름)
+        // 로그인은 성공해도 상태 명령과 실제 채팅은 다른 디렉터리를 보고 계속 미인증으로 남는다.
         BROWSER: "echo",
         GH_BROWSER: "echo",
         TERM: "xterm-256color",
@@ -226,6 +248,7 @@ export class CliAuthManager {
         this.statuses.set(key, status);
         if (status.authenticated && !previous) {
           this.realtime.broadcast("cli_auth_changed", { provider: target.provider, accountId: target.accountId, exitCode: null });
+          this.onAuthenticated?.(target.provider, target.accountId);
         }
       })();
     }, 5_000);

@@ -9,6 +9,13 @@ import {
 export type DiffMode = "unified" | "split";
 /** hunk 사이 감춰진 구간을 펼칠 때 원본 줄을 가져오는 함수. 없으면 펼치기 버튼을 내보내지 않는다. */
 export type ExpandLines = (path: string) => Promise<string[]>;
+export interface DiffLineCommentTarget { path: string; side: "old" | "new"; line: number; hunkIndex: number }
+export interface DiffReviewControls {
+  hunkId: (file: DiffFile, hunk: DiffHunk, index: number) => string | undefined;
+  busyHunkId?: string;
+  onDecision: (file: DiffFile, hunk: DiffHunk, index: number, decision: "accept" | "reject") => void;
+  onComment: (target: DiffLineCommentTarget) => void;
+}
 
 const EXPAND_STEP = 20;
 
@@ -78,7 +85,7 @@ interface ExpansionState {
 }
 
 // 한 파일의 diff 본문. hunk 사이 컨텍스트를 펼칠 수 있고 통합·분할 보기를 모두 지원한다.
-function FileDiffBody({ file, mode, expandLines }: { file: DiffFile; mode: DiffMode; expandLines?: ExpandLines }): React.ReactElement {
+function FileDiffBody({ file, mode, expandLines, reviewControls }: { file: DiffFile; mode: DiffMode; expandLines?: ExpandLines; reviewControls?: DiffReviewControls }): React.ReactElement {
   const [expansion, setExpansion] = useState<ExpansionState>({ before: {} });
   const [busyBoundary, setBusyBoundary] = useState<number | null>(null);
   const [source, setSource] = useState<string[] | null>(null);
@@ -138,58 +145,64 @@ function FileDiffBody({ file, mode, expandLines }: { file: DiffFile; mode: DiffM
       blocks.push(<ExpanderRow key={`exp:${index}`} hidden={hidden} columns={columns} busy={busyBoundary === index} onExpand={(amount) => void expand(index, amount)} />);
     }
     if (expanded.length) {
-      blocks.push(<HunkLines key={`ctx:${index}`} lines={expanded} mode={mode} language={language} />);
+      blocks.push(<HunkLines key={`ctx:${index}`} file={file} hunkIndex={index} lines={expanded} mode={mode} language={language} />);
     }
     const hunk = file.hunks[index];
     if (hunk) {
-      blocks.push(<HunkBlock key={`hunk:${index}`} hunk={hunk} mode={mode} language={language} showHeader={!expanded.length} />);
+      blocks.push(<HunkBlock key={`hunk:${index}`} file={file} hunk={hunk} hunkIndex={index} mode={mode} language={language} showHeader={!expanded.length} reviewControls={reviewControls} />);
     }
   }
   return <div className={`diff-body diff-body-${mode}`}>{blocks}</div>;
 }
 
 // hunk 헤더(@@ 대신 섹션 힌트)와 줄들을 그린다.
-function HunkBlock({ hunk, mode, language, showHeader }: { hunk: DiffHunk; mode: DiffMode; language: string | null; showHeader: boolean }): React.ReactElement {
+function HunkBlock({ file, hunk, hunkIndex, mode, language, showHeader, reviewControls }: { file: DiffFile; hunk: DiffHunk; hunkIndex: number; mode: DiffMode; language: string | null; showHeader: boolean; reviewControls?: DiffReviewControls }): React.ReactElement {
+  const hunkId = reviewControls?.hunkId(file, hunk, hunkIndex);
+  const busy = !!hunkId && reviewControls?.busyHunkId === hunkId;
   return <>
-    {showHeader && <div className="diff-hunk-head">{hunk.section || `@@ ${hunk.newStart}행부터`}</div>}
-    <HunkLines lines={hunk.lines} mode={mode} language={language} />
+    {(showHeader || hunkId) && <div className="diff-hunk-head"><span>{showHeader ? hunk.section || `@@ ${hunk.newStart}행부터` : `hunk ${hunkIndex + 1}`}</span>{hunkId && <span className="diff-hunk-actions"><button type="button" disabled={busy} onClick={() => reviewControls?.onDecision(file, hunk, hunkIndex, "accept")}>{busy ? "처리 중…" : "승인·stage"}</button><button type="button" className="danger" disabled={busy} onClick={() => reviewControls?.onDecision(file, hunk, hunkIndex, "reject")}>거부·되돌림</button></span>}</div>}
+    <HunkLines file={file} hunkIndex={hunkIndex} lines={hunk.lines} mode={mode} language={language} reviewControls={reviewControls} />
   </>;
 }
 
 // 줄 목록을 선택한 보기 방식으로 렌더링한다.
-function HunkLines({ lines, mode, language }: { lines: DiffLine[]; mode: DiffMode; language: string | null }): React.ReactElement {
+function HunkLines({ file, hunkIndex, lines, mode, language, reviewControls }: { file: DiffFile; hunkIndex: number; lines: DiffLine[]; mode: DiffMode; language: string | null; reviewControls?: DiffReviewControls }): React.ReactElement {
   return mode === "split"
-    ? <SplitLines lines={lines} language={language} />
-    : <UnifiedLines lines={lines} language={language} />;
+    ? <SplitLines file={file} hunkIndex={hunkIndex} lines={lines} language={language} reviewControls={reviewControls} />
+    : <UnifiedLines file={file} hunkIndex={hunkIndex} lines={lines} language={language} reviewControls={reviewControls} />;
 }
 
-function UnifiedLines({ lines, language }: { lines: DiffLine[]; language: string | null }): React.ReactElement {
+function CommentButton({ target, onComment }: { target: DiffLineCommentTarget; onComment: (target: DiffLineCommentTarget) => void }): React.ReactElement {
+  return <button type="button" className="diff-comment-trigger" aria-label={`${target.path} ${target.side} ${target.line}행에 주석`} title="이 줄에 주석" onClick={() => onComment(target)}>＋</button>;
+}
+
+function UnifiedLines({ file, hunkIndex, lines, language, reviewControls }: { file: DiffFile; hunkIndex: number; lines: DiffLine[]; language: string | null; reviewControls?: DiffReviewControls }): React.ReactElement {
   const code = useMemo(() => lines.map((line) => line.text), [lines]);
   const tokens = useDiffTokens(code, language);
   return <>{lines.map((line, index) => <div key={index} className={`diff-row diff-row-${line.kind}`}>
     <span className="diff-num">{line.oldNumber ?? ""}</span>
     <span className="diff-num">{line.newNumber ?? ""}</span>
-    <span className="diff-code"><i>{line.kind === "add" ? "+" : line.kind === "remove" ? "-" : " "}</i><span className="diff-text"><TokenLine text={line.text} tokens={tokens?.[index]} /></span></span>
+    <span className="diff-code"><i>{line.kind === "add" ? "+" : line.kind === "remove" ? "-" : " "}</i><span className="diff-text"><TokenLine text={line.text} tokens={tokens?.[index]} /></span>{reviewControls && <CommentButton target={{ path: file.path, side: line.kind === "remove" ? "old" : "new", line: (line.kind === "remove" ? line.oldNumber : line.newNumber)!, hunkIndex }} onComment={reviewControls.onComment} />}</span>
   </div>)}</>;
 }
 
-function SplitLines({ lines, language }: { lines: DiffLine[]; language: string | null }): React.ReactElement {
+function SplitLines({ file, hunkIndex, lines, language, reviewControls }: { file: DiffFile; hunkIndex: number; lines: DiffLine[]; language: string | null; reviewControls?: DiffReviewControls }): React.ReactElement {
   const rows = useMemo(() => toSplitRows(lines), [lines]);
   const leftCode = useMemo(() => rows.map((row) => row.left?.text ?? ""), [rows]);
   const rightCode = useMemo(() => rows.map((row) => row.right?.text ?? ""), [rows]);
   const leftTokens = useDiffTokens(leftCode, language);
   const rightTokens = useDiffTokens(rightCode, language);
   return <>{rows.map((row, index) => <div key={index} className="diff-row diff-row-split">
-    <SplitSide line={row.left} side="old" tokens={leftTokens?.[index]} />
-    <SplitSide line={row.right} side="new" tokens={rightTokens?.[index]} />
+    <SplitSide file={file} hunkIndex={hunkIndex} line={row.left} side="old" tokens={leftTokens?.[index]} reviewControls={reviewControls} />
+    <SplitSide file={file} hunkIndex={hunkIndex} line={row.right} side="new" tokens={rightTokens?.[index]} reviewControls={reviewControls} />
   </div>)}</>;
 }
 
-function SplitSide({ line, side, tokens }: { line: DiffLine | null; side: "old" | "new"; tokens?: DiffToken[] }): React.ReactElement {
+function SplitSide({ file, hunkIndex, line, side, tokens, reviewControls }: { file: DiffFile; hunkIndex: number; line: DiffLine | null; side: "old" | "new"; tokens?: DiffToken[]; reviewControls?: DiffReviewControls }): React.ReactElement {
   if (!line) return <><span className="diff-num empty" /><span className="diff-code empty" /></>;
   return <>
     <span className={`diff-num ${line.kind}`}>{(side === "old" ? line.oldNumber : line.newNumber) ?? ""}</span>
-    <span className={`diff-code ${line.kind}`}><i>{line.kind === "add" ? "+" : line.kind === "remove" ? "-" : " "}</i><span className="diff-text"><TokenLine text={line.text} tokens={tokens} /></span></span>
+    <span className={`diff-code ${line.kind}`}><i>{line.kind === "add" ? "+" : line.kind === "remove" ? "-" : " "}</i><span className="diff-text"><TokenLine text={line.text} tokens={tokens} /></span>{reviewControls && (side === "old" ? line.oldNumber : line.newNumber) != null && <CommentButton target={{ path: file.path, side, line: (side === "old" ? line.oldNumber : line.newNumber)!, hunkIndex }} onComment={reviewControls.onComment} />}</span>
   </>;
 }
 
@@ -207,8 +220,8 @@ function FilePathLabel({ path, oldPath }: { path: string; oldPath: string | null
 }
 
 // 파일 하나를 GitHub식 카드(상태 배지·경로·증감 통계 + 접기)로 보여준다.
-export function DiffFileCard({ file, mode, expandLines, defaultOpen = true }: {
-  file: DiffFile; mode: DiffMode; expandLines?: ExpandLines; defaultOpen?: boolean;
+export function DiffFileCard({ file, mode, expandLines, defaultOpen = true, reviewControls }: {
+  file: DiffFile; mode: DiffMode; expandLines?: ExpandLines; defaultOpen?: boolean; reviewControls?: DiffReviewControls;
 }): React.ReactElement {
   const [open, setOpen] = useState(defaultOpen);
   return <section className={`diff-file${open ? " open" : ""}`}>
@@ -223,19 +236,19 @@ export function DiffFileCard({ file, mode, expandLines, defaultOpen = true }: {
         {file.deletions > 0 && <b className="diff-stat-del">−{file.deletions}</b>}
       </span>
     </header>
-    {open && <FileDiffBody file={file} mode={mode} expandLines={expandLines} />}
+    {open && <FileDiffBody file={file} mode={mode} expandLines={expandLines} reviewControls={reviewControls} />}
   </section>;
 }
 
 // 통합 diff 문자열을 GitHub식 파일 카드 목록으로 렌더링한다.
-export function DiffView({ diff, mode = "unified", path, expandLines, defaultOpen = true }: {
-  diff: string; mode?: DiffMode; path?: string; expandLines?: ExpandLines; defaultOpen?: boolean;
+export function DiffView({ diff, mode = "unified", path, expandLines, defaultOpen = true, reviewControls }: {
+  diff: string; mode?: DiffMode; path?: string; expandLines?: ExpandLines; defaultOpen?: boolean; reviewControls?: DiffReviewControls;
 }): React.ReactElement {
   const files = useMemo(() => parseDiffFiles(diff), [diff]);
   if (!files.length) return <pre className="diff-plain">{diff}</pre>;
   // 단일 파일 diff(채팅 상세 등)는 카드 헤더 없이 본문만 보여 기존 표시와 가깝게 유지한다.
-  if (files.length === 1 && path) return <FileDiffBody file={files[0]} mode={mode} expandLines={expandLines} />;
+  if (files.length === 1 && path) return <FileDiffBody file={files[0]} mode={mode} expandLines={expandLines} reviewControls={reviewControls} />;
   return <div className="diff-file-list">{files.map((file) => (
-    <DiffFileCard key={`${file.oldPath ?? ""}:${file.path}`} file={file} mode={mode} expandLines={expandLines} defaultOpen={defaultOpen} />
+    <DiffFileCard key={`${file.oldPath ?? ""}:${file.path}`} file={file} mode={mode} expandLines={expandLines} defaultOpen={defaultOpen} reviewControls={reviewControls} />
   ))}</div>;
 }

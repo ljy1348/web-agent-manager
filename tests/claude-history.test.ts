@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ClaudeAdapter } from "../src/server/providers/claude";
+import { ClaudeAdapter, ensureClaudeOnboardingComplete, ensureClaudeWorkspaceTrusted } from "../src/server/providers/claude";
 import type { TmuxIO } from "../src/server/providers/provider";
 import { USAGE_KEEPALIVE_PROMPT } from "../src/shared/usage-keepalive";
 
@@ -40,9 +40,29 @@ describe("Claude 세션 기록 파싱", () => {
     const adapter = new ClaudeAdapter("/tmp/settings.json", { WAM_HOOK: "enabled" });
     expect(adapter.createMonitorLaunch("/tmp")).toEqual({ command: "claude", args: ["--safe-mode", "--ax-screen-reader"] });
     expect(adapter.createLaunch("/tmp").args).toEqual(["--settings", "/tmp/settings.json"]);
+    expect(adapter.supportsNewSessionId).toBe(true);
+    expect(adapter.createLaunch("/tmp", undefined, "11111111-1111-4111-8111-111111111111").args).toEqual([
+      "--settings", "/tmp/settings.json", "--session-id", "11111111-1111-4111-8111-111111111111",
+    ]);
+    expect(adapter.createLaunch("/tmp", "resume-1", "11111111-1111-4111-8111-111111111111").args).toEqual([
+      "--settings", "/tmp/settings.json", "--resume", "resume-1",
+    ]);
     expect(adapter.promptQuirks).toMatchObject({ pasteSubmitDelayMs: 160, verifyPromptSubmission: true });
     // /usage 화면이 열린 채로 다음 주기에 다시 /usage를 보내면 무시돼 값이 영원히 굳는다(실측) — 다음 조회 전에 닫아야 한다.
     expect(adapter.usageScreenCloseInput).toBe("\u001b");
+  });
+
+  it("pinned project profile을 제한 모드와 공급자 CLI 옵션으로 적용한다", () => {
+    const adapter = new ClaudeAdapter("/tmp/settings.json", {});
+    const args = adapter.createLaunch("/tmp", undefined, "11111111-1111-4111-8111-111111111111", {
+      sandbox: "read-only", approvalMode: "on-request", model: "claude-profile", reasoningEffort: "high",
+      additionalWritePaths: [], allowedTools: ["Read"], disallowedTools: ["WebFetch"],
+    }).args;
+    expect(args).toEqual([
+      "--settings", "/tmp/settings.json", "--restricted", "--permission-mode", "plan", "--model", "claude-profile",
+      "--effort", "high", "--allowedTools", "Read", "--disallowedTools", "WebFetch",
+      "--session-id", "11111111-1111-4111-8111-111111111111",
+    ]);
   });
 
   it("도구 실행 결과 턴을 user가 아닌 tool 역할로 분류한다", () => {
@@ -801,5 +821,36 @@ describe("Claude 세션 기록 파싱", () => {
     expect(options.currentEffort).toBe("high");
     expect(adapter.effortCommand?.("high")).toBe("/effort high");
     expect(adapter.effortCommand?.("invalid")).toBeNull();
+  });
+});
+
+describe("Claude 온보딩·작업공간 신뢰 사전 처리", () => {
+  // OAuth 로그인만 끝내도(claude auth login/status는 인증됨을 보여줌) hasCompletedOnboarding이
+  // 별개로 관리돼 대화형 실행마다 테마 선택 마법사가 다시 뜬다(실사용 보고로 재현·확인). 실행 전에
+  // 이 플래그를 직접 채워 마법사를 건너뛴다.
+  it("hasCompletedOnboarding이 없으면 채우고, 이미 있으면 다른 값을 건드리지 않는다", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "claude-onboard-"));
+    ensureClaudeOnboardingComplete(home);
+    const first = JSON.parse(fs.readFileSync(path.join(home, ".claude.json"), "utf8"));
+    expect(first.hasCompletedOnboarding).toBe(true);
+
+    fs.writeFileSync(path.join(home, ".claude.json"), JSON.stringify({ hasCompletedOnboarding: true, userID: "keep-me" }));
+    ensureClaudeOnboardingComplete(home);
+    const second = JSON.parse(fs.readFileSync(path.join(home, ".claude.json"), "utf8"));
+    expect(second).toEqual({ hasCompletedOnboarding: true, userID: "keep-me" });
+  });
+
+  // 온보딩을 건너뛴 뒤에도 처음 여는 작업공간마다 "이 폴더를 신뢰합니까?" 확인이 한 번씩 더 뜬다
+  // (projects[경로].hasTrustDialogAccepted로 저장됨, 실측 확인). 사용량 조회 전용 PTY는 앱 자신의
+  // 고정 설치 경로만 열기 때문에 미리 신뢰 처리해도 안전하다.
+  it("사용량 조회 작업공간만 hasTrustDialogAccepted를 채우고 다른 프로젝트는 건드리지 않는다", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "claude-trust-"));
+    fs.writeFileSync(path.join(home, ".claude.json"), JSON.stringify({
+      projects: { "/other/project": { hasTrustDialogAccepted: false, allowedTools: ["Bash"] } },
+    }));
+    ensureClaudeWorkspaceTrusted(home, "/opt/web-agent-manager");
+    const config = JSON.parse(fs.readFileSync(path.join(home, ".claude.json"), "utf8"));
+    expect(config.projects["/opt/web-agent-manager"].hasTrustDialogAccepted).toBe(true);
+    expect(config.projects["/other/project"]).toEqual({ hasTrustDialogAccepted: false, allowedTools: ["Bash"] });
   });
 });

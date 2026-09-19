@@ -42,7 +42,10 @@ export interface ProcessGroup {
 }
 
 const SYSTEM_METRICS_INTERVAL_MS = 5_000;
-const PROCESS_METRICS_INTERVAL_MS = 15_000;
+// systeminformation의 networkStats/processes는 Linux에서도 여러 shell·ps·cat 프로세스를 띄운다.
+// 화면의 전체 CPU·메모리는 5초로 유지하되 누적 network와 프로세스 표는 이 비용에 맞춰 낮은 주기로 읽는다.
+const NETWORK_METRICS_INTERVAL_MS = 30_000;
+const PROCESS_METRICS_INTERVAL_MS = 60_000;
 const DISK_METRICS_INTERVAL_MS = 60_000;
 
 export interface SystemMetricsRuntime {
@@ -120,7 +123,7 @@ export function classifySystemProcesses(
   let ancestor = byPid.get(serverPid)?.parentPid;
   for (let depth = 0; depth < 8 && ancestor && ancestor > 1; depth += 1) {
     const process = byPid.get(ancestor);
-    if (!process || !/^(codex|claude|node|tmux)/i.test(process.name)) break;
+    if (!process || !/^(codex|claude|grok|node|tmux)/i.test(process.name)) break;
     if (!chatLinkedPids.has(process.pid)) system.add(process.pid);
     ancestor = process.parentPid;
   }
@@ -177,6 +180,7 @@ export class SystemMetricsService {
   private collecting = false;
   private latest?: SystemSnapshot;
   private readonly recent: SystemSnapshot[] = [];
+  private lastNetworkCollectionAt = 0;
   private lastProcessCollectionAt = 0;
   private lastDiskCollectionAt = 0;
 
@@ -212,15 +216,24 @@ export class SystemMetricsService {
     this.collecting = true;
     try {
       const collectedAt = this.now();
+      const refreshNetworks = !this.latest || collectedAt - this.lastNetworkCollectionAt >= NETWORK_METRICS_INTERVAL_MS;
       const refreshProcesses = !this.latest || collectedAt - this.lastProcessCollectionAt >= PROCESS_METRICS_INTERVAL_MS;
       const refreshDisks = !this.latest || collectedAt - this.lastDiskCollectionAt >= DISK_METRICS_INTERVAL_MS;
-      const [load, memory, networks, processResult, diskResult] = await Promise.all([
+      const [load, memory, networkResult, processResult, diskResult] = await Promise.all([
         this.runtime.currentLoad(),
         this.runtime.mem(),
-        this.runtime.networkStats(),
+        refreshNetworks ? this.runtime.networkStats() : Promise.resolve(null),
         refreshProcesses ? this.runtime.processes() : Promise.resolve(null),
         refreshDisks ? this.runtime.fsSize() : Promise.resolve(null),
       ]);
+      let networkSnapshot = this.latest?.network ?? { rxBytes: 0, txBytes: 0 };
+      if (networkResult) {
+        networkSnapshot = {
+          rxBytes: networkResult.reduce((sum, item) => sum + item.rx_bytes, 0),
+          txBytes: networkResult.reduce((sum, item) => sum + item.tx_bytes, 0),
+        };
+        this.lastNetworkCollectionAt = collectedAt;
+      }
       let processSnapshot = this.latest?.processes ?? [];
       if (processResult) {
         const chats = this.database.prepare(`
@@ -232,7 +245,7 @@ export class SystemMetricsService {
         // 채팅 매핑을 먼저 확정한 뒤 남은 프로세스에서 시스템을 골라야 채팅 소속이 시스템으로 흡수되지 않는다.
         const systemPids = classifySystemProcesses(processResult.list, new Set(pidToChat.keys()), this.serverPid);
         processSnapshot = processResult.list
-          .filter((process) => /^(codex|claude|node|tmux)/i.test(process.name))
+          .filter((process) => /^(codex|claude|grok|node|tmux)/i.test(process.name))
           // systeminformation의 memRss는 KiB 단위인데 화면은 바이트로 포맷해 실제보다 1024배 작게
           // 보였다(claude 421MB가 0.4MB로 표시됨, 2026-08-06 확인) — 여기서 바이트로 맞춰 내보낸다.
           .map((process) => {
@@ -267,7 +280,7 @@ export class SystemMetricsService {
         loadAverage: [load.avgLoad, load.currentLoadUser, load.currentLoadSystem],
         memory: { total: memory.total, used: memory.used, available: memory.available, swapTotal: memory.swaptotal, swapUsed: memory.swapused },
         disks: diskSnapshot,
-        network: { rxBytes: networks.reduce((sum, item) => sum + item.rx_bytes, 0), txBytes: networks.reduce((sum, item) => sum + item.tx_bytes, 0) },
+        network: networkSnapshot,
         processes: processSnapshot,
         uptimeSeconds: this.runtime.uptime(),
         sessions: counts,

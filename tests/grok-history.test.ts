@@ -100,6 +100,32 @@ const AUTO_MODE_SCREEN = [
   "  Shift+Tab:mode  │  Ctrl+x:shortcuts",
 ].join("\n");
 
+describe("GrokAdapter 실행 명령", () => {
+  it("새 대화에는 --session-id를 붙이고 resume에는 --resume만 쓴다", () => {
+    const adapter = new GrokAdapter();
+    expect(adapter.supportsNewSessionId).toBe(true);
+    expect(adapter.createLaunch("/tmp").args).toEqual([]);
+    expect(adapter.createLaunch("/tmp", undefined, "01a022ac-049f-7a93-b983-32c76000c809").args).toEqual([
+      "--session-id", "01a022ac-049f-7a93-b983-32c76000c809",
+    ]);
+    expect(adapter.createLaunch("/tmp", "01a022ac-049f-7a93-b983-32c76000c809", "ignored").args).toEqual([
+      "--resume", "01a022ac-049f-7a93-b983-32c76000c809",
+    ]);
+  });
+
+  it("pinned project profile의 sandbox·승인·모델·도구 경계를 argv로 적용한다", () => {
+    const adapter = new GrokAdapter();
+    expect(adapter.createLaunch("/tmp", undefined, "01a022ac-049f-7a93-b983-32c76000c809", {
+      sandbox: "workspace-write", approvalMode: "never", model: "grok-profile", reasoningEffort: "high",
+      additionalWritePaths: [], allowedTools: ["git status"], disallowedTools: ["curl"],
+    }).args).toEqual([
+      "--sandbox", "workspace", "--permission-mode", "dontAsk", "--model", "grok-profile",
+      "--reasoning-effort", "high", "--allow", "git status", "--deny", "curl",
+      "--session-id", "01a022ac-049f-7a93-b983-32c76000c809",
+    ]);
+  });
+});
+
 describe("GrokAdapter 기록 파싱", () => {
   it("사람이 친 발화만 사용자 메시지로 남기고 CLI 주입 블록과 내부 사고는 제외한다", () => {
     const adapter = new GrokAdapter();
@@ -143,6 +169,17 @@ describe("GrokAdapter 기록 파싱", () => {
   it("turn_ended가 아직 없으면 턴 종료 시각도 비어 있다", () => {
     const adapter = new GrokAdapter();
     const { chatHistory } = writeSession(SAMPLE_RECORDS, { events: [{ ts: "2026-08-18T03:54:00.000Z", type: "turn_started" }] });
+    expect(adapter.parseHistoryFile(chatHistory)!.turnEndedAt).toBeNull();
+  });
+
+  it("사람 발화가 턴 종료보다 많으면 현재 턴이 아직 끝난 것이 아니다", () => {
+    const adapter = new GrokAdapter();
+    const secondUser = { type: "user", content: [{ type: "text", text: "<user_query>\n이어서 확인해줘\n</user_query>" }], prompt_index: 1 };
+    const { chatHistory } = writeSession([...SAMPLE_RECORDS, secondUser], {
+      events: [
+        { ts: "2026-08-18T03:54:20.000Z", type: "turn_ended", outcome: "completed" },
+      ],
+    });
     expect(adapter.parseHistoryFile(chatHistory)!.turnEndedAt).toBeNull();
   });
 
@@ -449,5 +486,12 @@ describe("GrokAdapter 사용량", () => {
     const usage = adapter.parseUsage("You are not authenticated.");
     expect(usage.error_code).toBe("auth_required");
     expect(usage.data_status).toBe("unavailable");
+  });
+});
+
+describe("Grok 훅 실행 환경(#96)", () => {
+  it("전역 훅 브리지가 쓸 토큰 환경을 채팅 실행에 싣는다", () => {
+    const adapter = new GrokAdapter({ WEB_AGENT_MANAGER_HOOK_TOKEN: "t" });
+    expect(adapter.createLaunch("/tmp").env).toEqual({ WEB_AGENT_MANAGER_HOOK_TOKEN: "t" });
   });
 });

@@ -151,11 +151,12 @@ function McpEditor({ provider, project, selected, creating, reload, cancelCreate
       <label className="span-2">CWD<input value={cwd} onChange={(event) => setCwd(event.target.value)} placeholder="/path/to/project" /></label>
       <label className="span-2">Env JSON<textarea value={env} onChange={(event) => setEnv(event.target.value)} placeholder={envHint} rows={3} /></label>
       <label className="span-2">Headers JSON<textarea value={headers} onFocus={() => activateTransport("http")} onChange={(event) => { activateTransport("http"); setHeaders(event.target.value); }} placeholder={headerHint} rows={3} /></label>
-      {provider === "codex" ? <label className="mcp-enabled"><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} />활성화</label> : <span className="inline-status">Claude MCP는 공식 설정상 비활성 토글 대신 삭제/재추가로 관리합니다.</span>}
+      {provider === "claude" ? <span className="inline-status">Claude MCP는 공식 설정상 비활성 토글 대신 삭제/재추가로 관리합니다.</span> : <label className="mcp-enabled"><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} />활성화</label>}
     </div>
     <div className="tool-actions">
       <button className="primary" type="submit">{creating ? "추가" : "저장"}</button>
-      {!creating && selected && provider === "codex" && <button type="button" onClick={() => void toggle()}>{enabled ? "비활성화" : "활성화"}</button>}
+      {/* Codex·Grok은 config.toml의 enabled 토글을 지원하고 Claude만 삭제/재추가다. "codex가 아니면 Claude"로 묶으면 Grok이 Claude 취급된다. */}
+      {!creating && selected && provider !== "claude" && <button type="button" onClick={() => void toggle()}>{enabled ? "비활성화" : "활성화"}</button>}
       {!creating && selected && <button className="danger" type="button" onClick={() => void remove()}>삭제</button>}
       {creating && <button type="button" onClick={cancelCreate}>취소</button>}
       {status && <span className="inline-status">{status}</span>}

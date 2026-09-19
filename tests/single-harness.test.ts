@@ -12,6 +12,7 @@ import type {
   RuntimeRunInput,
   RuntimeSnapshot,
 } from "../src/server/experiments/agent-runtime";
+import { FINDING_REPORT_CONTRACT_INSTRUCTION } from "../src/server/experiments/finding-output";
 import { ExperimentHookBus } from "../src/server/experiments/hook-bus";
 import { SingleHarness } from "../src/server/experiments/single-harness";
 import { ExperimentRepository } from "../src/server/services/experiment-repository";
@@ -24,7 +25,7 @@ afterEach(() => {
 });
 
 // 테스트마다 독립된 SQLite 실험과 single run을 만든다.
-function createRun(overrides: Partial<ExperimentVariantConfig> = {}) {
+function createRun(overrides: Partial<ExperimentVariantConfig> = {}, outputContract?: "code_change" | "finding_report") {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wam-single-harness-"));
   const database = openDatabase({
     rootDir: root, dataDir: root, homeDir: root, host: "127.0.0.1", port: 0,
@@ -42,7 +43,7 @@ function createRun(overrides: Partial<ExperimentVariantConfig> = {}) {
     hooks: [], budget: { maxSeconds: 60, maxTokens: 1_000, maxCostUsd: 5 },
     ...overrides,
   };
-  const experiment = repository.createExperiment({ projectId, name: "single", command: "원래 명령" });
+  const experiment = repository.createExperiment({ projectId, name: "single", command: "원래 명령", outputContract });
   const variant = repository.createVariant({ experimentId: experiment.id, name: "기본", config });
   const run = repository.createRun({ variantId: variant.id, workingDirectory: root });
   return { database, repository, run };
@@ -51,6 +52,7 @@ function createRun(overrides: Partial<ExperimentVariantConfig> = {}) {
 // 지정 이벤트를 순서대로 내보내며 전달된 prompt와 취소 호출을 관측한다.
 class FakeRuntime implements AgentRuntime {
   inputs: RuntimeRunInput[] = [];
+  prepares: RuntimePrepareInput[] = [];
   cancelCalls = 0;
   onResume?: (input: RuntimeResumeInput) => void;
 
@@ -58,6 +60,7 @@ class FakeRuntime implements AgentRuntime {
 
   // 고정된 가짜 CLI provenance를 반환한다.
   async prepare(input: RuntimePrepareInput): Promise<RuntimeSnapshot> {
+    this.prepares.push(input);
     return {
       provider: input.config.runtime.provider, cliVersion: "fake-1", resolvedModel: input.config.runtime.model,
       toolProfile: { transport: "fake" }, permissionProfile: { sandbox: input.config.runtime.sandbox },
@@ -275,6 +278,79 @@ describe("SingleHarness", () => {
     expect(await pending).toMatchObject({ terminationReason: "cancelled" });
     expect(limitChecks).toBe(0);
   });
+
+  it("finding_report 형식 실패는 completed로 두고 malformed만 남기며 스키마를 넘긴다", async () => {
+    const { repository, run } = createRun({}, "finding_report");
+    const runtime = new FakeRuntime(async function* () {
+      yield at({ type: "completed", result: { findings: "not-an-array" } });
+    });
+    const completed = await new SingleHarness({ repository, runtimes: { codex: runtime } }).execute(run.id);
+    expect(completed).toMatchObject({ status: "completed", terminationReason: "success", outputStatus: "malformed" });
+    expect(completed.observation).toMatchObject({ outputError: expect.stringContaining("배열이어야") });
+    expect(runtime.prepares[0]?.outputSchema).toMatchObject({ required: ["findings"] });
+    expect(runtime.inputs[0]?.outputSchema).toMatchObject({ required: ["findings"] });
+    expect(runtime.inputs[0]?.prompt).toContain("결함 보고 계약:");
+    expect(completed.environmentSnapshot.findingReportContract).toEqual({
+      instruction: expect.stringContaining("결함 보고 계약:"),
+    });
+  });
+
+  it("finding_report 유효 보고는 정답과 대조한 관찰을 남긴다", async () => {
+    const { database, repository, run } = createRun({}, "finding_report");
+    const fixture = repository.createFixture({
+      name: "review-gt", url: "https://github.com/example/repo", pinnedCommit: "a".repeat(40),
+      sizeClass: "small", setupCommand: [], testCommand: [],
+      groundTruth: [{
+        id: "gt-1", file: "src/app.ts", lineStart: 10, lineEnd: 12, category: "correctness",
+        severity: "major", mustFind: true, rationale: "경계",
+      }],
+    });
+    database.prepare("UPDATE experiments SET fixture_id = ? WHERE id = (SELECT experiment_id FROM experiment_runs WHERE id = ?)")
+      .run(fixture.id, run.id);
+
+    const runtime = new FakeRuntime(async function* () {
+      yield at({
+        type: "completed",
+        result: {
+          findings: [{
+            file: "src/app.ts", lineStart: 10, lineEnd: 12, category: "correctness",
+            severity: "major", title: "경계 오류",
+          }],
+        },
+      });
+    });
+    const completed = await new SingleHarness({ repository, runtimes: { codex: runtime } }).execute(run.id);
+    expect(completed.outputStatus).toBe("ok");
+    expect(completed.observation).toMatchObject({
+      report: { findings: [expect.objectContaining({ title: "경계 오류", file: "src/app.ts" })] },
+      findingScore: expect.objectContaining({ mustFindFound: 1, falsePositives: 0 }),
+      toolCallCount: 0,
+    });
+  });
+
+  it("finding_report는 tool_started만 세고 finished는 더하지 않는다", async () => {
+    const empty = createRun({}, "finding_report");
+    const idle = new FakeRuntime(async function* () {
+      yield at({ type: "completed", result: { findings: [] } });
+    });
+    expect((await new SingleHarness({
+      repository: empty.repository, runtimes: { codex: idle },
+    }).execute(empty.run.id)).observation).toMatchObject({ toolCallCount: 0, hadNonEmptyDiff: false });
+
+    const active = createRun({}, "finding_report");
+    const tools = new FakeRuntime(async function* () {
+      yield at({ type: "tool_started", name: "Read", payload: {}, toolCallId: "t1" });
+      yield at({ type: "tool_finished", name: "tool_result", payload: {}, toolCallId: "t1" });
+      yield at({ type: "tool_started", name: "Read", payload: {}, toolCallId: "t2" });
+      yield at({ type: "tool_finished", name: "tool_result", payload: {}, toolCallId: "t2" });
+      yield at({ type: "tool_started", name: "Read", payload: {}, toolCallId: "t3" });
+      yield at({ type: "tool_finished", name: "tool_result", payload: {}, toolCallId: "t3" });
+      yield at({ type: "completed", result: { findings: [] } });
+    });
+    expect((await new SingleHarness({
+      repository: active.repository, runtimes: { codex: tools },
+    }).execute(active.run.id)).observation).toMatchObject({ toolCallCount: 3 });
+  });
 });
 
 describe("명시 호출 활성화", () => {
@@ -288,6 +364,7 @@ describe("명시 호출 활성화", () => {
       repository: target.repository, runtimes: { codex: runtime }, promptPrefix: "/caveman",
     }).execute(target.run.id);
     expect(runtime.inputs[0]?.prompt).toBe("/caveman\n\n원래 명령");
+    expect(target.repository.getRun(target.run.id)?.environmentSnapshot).not.toHaveProperty("findingReportContract");
 
     // 접두가 없으면 공유 과제 문구가 그대로 간다.
     const control = createRun();
@@ -297,5 +374,20 @@ describe("명시 호출 활성화", () => {
     });
     await new SingleHarness({ repository: control.repository, runtimes: { codex: plain } }).execute(control.run.id);
     expect(plain.inputs[0]?.prompt).toBe("원래 명령");
+  });
+
+  it("finding_report는 접두·과제·계약을 이 순서로 붙이고 스냅샷에 같은 문구를 남긴다", async () => {
+    const target = createRun({}, "finding_report");
+    const runtime = new FakeRuntime(async function* () {
+      yield at({ type: "completed", result: { findings: [] } });
+    });
+    const completed = await new SingleHarness({
+      repository: target.repository, runtimes: { codex: runtime }, promptPrefix: "/caveman",
+    }).execute(target.run.id);
+
+    expect(runtime.inputs[0]?.prompt).toBe(`/caveman\n\n원래 명령\n\n${FINDING_REPORT_CONTRACT_INSTRUCTION}`);
+    expect(completed.environmentSnapshot.findingReportContract).toEqual({
+      instruction: FINDING_REPORT_CONTRACT_INSTRUCTION,
+    });
   });
 });

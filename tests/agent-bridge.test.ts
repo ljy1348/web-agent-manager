@@ -53,6 +53,80 @@ afterEach(() => {
   for (const root of temporaryRoots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
+// 위임 완료 후 세션 정리 조건을 가짜 SessionManager로 검증한다.
+async function runDelegationCompletion(options: {
+  origin: "user" | "delegation";
+  busyAtComplete?: number;
+  extraUnfinished?: boolean;
+  stopImpl?: (chatId: number) => Promise<void>;
+}): Promise<{
+  completed: { delegation: { status: string }; result: { response: string } };
+  stopped: number[];
+  database: AppDatabase;
+}> {
+  const dataDir = createRoot("web-agent-manager-bridge-stop-data-");
+  const projectPath = createRoot("web-agent-manager-bridge-stop-project-");
+  const database = createDatabase(dataDir);
+  database.prepare("INSERT INTO projects(id, name, path) VALUES (1, 'sample', ?)").run(projectPath);
+  database.prepare(`
+    INSERT INTO chats(id, project_id, provider, tmux_name, status, title, history_file, busy, origin)
+    VALUES (1, 1, 'codex', 'web_agent_manager_chat_1', 'running', '부모 작업', 'codex.jsonl', 0, 'user')
+  `).run();
+  database.prepare(`
+    INSERT INTO chats(id, project_id, provider, tmux_name, status, title, history_file, busy, origin)
+    VALUES (2, 1, 'claude', 'web_agent_manager_chat_2', 'running', '자식 작업', 'claude.jsonl', 0, ?)
+  `).run(options.origin);
+  if (options.extraUnfinished) {
+    database.prepare(`
+      INSERT INTO delegations(id, idempotency_key, depth, source_chat_id, target_chat_id, prompt, status, baseline_message_count)
+      VALUES ('pending-other', 'pending-other', 0, 1, 2, '이전 라운드', 'sent', 0)
+    `).run();
+  }
+  const stopped: number[] = [];
+  const messages: Array<{ id: string; role: "user" | "assistant"; kind: string; content: string; createdAt: string }> = [];
+  const bridge = new AgentBridge({
+    database,
+    adapters: [
+      { id: "codex", displayLabel: "Codex" },
+      { id: "claude", displayLabel: "Claude" },
+    ] as unknown as ProviderAdapter[],
+    historyCache: {
+      get: () => ({ messages, turnEndedAt: null }),
+    } as unknown as HistoryCache,
+    sessions: {
+      start: () => undefined,
+      sendPrompt: async (_chatId: number, text: string) => {
+        messages.push({ id: "user-1", role: "user", kind: "text", content: text, createdAt: "2026-08-21T09:00:00.000Z" });
+        messages.push({
+          id: "assistant-1",
+          role: "assistant",
+          kind: "turn_end",
+          content: "자식 작업이 끝났습니다.",
+          createdAt: "2026-08-21T09:00:01.000Z",
+        });
+        database.prepare("UPDATE chats SET busy = ? WHERE id = 2").run(options.busyAtComplete ?? 0);
+        return text;
+      },
+      stop: async (chatId: number) => {
+        stopped.push(chatId);
+        await options.stopImpl?.(chatId);
+      },
+    } as unknown as Pick<SessionManager, "start" | "sendPrompt" | "stop">,
+    socketPath: path.join(dataDir, "web-agent-manager-agent.sock"),
+  });
+  const completed = await bridge.execute({
+    method: "delegation.send_wait",
+    params: {
+      sourceChatId: 1,
+      targetChatId: 2,
+      prompt: "자식 채팅에서 이어서 처리하세요.",
+      idempotencyKey: `stop-${options.origin}-${options.busyAtComplete ?? 0}-${options.extraUnfinished ? "extra" : "solo"}`,
+      timeoutSeconds: 2,
+    },
+  }) as { delegation: { status: string }; result: { response: string } };
+  return { completed, stopped, database };
+}
+
 describe("로컬 에이전트 브리지", () => {
   it("채팅 번호의 문맥을 읽고 동일 키 작업 전달을 한 번만 전송한다", async () => {
     const dataDir = createRoot("web-agent-manager-bridge-data-");
@@ -133,6 +207,92 @@ describe("로컬 에이전트 브리지", () => {
     database.close();
   });
 
+  it("부모 ID가 없어도 A→B 다음 B→A 순환 위임을 거부한다", async () => {
+    const dataDir = createRoot("web-agent-manager-bridge-cycle-data-");
+    const projectPath = createRoot("web-agent-manager-bridge-cycle-project-");
+    const database = createDatabase(dataDir);
+    database.prepare("INSERT INTO projects(id, name, path) VALUES (1, 'sample', ?)").run(projectPath);
+    database.prepare(`
+      INSERT INTO chats(id, project_id, provider, tmux_name, status, title)
+      VALUES (1, 1, 'codex', 'web_agent_manager_chat_1', 'running', 'A')
+    `).run();
+    database.prepare(`
+      INSERT INTO chats(id, project_id, provider, tmux_name, status, title)
+      VALUES (2, 1, 'claude', 'web_agent_manager_chat_2', 'running', 'B')
+    `).run();
+    const sent: Array<{ chatId: number; text: string }> = [];
+    const bridge = new AgentBridge({
+      database,
+      adapters: [
+        { id: "codex", displayLabel: "Codex" },
+        { id: "claude", displayLabel: "Claude" },
+      ] as unknown as ProviderAdapter[],
+      historyCache: {} as HistoryCache,
+      sessions: {
+        start: () => undefined,
+        sendPrompt: async (chatId: number, text: string) => { sent.push({ chatId, text }); },
+      } as unknown as Pick<SessionManager, "start" | "sendPrompt">,
+      socketPath: path.join(dataDir, "web-agent-manager-agent.sock"),
+    });
+
+    const first = await bridge.execute({
+      method: "delegation.send",
+      params: { sourceChatId: 1, targetChatId: 2, prompt: "A에서 B로", idempotencyKey: "a-to-b" },
+    }) as { delegation: { status: string; depth: number } };
+    const circular = bridge.execute({
+      method: "delegation.send",
+      params: { sourceChatId: 2, targetChatId: 1, prompt: "B에서 A로", idempotencyKey: "b-to-a" },
+    });
+
+    expect(first.delegation.status).toBe("sent");
+    expect(first.delegation.depth).toBe(0);
+    await expect(circular).rejects.toThrow("조상 채팅으로 작업을 다시 전달할 수 없습니다.");
+    expect(sent).toEqual([{ chatId: 2, text: "A에서 B로" }]);
+    database.close();
+  });
+
+  it("부모 ID가 없어도 기존 위임 체인 깊이를 계산해 4단계를 넘기면 거부한다", async () => {
+    const dataDir = createRoot("web-agent-manager-bridge-depth-data-");
+    const projectPath = createRoot("web-agent-manager-bridge-depth-project-");
+    const database = createDatabase(dataDir);
+    database.prepare("INSERT INTO projects(id, name, path) VALUES (1, 'sample', ?)").run(projectPath);
+    for (let id = 1; id <= 7; id += 1) {
+      database.prepare(`
+        INSERT INTO chats(id, project_id, provider, tmux_name, status, title)
+        VALUES (?, 1, 'codex', 'web_agent_manager_chat_' || ?, 'running', '채팅 ' || ?)
+      `).run(id, id, id);
+    }
+    const bridge = new AgentBridge({
+      database,
+      adapters: [{ id: "codex", displayLabel: "Codex" }] as unknown as ProviderAdapter[],
+      historyCache: {} as HistoryCache,
+      sessions: {
+        start: () => undefined,
+        sendPrompt: async () => undefined,
+      } as unknown as Pick<SessionManager, "start" | "sendPrompt">,
+      socketPath: path.join(dataDir, "web-agent-manager-agent.sock"),
+    });
+
+    for (let hop = 0; hop < 5; hop += 1) {
+      const result = await bridge.execute({
+        method: "delegation.send",
+        params: {
+          sourceChatId: hop + 1,
+          targetChatId: hop + 2,
+          prompt: `${hop}단계`,
+          idempotencyKey: `depth-${hop}`,
+        },
+      }) as { delegation: { depth: number; status: string } };
+      expect(result.delegation.status).toBe("sent");
+      expect(result.delegation.depth).toBe(hop);
+    }
+    await expect(bridge.execute({
+      method: "delegation.send",
+      params: { sourceChatId: 6, targetChatId: 7, prompt: "5단계 초과", idempotencyKey: "depth-5" },
+    })).rejects.toThrow("작업 전달 깊이는 4단계까지 허용합니다.");
+    database.close();
+  });
+
   it("createNew 위임은 같은 공급자의 기존 채팅 대신 새 자식 채팅을 만든다", async () => {
     const dataDir = createRoot("web-agent-manager-bridge-data-");
     const projectPath = createRoot("web-agent-manager-bridge-project-");
@@ -178,6 +338,60 @@ describe("로컬 에이전트 브리지", () => {
     expect(result.delegation.target_chat_id).not.toBe(2);
     expect(started).toEqual([result.delegation.target_chat_id]);
     expect(sent).toEqual([{ chatId: result.delegation.target_chat_id, text: "별도 세션에서 검증하세요." }]);
+    expect((database.prepare("SELECT origin FROM chats WHERE id = ?").get(result.delegation.target_chat_id) as { origin: string }).origin).toBe("delegation");
+    expect((database.prepare("SELECT origin FROM chats WHERE id = 2").get() as { origin: string }).origin).toBe("user");
+    database.close();
+  });
+
+  it("Grok 채팅에도 위임하고 등록되지 않은 공급자는 거부한다", async () => {
+    const dataDir = createRoot("web-agent-manager-bridge-grok-data-");
+    const projectPath = createRoot("web-agent-manager-bridge-grok-project-");
+    const database = createDatabase(dataDir);
+    database.prepare("INSERT INTO projects(id, name, path) VALUES (1, 'sample', ?)").run(projectPath);
+    database.prepare(`
+      INSERT INTO chats(id, project_id, provider, tmux_name, status, title)
+      VALUES (1, 1, 'claude', 'web_agent_manager_chat_1', 'running', '부모 작업')
+    `).run();
+    const started: number[] = [];
+    const sent: Array<{ chatId: number; text: string }> = [];
+    const bridge = new AgentBridge({
+      database,
+      adapters: [
+        { id: "codex", displayLabel: "Codex" },
+        { id: "claude", displayLabel: "Claude" },
+        { id: "grok", displayLabel: "Grok" },
+      ] as unknown as ProviderAdapter[],
+      historyCache: {} as HistoryCache,
+      sessions: {
+        start: (chatId: number) => { started.push(chatId); },
+        sendPrompt: async (chatId: number, text: string) => { sent.push({ chatId, text }); },
+      } as unknown as Pick<SessionManager, "start" | "sendPrompt">,
+      socketPath: path.join(dataDir, "web-agent-manager-agent.sock"),
+    });
+
+    const result = await bridge.execute({
+      method: "delegation.send",
+      params: {
+        sourceChatId: 1,
+        projectId: 1,
+        provider: "grok",
+        prompt: "Grok에서 독립 구현하세요.",
+        idempotencyKey: "new-grok-child",
+        createNew: true,
+      },
+    }) as { delegation: { target_chat_id: number; status: string } };
+
+    expect(result.delegation).toMatchObject({ status: "sent" });
+    expect(started).toEqual([result.delegation.target_chat_id]);
+    expect(sent).toEqual([{ chatId: result.delegation.target_chat_id, text: "Grok에서 독립 구현하세요." }]);
+    const targetProvider = database.prepare("SELECT provider FROM chats WHERE id = ?")
+      .get(result.delegation.target_chat_id) as { provider: string };
+    expect(targetProvider.provider).toBe("grok");
+
+    await expect(bridge.execute({
+      method: "delegation.send",
+      params: { projectId: 1, provider: "gemini", prompt: "지원하지 않는 공급자", idempotencyKey: "unsupported" },
+    })).rejects.toThrow(/codex 또는 claude 또는 grok/);
     database.close();
   });
 
@@ -195,6 +409,7 @@ describe("로컬 에이전트 브리지", () => {
       VALUES (2, 1, 'claude', 'web_agent_manager_chat_2', 'running', '자식 작업', 'claude.jsonl', 0)
     `).run();
     const messages: Array<{ id: string; role: "user" | "assistant"; kind: string; content: string; createdAt: string }> = [];
+    let turnEndedAt: string | null = null;
     const bridge = new AgentBridge({
       database,
       adapters: [
@@ -202,7 +417,7 @@ describe("로컬 에이전트 브리지", () => {
         { id: "claude", displayLabel: "Claude" },
       ] as unknown as ProviderAdapter[],
       historyCache: {
-        get: () => ({ messages }),
+        get: () => ({ messages, turnEndedAt }),
       } as unknown as HistoryCache,
       sessions: {
         start: () => undefined,
@@ -212,6 +427,7 @@ describe("로컬 에이전트 브리지", () => {
           database.prepare("UPDATE chats SET busy = 1 WHERE id = 2").run();
           setTimeout(() => {
             messages.push({ id: "assistant-1", role: "assistant", kind: "message", content: "검증 결과: 수정안이 안전합니다.", createdAt: new Date().toISOString() });
+            turnEndedAt = new Date().toISOString();
             database.prepare("UPDATE chats SET busy = 0 WHERE id = 2").run();
           }, 30);
           return delivered;
@@ -238,6 +454,763 @@ describe("로컬 에이전트 브리지", () => {
     expect(stored.history_prompt).toContain("[첨부:");
     expect(JSON.parse(stored.result_json)).toMatchObject({ response: "검증 결과: 수정안이 안전합니다." });
     expect(stored.completed_at).toBeTruthy();
+    database.close();
+  });
+
+  it("전달 이후 assistant가 있고 busy가 0이어도 턴이 안 끝났으면 완료로 확정하지 않는다", async () => {
+    const dataDir = createRoot("web-agent-manager-bridge-premature-data-");
+    const projectPath = createRoot("web-agent-manager-bridge-premature-project-");
+    const database = createDatabase(dataDir);
+    database.prepare("INSERT INTO projects(id, name, path) VALUES (1, 'sample', ?)").run(projectPath);
+    database.prepare(`
+      INSERT INTO chats(id, project_id, provider, tmux_name, status, title, history_file, busy)
+      VALUES (1, 1, 'codex', 'web_agent_manager_chat_1', 'running', '부모 작업', 'codex.jsonl', 0)
+    `).run();
+    database.prepare(`
+      INSERT INTO chats(id, project_id, provider, tmux_name, status, title, history_file, busy)
+      VALUES (2, 1, 'grok', 'web_agent_manager_chat_2', 'running', '자식 작업', 'grok.jsonl', 0)
+    `).run();
+    const messages: Array<{ id: string; role: "user" | "assistant"; kind: string; content: string; createdAt: string }> = [];
+    const bridge = new AgentBridge({
+      database,
+      adapters: [
+        { id: "codex", displayLabel: "Codex" },
+        { id: "grok", displayLabel: "Grok" },
+      ] as unknown as ProviderAdapter[],
+      historyCache: {
+        get: () => ({ messages, turnEndedAt: null }),
+      } as unknown as HistoryCache,
+      sessions: {
+        start: () => undefined,
+        sendPrompt: async (_chatId: number, text: string) => {
+          messages.push({ id: "user-1", role: "user", kind: "text", content: text, createdAt: "2026-08-21T04:00:00.000Z" });
+          messages.push({
+            id: "assistant-mid",
+            role: "assistant",
+            kind: "text",
+            content: "관련 수정과 보고는 위에서 마무리했습니다.",
+            createdAt: "2026-08-21T04:00:01.000Z",
+          });
+          database.prepare("UPDATE chats SET busy = 0 WHERE id = 2").run();
+          return text;
+        },
+      } as unknown as Pick<SessionManager, "start" | "sendPrompt">,
+      socketPath: path.join(dataDir, "web-agent-manager-agent.sock"),
+    });
+
+    const waited = await bridge.execute({
+      method: "delegation.send_wait",
+      params: {
+        sourceChatId: 1,
+        targetChatId: 2,
+        prompt: "장문 작업을 이어서 처리하세요.",
+        idempotencyKey: "premature-idle-result",
+        timeoutSeconds: 1,
+      },
+    }) as { timedOut?: boolean; delegation: { status: string; completed_at: string | null }; result: { response?: string } | null };
+
+    expect(waited.timedOut).toBe(true);
+    expect(waited.delegation.status).not.toBe("completed");
+    expect(waited.delegation.completed_at).toBeFalsy();
+    expect(waited.result).toBeNull();
+    const stored = database.prepare("SELECT result_json, completed_at FROM delegations WHERE idempotency_key = ?")
+      .get("premature-idle-result") as { result_json: string | null; completed_at: string | null };
+    expect(stored.result_json).toBeNull();
+    expect(stored.completed_at).toBeNull();
+    database.close();
+  });
+
+  it("도구 호출 전 중간 응답을 건너뛰고 턴이 끝난 뒤의 최종 응답을 회수한다", async () => {
+    const dataDir = createRoot("web-agent-manager-bridge-turn-end-data-");
+    const projectPath = createRoot("web-agent-manager-bridge-turn-end-project-");
+    const database = createDatabase(dataDir);
+    database.prepare("INSERT INTO projects(id, name, path) VALUES (1, 'sample', ?)").run(projectPath);
+    database.prepare(`
+      INSERT INTO chats(id, project_id, provider, tmux_name, status, title, history_file, busy)
+      VALUES (1, 1, 'codex', 'web_agent_manager_chat_1', 'running', '부모 작업', 'codex.jsonl', 0)
+    `).run();
+    database.prepare(`
+      INSERT INTO chats(id, project_id, provider, tmux_name, status, title, history_file, busy)
+      VALUES (2, 1, 'grok', 'web_agent_manager_chat_2', 'running', '자식 작업', 'grok.jsonl', 0)
+    `).run();
+    const messages: Array<{ id: string; role: "user" | "assistant"; kind: string; content: string; createdAt: string }> = [];
+    let turnEndedAt: string | null = null;
+    const bridge = new AgentBridge({
+      database,
+      adapters: [
+        { id: "codex", displayLabel: "Codex" },
+        { id: "grok", displayLabel: "Grok" },
+      ] as unknown as ProviderAdapter[],
+      historyCache: {
+        get: () => ({ messages, turnEndedAt }),
+      } as unknown as HistoryCache,
+      sessions: {
+        start: () => undefined,
+        sendPrompt: async (_chatId: number, text: string) => {
+          messages.push({ id: "user-1", role: "user", kind: "text", content: text, createdAt: "2026-08-21T04:10:00.000Z" });
+          messages.push({
+            id: "assistant-mid",
+            role: "assistant",
+            kind: "text",
+            content: "회귀 테스트는 통과했습니다. 전체 vitest를 돌리겠습니다.",
+            createdAt: "2026-08-21T04:10:01.000Z",
+          });
+          database.prepare("UPDATE chats SET busy = 0 WHERE id = 2").run();
+          setTimeout(() => {
+            messages.push({
+              id: "assistant-final",
+              role: "assistant",
+              kind: "text",
+              content: "재현·원인·수정·테스트를 담은 최종 보고입니다.",
+              createdAt: "2026-08-21T04:10:08.000Z",
+            });
+            turnEndedAt = "2026-08-21T04:10:09.000Z";
+          }, 40);
+          return text;
+        },
+      } as unknown as Pick<SessionManager, "start" | "sendPrompt">,
+      socketPath: path.join(dataDir, "web-agent-manager-agent.sock"),
+    });
+
+    const completed = await bridge.execute({
+      method: "delegation.send_wait",
+      params: {
+        sourceChatId: 1,
+        targetChatId: 2,
+        prompt: "장문 작업을 이어서 처리하고 최종 보고를 남기세요.",
+        idempotencyKey: "wait-for-turn-end",
+        timeoutSeconds: 2,
+      },
+    }) as { timedOut?: boolean; delegation: { status: string; completed_at: string }; result: { response: string } };
+
+    expect(completed.timedOut).toBeFalsy();
+    expect(completed.delegation.status).toBe("completed");
+    expect(completed.result.response).toBe("재현·원인·수정·테스트를 담은 최종 보고입니다.");
+    const stored = database.prepare("SELECT result_json FROM delegations WHERE idempotency_key = ?")
+      .get("wait-for-turn-end") as { result_json: string };
+    expect(JSON.parse(stored.result_json)).toMatchObject({ response: "재현·원인·수정·테스트를 담은 최종 보고입니다." });
+    database.close();
+  });
+
+  it("프롬프트 전에 끝난 턴의 종료 시각만으로는 새 위임을 완료하지 않는다", async () => {
+    const dataDir = createRoot("web-agent-manager-bridge-stale-turn-data-");
+    const projectPath = createRoot("web-agent-manager-bridge-stale-turn-project-");
+    const database = createDatabase(dataDir);
+    database.prepare("INSERT INTO projects(id, name, path) VALUES (1, 'sample', ?)").run(projectPath);
+    database.prepare(`
+      INSERT INTO chats(id, project_id, provider, tmux_name, status, title, history_file, busy)
+      VALUES (1, 1, 'codex', 'web_agent_manager_chat_1', 'running', '부모 작업', 'codex.jsonl', 0)
+    `).run();
+    database.prepare(`
+      INSERT INTO chats(id, project_id, provider, tmux_name, status, title, history_file, busy)
+      VALUES (2, 1, 'codex', 'web_agent_manager_chat_2', 'running', '자식 작업', 'codex.jsonl', 0)
+    `).run();
+    const messages: Array<{ id: string; role: "user" | "assistant"; kind: string; content: string; createdAt: string }> = [
+      { id: "old-user", role: "user", kind: "message", content: "이전 작업", createdAt: "2026-08-21T03:00:00.000Z" },
+      { id: "old-assistant", role: "assistant", kind: "message", content: "이전 턴 완료", createdAt: "2026-08-21T03:00:01.000Z" },
+    ];
+    const bridge = new AgentBridge({
+      database,
+      adapters: [{ id: "codex", displayLabel: "Codex" }] as unknown as ProviderAdapter[],
+      historyCache: {
+        get: () => ({ messages, turnEndedAt: "2026-08-21T03:00:02.000Z" }),
+      } as unknown as HistoryCache,
+      sessions: {
+        start: () => undefined,
+        sendPrompt: async (_chatId: number, text: string) => {
+          messages.push({ id: "user-new", role: "user", kind: "message", content: text, createdAt: "2026-08-21T04:00:00.000Z" });
+          messages.push({
+            id: "assistant-mid",
+            role: "assistant",
+            kind: "message",
+            content: "테스트로 확인했습니다. turn_ended를 이미 본 뒤에는 파일이 안 바뀌면 busy가 복구되지 않습니다.",
+            createdAt: "2026-08-21T04:00:01.000Z",
+          });
+          database.prepare("UPDATE chats SET busy = 0 WHERE id = 2").run();
+          return text;
+        },
+      } as unknown as Pick<SessionManager, "start" | "sendPrompt">,
+      socketPath: path.join(dataDir, "web-agent-manager-agent.sock"),
+    });
+
+    const waited = await bridge.execute({
+      method: "delegation.send_wait",
+      params: {
+        sourceChatId: 1,
+        targetChatId: 2,
+        prompt: "새 작업을 이어서 하세요.",
+        idempotencyKey: "stale-turn-end",
+        timeoutSeconds: 1,
+      },
+    }) as { timedOut?: boolean; delegation: { status: string; completed_at: string | null }; result: { response?: string } | null };
+
+    expect(waited.timedOut).toBe(true);
+    expect(waited.delegation.completed_at).toBeFalsy();
+    expect(waited.result).toBeNull();
+    database.close();
+  });
+
+  it("세션 종료 시각이 없어도 프롬프트 이후 end_turn 응답이면 완료로 회수한다", async () => {
+    const dataDir = createRoot("web-agent-manager-bridge-claude-turn-data-");
+    const projectPath = createRoot("web-agent-manager-bridge-claude-turn-project-");
+    const database = createDatabase(dataDir);
+    database.prepare("INSERT INTO projects(id, name, path) VALUES (1, 'sample', ?)").run(projectPath);
+    database.prepare(`
+      INSERT INTO chats(id, project_id, provider, tmux_name, status, title, history_file, busy)
+      VALUES (1, 1, 'codex', 'web_agent_manager_chat_1', 'running', '부모 작업', 'codex.jsonl', 0)
+    `).run();
+    database.prepare(`
+      INSERT INTO chats(id, project_id, provider, tmux_name, status, title, history_file, busy)
+      VALUES (2, 1, 'claude', 'web_agent_manager_chat_2', 'running', '자식 작업', 'claude.jsonl', 0)
+    `).run();
+    const messages: Array<{ id: string; role: "user" | "assistant"; kind: string; content: string; createdAt: string }> = [];
+    const bridge = new AgentBridge({
+      database,
+      adapters: [
+        { id: "codex", displayLabel: "Codex" },
+        { id: "claude", displayLabel: "Claude" },
+      ] as unknown as ProviderAdapter[],
+      historyCache: {
+        get: () => ({ messages, turnEndedAt: null }),
+      } as unknown as HistoryCache,
+      sessions: {
+        start: () => undefined,
+        sendPrompt: async (_chatId: number, text: string) => {
+          messages.push({ id: "user-1", role: "user", kind: "text", content: text, createdAt: "2026-08-21T05:00:00.000Z" });
+          messages.push({
+            id: "assistant-1",
+            role: "assistant",
+            kind: "turn_end",
+            content: "Claude 턴이 끝났습니다.",
+            createdAt: "2026-08-21T05:00:02.000Z",
+          });
+          database.prepare("UPDATE chats SET busy = 0 WHERE id = 2").run();
+          return text;
+        },
+      } as unknown as Pick<SessionManager, "start" | "sendPrompt">,
+      socketPath: path.join(dataDir, "web-agent-manager-agent.sock"),
+    });
+
+    const completed = await bridge.execute({
+      method: "delegation.send_wait",
+      params: {
+        sourceChatId: 1,
+        targetChatId: 2,
+        prompt: "Claude에서 이어서 처리하세요.",
+        idempotencyKey: "claude-turn-end",
+        timeoutSeconds: 2,
+      },
+    }) as { delegation: { status: string }; result: { response: string } };
+
+    expect(completed.delegation.status).toBe("completed");
+    expect(completed.result.response).toBe("Claude 턴이 끝났습니다.");
+    database.close();
+  });
+
+  it("전달 반환 전에 턴이 이미 끝났어도 완료 응답을 놓치지 않는다", async () => {
+    const dataDir = createRoot("web-agent-manager-bridge-sync-turn-data-");
+    const projectPath = createRoot("web-agent-manager-bridge-sync-turn-project-");
+    const database = createDatabase(dataDir);
+    database.prepare("INSERT INTO projects(id, name, path) VALUES (1, 'sample', ?)").run(projectPath);
+    database.prepare(`
+      INSERT INTO chats(id, project_id, provider, tmux_name, status, title, history_file, busy)
+      VALUES (1, 1, 'codex', 'web_agent_manager_chat_1', 'running', '부모 작업', 'codex.jsonl', 0)
+    `).run();
+    database.prepare(`
+      INSERT INTO chats(id, project_id, provider, tmux_name, status, title, history_file, busy)
+      VALUES (2, 1, 'codex', 'web_agent_manager_chat_2', 'running', '자식 작업', 'codex.jsonl', 0)
+    `).run();
+    const messages: Array<{ id: string; role: "user" | "assistant"; kind: string; content: string; createdAt: string }> = [];
+    let turnEndedAt: string | null = null;
+    const bridge = new AgentBridge({
+      database,
+      adapters: [{ id: "codex", displayLabel: "Codex" }] as unknown as ProviderAdapter[],
+      historyCache: {
+        get: () => ({ messages, turnEndedAt }),
+      } as unknown as HistoryCache,
+      sessions: {
+        start: () => undefined,
+        sendPrompt: async (_chatId: number, text: string) => {
+          messages.push({ id: "user-1", role: "user", kind: "message", content: text, createdAt: "2026-08-21T07:00:00.000Z" });
+          messages.push({
+            id: "assistant-1",
+            role: "assistant",
+            kind: "message",
+            content: "바로 끝난 최종 응답입니다.",
+            createdAt: "2026-08-21T07:00:01.000Z",
+          });
+          turnEndedAt = "2026-08-21T07:00:02.000Z";
+          database.prepare("UPDATE chats SET busy = 0 WHERE id = 2").run();
+          return text;
+        },
+      } as unknown as Pick<SessionManager, "start" | "sendPrompt">,
+      socketPath: path.join(dataDir, "web-agent-manager-agent.sock"),
+    });
+
+    const completed = await bridge.execute({
+      method: "delegation.send_wait",
+      params: {
+        sourceChatId: 1,
+        targetChatId: 2,
+        prompt: "즉시 끝나는 작업을 전달합니다.",
+        idempotencyKey: "sync-turn-end",
+        timeoutSeconds: 2,
+      },
+    }) as { timedOut?: boolean; delegation: { status: string }; result: { response: string } };
+
+    expect(completed.timedOut).toBeFalsy();
+    expect(completed.delegation.status).toBe("completed");
+    expect(completed.result.response).toBe("바로 끝난 최종 응답입니다.");
+    database.close();
+  });
+
+  it("대상 채팅이 stopped로 끝나면 위임을 실패로 확정한다", async () => {
+    const dataDir = createRoot("web-agent-manager-bridge-stopped-data-");
+    const projectPath = createRoot("web-agent-manager-bridge-stopped-project-");
+    const database = createDatabase(dataDir);
+    database.prepare("INSERT INTO projects(id, name, path) VALUES (1, 'sample', ?)").run(projectPath);
+    database.prepare(`
+      INSERT INTO chats(id, project_id, provider, tmux_name, status, title, history_file, busy)
+      VALUES (1, 1, 'codex', 'web_agent_manager_chat_1', 'running', '부모 작업', 'codex.jsonl', 0)
+    `).run();
+    database.prepare(`
+      INSERT INTO chats(id, project_id, provider, tmux_name, status, title, history_file, busy)
+      VALUES (2, 1, 'claude', 'web_agent_manager_chat_2', 'running', '자식 작업', 'claude.jsonl', 0)
+    `).run();
+    const messages: Array<{ id: string; role: "user" | "assistant"; kind: string; content: string; createdAt: string }> = [];
+    const bridge = new AgentBridge({
+      database,
+      adapters: [
+        { id: "codex", displayLabel: "Codex" },
+        { id: "claude", displayLabel: "Claude" },
+      ] as unknown as ProviderAdapter[],
+      historyCache: {
+        get: () => ({ messages, turnEndedAt: null }),
+      } as unknown as HistoryCache,
+      sessions: {
+        start: () => undefined,
+        sendPrompt: async (_chatId: number, text: string) => {
+          messages.push({ id: "user-1", role: "user", kind: "text", content: text, createdAt: "2026-08-21T06:00:00.000Z" });
+          database.prepare("UPDATE chats SET busy = 0, status = 'stopped' WHERE id = 2").run();
+          return text;
+        },
+      } as unknown as Pick<SessionManager, "start" | "sendPrompt">,
+      socketPath: path.join(dataDir, "web-agent-manager-agent.sock"),
+    });
+
+    const failed = await bridge.execute({
+      method: "delegation.send_wait",
+      params: {
+        sourceChatId: 1,
+        targetChatId: 2,
+        prompt: "중단된 채팅에 전달합니다.",
+        idempotencyKey: "stopped-target",
+        timeoutSeconds: 2,
+      },
+    }) as { delegation: { status: string; error: string | null } };
+
+    expect(failed.delegation.status).toBe("failed");
+    expect(failed.delegation.error).toContain("stopped");
+    database.close();
+  });
+
+  it("위임 전용 채팅이 완료되면 SessionManager.stop으로 터미널을 정리한다", async () => {
+    const { completed, stopped, database } = await runDelegationCompletion({ origin: "delegation" });
+    expect(completed.delegation.status).toBe("completed");
+    expect(completed.result.response).toBe("자식 작업이 끝났습니다.");
+    expect(stopped).toEqual([2]);
+    expect((database.prepare("SELECT id FROM chats WHERE id = 2").get() as { id: number }).id).toBe(2);
+    database.close();
+  });
+
+  it("origin이 user인 채팅은 위임이 끝나도 자동 종료하지 않는다", async () => {
+    const { completed, stopped, database } = await runDelegationCompletion({ origin: "user" });
+    expect(completed.delegation.status).toBe("completed");
+    expect(stopped).toEqual([]);
+    database.close();
+  });
+
+  it("같은 채팅에 미완료 위임이 남아 있으면 자동 종료하지 않는다", async () => {
+    const { completed, stopped, database } = await runDelegationCompletion({
+      origin: "delegation",
+      extraUnfinished: true,
+    });
+    expect(completed.delegation.status).toBe("completed");
+    expect(stopped).toEqual([]);
+    database.close();
+  });
+
+  it("종료가 예외를 던져도 위임 결과는 정상 반환한다", async () => {
+    const { completed, stopped, database } = await runDelegationCompletion({
+      origin: "delegation",
+      stopImpl: async () => {
+        throw new Error("세션 종료 실패");
+      },
+    });
+    expect(completed.delegation.status).toBe("completed");
+    expect(completed.result.response).toBe("자식 작업이 끝났습니다.");
+    expect(stopped).toEqual([2]);
+    database.close();
+  });
+
+  it("busy인 위임 채팅은 완료되어도 자동 종료하지 않는다", async () => {
+    const { completed, stopped, database } = await runDelegationCompletion({
+      origin: "delegation",
+      busyAtComplete: 1,
+    });
+    expect(completed.delegation.status).toBe("completed");
+    expect(stopped).toEqual([]);
+    database.close();
+  });
+
+  it("실패로 끝난 위임은 터미널을 자동 종료하지 않는다", async () => {
+    const dataDir = createRoot("web-agent-manager-bridge-failed-keep-data-");
+    const projectPath = createRoot("web-agent-manager-bridge-failed-keep-project-");
+    const database = createDatabase(dataDir);
+    database.prepare("INSERT INTO projects(id, name, path) VALUES (1, 'sample', ?)").run(projectPath);
+    database.prepare(`
+      INSERT INTO chats(id, project_id, provider, tmux_name, status, title, history_file, busy, origin)
+      VALUES (1, 1, 'codex', 'web_agent_manager_chat_1', 'running', '부모 작업', 'codex.jsonl', 0, 'user')
+    `).run();
+    database.prepare(`
+      INSERT INTO chats(id, project_id, provider, tmux_name, status, title, history_file, busy, origin)
+      VALUES (2, 1, 'claude', 'web_agent_manager_chat_2', 'running', '자식 작업', 'claude.jsonl', 0, 'delegation')
+    `).run();
+    const stopped: number[] = [];
+    const messages: Array<{ id: string; role: "user" | "assistant"; kind: string; content: string; createdAt: string }> = [];
+    const bridge = new AgentBridge({
+      database,
+      adapters: [
+        { id: "codex", displayLabel: "Codex" },
+        { id: "claude", displayLabel: "Claude" },
+      ] as unknown as ProviderAdapter[],
+      historyCache: {
+        get: () => ({ messages, turnEndedAt: null }),
+      } as unknown as HistoryCache,
+      sessions: {
+        start: () => undefined,
+        sendPrompt: async (_chatId: number, text: string) => {
+          messages.push({ id: "user-1", role: "user", kind: "text", content: text, createdAt: "2026-08-21T08:00:00.000Z" });
+          database.prepare("UPDATE chats SET busy = 0, status = 'error' WHERE id = 2").run();
+          return text;
+        },
+        stop: async (chatId: number) => { stopped.push(chatId); },
+      } as unknown as Pick<SessionManager, "start" | "sendPrompt" | "stop">,
+      socketPath: path.join(dataDir, "web-agent-manager-agent.sock"),
+    });
+
+    const failed = await bridge.execute({
+      method: "delegation.send_wait",
+      params: {
+        sourceChatId: 1,
+        targetChatId: 2,
+        prompt: "실패할 작업을 전달합니다.",
+        idempotencyKey: "failed-keep-session",
+        timeoutSeconds: 2,
+      },
+    }) as { delegation: { status: string; error: string | null } };
+
+    expect(failed.delegation.status).toBe("failed");
+    expect(failed.delegation.error).toContain("error");
+    expect(stopped).toEqual([]);
+    database.close();
+  });
+
+  it("아무도 결과를 묻지 않은 위임도 주기 확정으로 완료한다", async () => {
+    const dataDir = createRoot("web-agent-manager-bridge-settle-data-");
+    const projectPath = createRoot("web-agent-manager-bridge-settle-project-");
+    const database = createDatabase(dataDir);
+    database.prepare("INSERT INTO projects(id, name, path) VALUES (1, 'sample', ?)").run(projectPath);
+    database.prepare(`
+      INSERT INTO chats(id, project_id, provider, tmux_name, status, title, history_file, busy, origin)
+      VALUES (1, 1, 'codex', 'web_agent_manager_chat_1', 'running', '부모 작업', 'codex.jsonl', 0, 'user')
+    `).run();
+    database.prepare(`
+      INSERT INTO chats(id, project_id, provider, tmux_name, status, title, history_file, busy, origin)
+      VALUES (2, 1, 'claude', 'web_agent_manager_chat_2', 'running', '자식 작업', 'claude.jsonl', 0, 'delegation')
+    `).run();
+    const messages: Array<{ id: string; role: "user" | "assistant"; kind: string; content: string; createdAt: string }> = [];
+    let turnEndedAt: string | null = null;
+    const stopped: number[] = [];
+    const bridge = new AgentBridge({
+      database,
+      adapters: [
+        { id: "codex", displayLabel: "Codex" },
+        { id: "claude", displayLabel: "Claude" },
+      ] as unknown as ProviderAdapter[],
+      historyCache: {
+        get: () => ({ messages, turnEndedAt }),
+      } as unknown as HistoryCache,
+      sessions: {
+        start: () => undefined,
+        sendPrompt: async (_chatId: number, text: string) => {
+          messages.push({ id: "user-1", role: "user", kind: "text", content: text, createdAt: "2026-08-21T09:30:00.000Z" });
+          messages.push({
+            id: "assistant-1",
+            role: "assistant",
+            kind: "turn_end",
+            content: "위임 작업이 끝났습니다.",
+            createdAt: "2026-08-21T09:30:01.000Z",
+          });
+          turnEndedAt = "2026-08-21T09:30:02.000Z";
+          database.prepare("UPDATE chats SET busy = 0 WHERE id = 2").run();
+          return text;
+        },
+        stop: async (chatId: number) => { stopped.push(chatId); },
+      } as unknown as Pick<SessionManager, "start" | "sendPrompt" | "stop">,
+      socketPath: path.join(dataDir, "web-agent-manager-agent.sock"),
+    });
+
+    await bridge.execute({
+      method: "delegation.send",
+      params: {
+        sourceChatId: 1,
+        targetChatId: 2,
+        prompt: "결과를 묻지 않는 작업을 전달합니다.",
+        idempotencyKey: "fire-and-forget-settle",
+      },
+    });
+    const before = database.prepare("SELECT completed_at FROM delegations WHERE idempotency_key = ?")
+      .get("fire-and-forget-settle") as { completed_at: string | null };
+    expect(before.completed_at).toBeNull();
+
+    expect(await bridge.settleOpenDelegations()).toBe(1);
+    const stored = database.prepare("SELECT result_json, completed_at FROM delegations WHERE idempotency_key = ?")
+      .get("fire-and-forget-settle") as { result_json: string; completed_at: string };
+    expect(stored.completed_at).toBeTruthy();
+    expect(JSON.parse(stored.result_json)).toMatchObject({ response: "위임 작업이 끝났습니다." });
+    expect(stopped).toEqual([2]);
+    expect(await bridge.settleOpenDelegations()).toBe(0);
+    database.close();
+  });
+
+  it("아직 일하는 자식의 위임은 주기 확정으로 완료하지 않는다", async () => {
+    const dataDir = createRoot("web-agent-manager-bridge-settle-busy-data-");
+    const projectPath = createRoot("web-agent-manager-bridge-settle-busy-project-");
+    const database = createDatabase(dataDir);
+    database.prepare("INSERT INTO projects(id, name, path) VALUES (1, 'sample', ?)").run(projectPath);
+    database.prepare(`
+      INSERT INTO chats(id, project_id, provider, tmux_name, status, title, history_file, busy)
+      VALUES (1, 1, 'codex', 'web_agent_manager_chat_1', 'running', '부모 작업', 'codex.jsonl', 0)
+    `).run();
+    database.prepare(`
+      INSERT INTO chats(id, project_id, provider, tmux_name, status, title, history_file, busy)
+      VALUES (2, 1, 'grok', 'web_agent_manager_chat_2', 'running', '자식 작업', 'grok.jsonl', 0)
+    `).run();
+    const messages: Array<{ id: string; role: "user" | "assistant"; kind: string; content: string; createdAt: string }> = [];
+    const stopped: number[] = [];
+    const bridge = new AgentBridge({
+      database,
+      adapters: [
+        { id: "codex", displayLabel: "Codex" },
+        { id: "grok", displayLabel: "Grok" },
+      ] as unknown as ProviderAdapter[],
+      historyCache: {
+        get: () => ({ messages, turnEndedAt: null }),
+      } as unknown as HistoryCache,
+      sessions: {
+        start: () => undefined,
+        sendPrompt: async (_chatId: number, text: string) => {
+          messages.push({ id: "user-1", role: "user", kind: "text", content: text, createdAt: "2026-08-21T09:40:00.000Z" });
+          messages.push({
+            id: "assistant-mid",
+            role: "assistant",
+            kind: "text",
+            content: "중간 응답입니다. 이어서 도구를 호출합니다.",
+            createdAt: "2026-08-21T09:40:01.000Z",
+          });
+          database.prepare("UPDATE chats SET busy = 0 WHERE id = 2").run();
+          return text;
+        },
+        stop: async (chatId: number) => { stopped.push(chatId); },
+      } as unknown as Pick<SessionManager, "start" | "sendPrompt" | "stop">,
+      socketPath: path.join(dataDir, "web-agent-manager-agent.sock"),
+    });
+
+    await bridge.execute({
+      method: "delegation.send",
+      params: {
+        sourceChatId: 1,
+        targetChatId: 2,
+        prompt: "아직 끝나지 않은 작업을 전달합니다.",
+        idempotencyKey: "settle-still-working",
+      },
+    });
+
+    expect(await bridge.settleOpenDelegations()).toBe(0);
+    const stored = database.prepare("SELECT result_json, completed_at FROM delegations WHERE idempotency_key = ?")
+      .get("settle-still-working") as { result_json: string | null; completed_at: string | null };
+    expect(stored.result_json).toBeNull();
+    expect(stored.completed_at).toBeNull();
+    expect(stopped).toEqual([]);
+    database.close();
+  });
+
+  it("한 위임 확정이 예외를 던져도 다른 열린 위임은 계속 확정한다", async () => {
+    const dataDir = createRoot("web-agent-manager-bridge-settle-error-data-");
+    const projectPath = createRoot("web-agent-manager-bridge-settle-error-project-");
+    const database = createDatabase(dataDir);
+    database.prepare("INSERT INTO projects(id, name, path) VALUES (1, 'sample', ?)").run(projectPath);
+    database.prepare(`
+      INSERT INTO chats(id, project_id, provider, tmux_name, status, title, history_file, busy, origin)
+      VALUES (1, 1, 'codex', 'web_agent_manager_chat_1', 'running', '부모 작업', 'codex.jsonl', 0, 'user')
+    `).run();
+    database.prepare(`
+      INSERT INTO chats(id, project_id, provider, tmux_name, status, title, history_file, busy, origin)
+      VALUES (2, 1, 'grok', 'web_agent_manager_chat_2', 'running', '실패할 자식', 'boom.jsonl', 0, 'delegation')
+    `).run();
+    database.prepare(`
+      INSERT INTO chats(id, project_id, provider, tmux_name, status, title, history_file, busy, origin)
+      VALUES (3, 1, 'claude', 'web_agent_manager_chat_3', 'running', '정상 자식', 'claude.jsonl', 0, 'delegation')
+    `).run();
+    const messagesByFile = new Map<string, Array<{ id: string; role: "user" | "assistant"; kind: string; content: string; createdAt: string }>>([
+      ["boom.jsonl", []],
+      ["claude.jsonl", []],
+    ]);
+    const turnEndedAtByFile = new Map<string, string | null>([
+      ["boom.jsonl", null],
+      ["claude.jsonl", null],
+    ]);
+    let throwOnBoom = false;
+    const bridge = new AgentBridge({
+      database,
+      adapters: [
+        { id: "codex", displayLabel: "Codex" },
+        { id: "grok", displayLabel: "Grok" },
+        { id: "claude", displayLabel: "Claude" },
+      ] as unknown as ProviderAdapter[],
+      historyCache: {
+        get: (_adapter: unknown, file: string) => {
+          if (throwOnBoom && file === "boom.jsonl") throw new Error("기록 읽기 실패");
+          return { messages: messagesByFile.get(file) ?? [], turnEndedAt: turnEndedAtByFile.get(file) ?? null };
+        },
+      } as unknown as HistoryCache,
+      sessions: {
+        start: () => undefined,
+        sendPrompt: async (chatId: number, text: string) => {
+          const file = chatId === 2 ? "boom.jsonl" : "claude.jsonl";
+          const messages = messagesByFile.get(file)!;
+          messages.push({ id: `user-${chatId}`, role: "user", kind: "text", content: text, createdAt: "2026-08-21T09:50:00.000Z" });
+          messages.push({
+            id: `assistant-${chatId}`,
+            role: "assistant",
+            kind: "turn_end",
+            content: `채팅 ${chatId} 완료`,
+            createdAt: "2026-08-21T09:50:01.000Z",
+          });
+          turnEndedAtByFile.set(file, "2026-08-21T09:50:02.000Z");
+          return text;
+        },
+        stop: async () => undefined,
+      } as unknown as Pick<SessionManager, "start" | "sendPrompt" | "stop">,
+      socketPath: path.join(dataDir, "web-agent-manager-agent.sock"),
+    });
+
+    await bridge.execute({
+      method: "delegation.send",
+      params: { sourceChatId: 1, targetChatId: 2, prompt: "실패할 위임", idempotencyKey: "settle-throw" },
+    });
+    await bridge.execute({
+      method: "delegation.send",
+      params: { sourceChatId: 1, targetChatId: 3, prompt: "정상 위임", idempotencyKey: "settle-ok" },
+    });
+    throwOnBoom = true;
+
+    expect(await bridge.settleOpenDelegations()).toBe(1);
+    const thrown = database.prepare("SELECT completed_at FROM delegations WHERE idempotency_key = ?")
+      .get("settle-throw") as { completed_at: string | null };
+    const ok = database.prepare("SELECT result_json, completed_at FROM delegations WHERE idempotency_key = ?")
+      .get("settle-ok") as { result_json: string; completed_at: string };
+    expect(thrown.completed_at).toBeNull();
+    expect(ok.completed_at).toBeTruthy();
+    expect(JSON.parse(ok.result_json)).toMatchObject({ response: "채팅 3 완료" });
+    database.close();
+  });
+
+  it("sourceChatId가 없거나 존재하지 않으면 부모 없이 위임한다", async () => {
+    const dataDir = createRoot("web-agent-manager-bridge-source-missing-data-");
+    const projectPath = createRoot("web-agent-manager-bridge-source-missing-project-");
+    const database = createDatabase(dataDir);
+    database.prepare("INSERT INTO projects(id, name, path) VALUES (1, 'sample', ?)").run(projectPath);
+    database.prepare(`
+      INSERT INTO chats(id, project_id, provider, tmux_name, status, title)
+      VALUES (1, 1, 'codex', 'web_agent_manager_chat_1', 'running', '부모')
+    `).run();
+    database.prepare(`
+      INSERT INTO chats(id, project_id, provider, tmux_name, status, title)
+      VALUES (2, 1, 'claude', 'web_agent_manager_chat_2', 'running', '자식')
+    `).run();
+    const sent: Array<{ chatId: number; text: string }> = [];
+    const bridge = new AgentBridge({
+      database,
+      adapters: [
+        { id: "codex", displayLabel: "Codex" },
+        { id: "claude", displayLabel: "Claude" },
+      ] as unknown as ProviderAdapter[],
+      historyCache: {} as HistoryCache,
+      sessions: {
+        start: () => undefined,
+        sendPrompt: async (chatId: number, text: string) => { sent.push({ chatId, text }); },
+      } as unknown as Pick<SessionManager, "start" | "sendPrompt">,
+      socketPath: path.join(dataDir, "web-agent-manager-agent.sock"),
+    });
+
+    const missing = await bridge.execute({
+      method: "delegation.send",
+      params: { targetChatId: 2, prompt: "부모 없이", idempotencyKey: "no-source" },
+    }) as { delegation: { source_chat_id: number | null; status: string } };
+    const unknown = await bridge.execute({
+      method: "delegation.send",
+      params: { sourceChatId: 99999, targetChatId: 2, prompt: "없는 부모", idempotencyKey: "missing-source" },
+    }) as { delegation: { source_chat_id: number | null; status: string } };
+    const garbage = await bridge.execute({
+      method: "delegation.send",
+      params: { sourceChatId: "not-a-chat", targetChatId: 2, prompt: "이상한 부모", idempotencyKey: "garbage-source" },
+    }) as { delegation: { source_chat_id: number | null; status: string } };
+
+    expect(missing.delegation).toMatchObject({ status: "sent", source_chat_id: null });
+    expect(unknown.delegation).toMatchObject({ status: "sent", source_chat_id: null });
+    expect(garbage.delegation).toMatchObject({ status: "sent", source_chat_id: null });
+    expect(sent).toHaveLength(3);
+    database.close();
+  });
+
+  it("유효한 sourceChatId는 부모로 묶고 자기 자신으로의 위임은 거부한다", async () => {
+    const dataDir = createRoot("web-agent-manager-bridge-source-self-data-");
+    const projectPath = createRoot("web-agent-manager-bridge-source-self-project-");
+    const database = createDatabase(dataDir);
+    database.prepare("INSERT INTO projects(id, name, path) VALUES (1, 'sample', ?)").run(projectPath);
+    database.prepare(`
+      INSERT INTO chats(id, project_id, provider, tmux_name, status, title)
+      VALUES (1, 1, 'codex', 'web_agent_manager_chat_1', 'running', '부모')
+    `).run();
+    database.prepare(`
+      INSERT INTO chats(id, project_id, provider, tmux_name, status, title)
+      VALUES (2, 1, 'claude', 'web_agent_manager_chat_2', 'running', '자식')
+    `).run();
+    const bridge = new AgentBridge({
+      database,
+      adapters: [
+        { id: "codex", displayLabel: "Codex" },
+        { id: "claude", displayLabel: "Claude" },
+      ] as unknown as ProviderAdapter[],
+      historyCache: {} as HistoryCache,
+      sessions: {
+        start: () => undefined,
+        sendPrompt: async () => undefined,
+      } as unknown as Pick<SessionManager, "start" | "sendPrompt">,
+      socketPath: path.join(dataDir, "web-agent-manager-agent.sock"),
+    });
+
+    const linked = await bridge.execute({
+      method: "delegation.send",
+      params: { sourceChatId: 1, targetChatId: 2, prompt: "부모 있음", idempotencyKey: "has-source" },
+    }) as { delegation: { source_chat_id: number; status: string } };
+    expect(linked.delegation).toMatchObject({ status: "sent", source_chat_id: 1 });
+    await expect(bridge.execute({
+      method: "delegation.send",
+      params: { sourceChatId: 1, targetChatId: 1, prompt: "자기 자신", idempotencyKey: "self-source" },
+    })).rejects.toThrow("같은 채팅으로 작업을 다시 전달할 수 없습니다.");
     database.close();
   });
 

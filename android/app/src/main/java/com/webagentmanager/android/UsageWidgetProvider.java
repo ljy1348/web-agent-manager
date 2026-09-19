@@ -78,7 +78,7 @@ public final class UsageWidgetProvider extends AppWidgetProvider {
         else renderFull(context, manager, appWidgetId, snapshot, error);
     }
 
-    // 1×1에서는 StackView 두 장을 제공해 Claude·Codex를 위아래 스와이프한다.
+    // 1×1에서는 StackView로 서버가 준 공급자 카드를 위아래 스와이프한다.
     private static void renderCompact(Context context, AppWidgetManager manager, int id, WidgetSnapshot snapshot, String error) {
         RemoteViews views = new RemoteViews(context.getPackageName(), R.layout.widget_compact);
         Intent serviceIntent = new Intent(context, WidgetStackService.class);
@@ -93,31 +93,34 @@ public final class UsageWidgetProvider extends AppWidgetProvider {
         manager.notifyAppWidgetViewDataChanged(id, R.id.usage_stack);
     }
 
-    // 2×1에서는 Claude·Codex 사용량을 좌우 두 카드로 표시한다.
+    // 2×1에서는 Claude·Codex·Grok 사용량을 좌우 카드로 표시한다.
     private static void renderWide(Context context, AppWidgetManager manager, int id, WidgetSnapshot snapshot, String error) {
         RemoteViews views = new RemoteViews(context.getPackageName(), R.layout.widget_wide);
         bindUsage(views, R.id.claude_value, R.id.claude_progress, snapshot == null ? null : snapshot.claude);
         bindUsage(views, R.id.codex_value, R.id.codex_progress, snapshot == null ? null : snapshot.codex);
+        bindUsage(views, R.id.grok_value, R.id.grok_progress, snapshot == null ? null : snapshot.grok);
         views.setTextViewText(R.id.widget_status, snapshot == null ? emptyText(error) : "업데이트됨");
         bindCommonActions(context, views, id);
         manager.updateAppWidget(id, views);
     }
 
-    // 1×2에서는 Claude·Codex 사용량을 위아래 두 카드로 표시한다.
+    // 1×2에서는 Claude·Codex·Grok 사용량을 위아래 카드로 표시한다.
     private static void renderTall(Context context, AppWidgetManager manager, int id, WidgetSnapshot snapshot, String error) {
         RemoteViews views = new RemoteViews(context.getPackageName(), R.layout.widget_tall);
         bindUsage(views, R.id.claude_value, R.id.claude_progress, snapshot == null ? null : snapshot.claude);
         bindUsage(views, R.id.codex_value, R.id.codex_progress, snapshot == null ? null : snapshot.codex);
+        bindUsage(views, R.id.grok_value, R.id.grok_progress, snapshot == null ? null : snapshot.grok);
         views.setTextViewText(R.id.widget_status, snapshot == null ? emptyText(error) : "업데이트됨");
         bindCommonActions(context, views, id);
         manager.updateAppWidget(id, views);
     }
 
-    // 2×2 이상에서는 두 모델과 CPU·메모리 사용률을 함께 표시한다.
+    // 2×2 이상에서는 세 모델과 CPU·메모리 사용률을 함께 표시한다.
     private static void renderFull(Context context, AppWidgetManager manager, int id, WidgetSnapshot snapshot, String error) {
         RemoteViews views = new RemoteViews(context.getPackageName(), R.layout.widget_full);
         bindUsage(views, R.id.claude_value, R.id.claude_progress, snapshot == null ? null : snapshot.claude);
         bindUsage(views, R.id.codex_value, R.id.codex_progress, snapshot == null ? null : snapshot.codex);
+        bindUsage(views, R.id.grok_value, R.id.grok_progress, snapshot == null ? null : snapshot.grok);
         bindMetric(views, R.id.cpu_value, R.id.cpu_progress, snapshot == null ? -1 : snapshot.cpuPercent);
         bindMetric(views, R.id.memory_value, R.id.memory_progress, snapshot == null ? -1 : snapshot.memoryPercent);
         views.setTextViewText(R.id.widget_status, snapshot == null ? emptyText(error) : "업데이트됨");

@@ -43,7 +43,7 @@ describe("서브 에이전트 관리 API", () => {
     database.prepare("INSERT INTO users(id, username, password_hash, role) VALUES (1, 'admin', 'test', 'admin')").run();
     database.prepare("INSERT INTO projects(id, name, path) VALUES (1, 'sample', ?)").run(root);
     database.prepare("INSERT INTO chats(id, project_id, provider, tmux_name, status, title) VALUES (1, 1, 'codex', 'chat-1', 'running', '부모')").run();
-    database.prepare("INSERT INTO chats(id, project_id, provider, tmux_name, status, title, busy) VALUES (2, 1, 'claude', 'chat-2', 'running', '자식', 1)").run();
+    database.prepare("INSERT INTO chats(id, project_id, provider, tmux_name, status, title, busy, origin) VALUES (2, 1, 'claude', 'chat-2', 'running', '자식', 1, 'delegation')").run();
     database.prepare(`
       INSERT INTO delegations(id, idempotency_key, source_chat_id, target_chat_id, prompt, status)
       VALUES ('delegation-1', 'key-1', 1, 2, '검증하세요.', 'sent')

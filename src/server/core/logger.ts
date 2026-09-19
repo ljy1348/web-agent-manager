@@ -7,7 +7,11 @@ import { readProductEnv } from "./config";
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
 const LEVEL_ORDER: LogLevel[] = ["debug", "info", "warn", "error"];
-const KEEP_DAYS = 14;
+// 디버그 레벨에서는 조회 화면 전체가 매분 쌓여 하루 수백 MB까지 커진다(실측: 8/9자 200MB).
+// 그 상태로 오래 운용하기 위해 보존 기간을 짧게 잡고, 필요하면 환경변수로 늘린다.
+const DEFAULT_KEEP_DAYS = 3;
+// 정리를 서버 시작 때 한 번만 돌리면 오래 켜둔 서버에서는 계속 쌓인다. 주기적으로도 돌린다.
+const PRUNE_INTERVAL_MS = 6 * 60 * 60_000;
 const MAX_DETAIL_LENGTH = 4000;
 
 let logsDir = "";
@@ -86,17 +90,28 @@ export function createLogger(scope: string): ScopedLogger {
   };
 }
 
-// KEEP_DAYS보다 오래된 날짜별 로그 파일을 정리한다.
-function pruneOldLogs(): void {
-  const cutoff = Date.now() - KEEP_DAYS * 24 * 60 * 60 * 1000;
+// 보존 기간을 정한다. 환경변수로 덮어쓸 수 있고, 값이 이상하면 기본값을 쓴다.
+export function keepDays(): number {
+  const configured = Number(readProductEnv("LOG_KEEP_DAYS"));
+  return Number.isFinite(configured) && configured >= 1 ? Math.floor(configured) : DEFAULT_KEEP_DAYS;
+}
+
+// 지정 디렉터리에서 기준 시각보다 오래된 날짜별 로그 파일을 지운다. 날짜 형식이 아닌 파일은
+// 건드리지 않는다 — 로그 디렉터리에 다른 파일이 섞여 있어도 안전해야 한다.
+export function pruneLogsIn(directory: string, cutoff: number): void {
   try {
-    for (const name of fs.readdirSync(logsDir)) {
+    for (const name of fs.readdirSync(directory)) {
       const match = name.match(/^(?:server|client)-(\d{4}-\d{2}-\d{2})\.log$/);
-      if (match && new Date(`${match[1]}T00:00:00Z`).getTime() < cutoff) fs.rmSync(path.join(logsDir, name), { force: true });
+      if (match && new Date(`${match[1]}T00:00:00Z`).getTime() < cutoff) fs.rmSync(path.join(directory, name), { force: true });
     }
   } catch {
     // 정리 실패는 무시한다.
   }
+}
+
+// 현재 설정된 보존 기간으로 로그 디렉터리를 정리한다.
+function pruneOldLogs(): void {
+  pruneLogsIn(logsDir, Date.now() - keepDays() * 24 * 60 * 60 * 1000);
 }
 
 // console.* 호출을 감싸 기존 산재한 로그도 전부 서버 로그 파일에 남긴다.
@@ -119,13 +134,17 @@ export function initServerLogging(dataDir: string): void {
   const configuredLevel = readProductEnv("LOG_LEVEL");
   minLevel = (LEVEL_ORDER as string[]).includes(configuredLevel ?? "") ? configuredLevel as LogLevel : defaultLogLevel(process.env.NODE_ENV);
   pruneOldLogs();
+  // 날짜가 바뀌어야 새 파일이 생기므로 하루 한 번이면 충분하지만, 재시작 없이 며칠씩 도는 서버를
+  // 감안해 6시간마다 확인한다. 프로세스 종료를 붙잡지 않도록 unref한다.
+  const pruneTimer = setInterval(pruneOldLogs, PRUNE_INTERVAL_MS);
+  pruneTimer.unref();
   installConsoleTee();
   process.on("unhandledRejection", (reason) => write("error", "process", "unhandledRejection", reason));
   process.on("uncaughtException", (error) => {
     write("error", "process", "uncaughtException", error);
     process.exit(1);
   });
-  write("info", "logger", `서버 로깅 시작 (level=${minLevel}, dir=${logsDir})`);
+  write("info", "logger", `서버 로깅 시작 (level=${minLevel}, keepDays=${keepDays()}, dir=${logsDir})`);
 }
 
 // /api·/internal 요청의 메서드·경로·상태·소요시간·사용자를 기록하는 미들웨어를 만든다.

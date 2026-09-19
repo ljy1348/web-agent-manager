@@ -179,3 +179,177 @@ describe("ApprovalService.handleClaudeHook 중복 방지", () => {
     expect(database.prepare("SELECT status, decision FROM approvals WHERE id = ?").get(id)).toEqual({ status: "declined", decision: "decline" });
   });
 });
+
+describe("ApprovalService.handleClaudeHook 채팅 식별", () => {
+  // 같은 프로젝트에 Claude 채팅 둘을 만든다. cwd 추측은 updated_at이 최근인 쪽(second)을 고른다.
+  function createTwoClaudeChats(database: AppDatabase): { first: number; second: number; codex: number } {
+    database.prepare("INSERT OR IGNORE INTO users(id, username, password_hash, role) VALUES (1, 'admin', 'x', 'admin')").run();
+    database.prepare("INSERT INTO projects(name, path) VALUES ('p', '/tmp/p')").run();
+    const project = database.prepare("SELECT id FROM projects WHERE path = '/tmp/p'").get() as { id: number };
+    const insert = database.prepare(`
+      INSERT INTO chats(project_id, provider, tmux_name, status, title, updated_at) VALUES (?, ?, ?, 'running', 't', ?)
+    `);
+    const first = Number(insert.run(project.id, "claude", "hint-first", "2026-09-01 00:00:00").lastInsertRowid);
+    const second = Number(insert.run(project.id, "claude", "hint-second", "2026-09-02 00:00:00").lastInsertRowid);
+    const codex = Number(insert.run(project.id, "codex", "hint-codex", "2026-09-03 00:00:00").lastInsertRowid);
+    return { first, second, codex };
+  }
+
+  it("훅이 채팅 ID를 넘기면 session_id·cwd 추측 대신 그 채팅에 승인을 붙인다", async () => {
+    const database = createTestDatabase();
+    const { first } = createTwoClaudeChats(database);
+    const service = new ApprovalService(loadConfig(), database, new RealtimeHub(fakeHttpServer(), database), new SlackNotifier(loadConfig(), database));
+
+    const pending = service.handleClaudeHook({ session_id: "unbound", cwd: "/tmp/p", tool_name: "Bash", tool_input: { command: "ls" } }, first);
+    const approval = database.prepare("SELECT id, chat_id AS chatId FROM approvals WHERE status = 'pending'").get() as { id: string; chatId: number };
+    service.decide(approval.id, "accept", { id: 1, username: "admin", role: "admin" });
+
+    expect(approval.chatId).toBe(first);
+    await expect(pending).resolves.toEqual({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "allow" } } });
+  });
+
+  it("채팅 ID가 Claude 채팅이 아니면 기존 cwd 경로로 되돌아간다", async () => {
+    const database = createTestDatabase();
+    const { second, codex } = createTwoClaudeChats(database);
+    const service = new ApprovalService(loadConfig(), database, new RealtimeHub(fakeHttpServer(), database), new SlackNotifier(loadConfig(), database));
+
+    const pending = service.handleClaudeHook({ cwd: "/tmp/p", tool_name: "Bash", tool_input: { command: "pwd" } }, codex);
+    const approval = database.prepare("SELECT id, chat_id AS chatId FROM approvals WHERE status = 'pending'").get() as { id: string; chatId: number };
+    service.decide(approval.id, "decline", { id: 1, username: "admin", role: "admin" });
+
+    expect(approval.chatId).toBe(second);
+    await pending;
+  });
+});
+
+describe("ApprovalService.handleCodexHook(#95)", () => {
+  // Codex 채팅 하나를 만든다.
+  function createCodexChat(database: AppDatabase): number {
+    database.prepare("INSERT OR IGNORE INTO users(id, username, password_hash, role) VALUES (1, 'admin', 'x', 'admin')").run();
+    database.prepare("INSERT INTO projects(name, path) VALUES ('p', '/tmp/p')").run();
+    const project = database.prepare("SELECT id FROM projects WHERE path = '/tmp/p'").get() as { id: number };
+    return Number(database.prepare(`
+      INSERT INTO chats(project_id, provider, provider_session_id, tmux_name, status, title, busy) VALUES (?, 'codex', 'thread-1', 'codex-hook', 'running', 't', 1)
+    `).run(project.id).lastInsertRowid);
+  }
+  const admin = { id: 1, username: "admin", role: "admin" } as const;
+  const input = { session_id: "thread-1", tool_name: "Bash", tool_input: { command: "touch /tmp/x" } };
+
+  it("허용과 세션 허용은 Codex에 allow로, 거부는 메시지를 담은 deny로 돌려준다", async () => {
+    const database = createTestDatabase();
+    const chatId = createCodexChat(database);
+    const service = new ApprovalService(loadConfig(), database, new RealtimeHub(fakeHttpServer(), database), new SlackNotifier(loadConfig(), database));
+    const pendingId = () => (database.prepare("SELECT id FROM approvals WHERE status = 'pending'").get() as { id: string }).id;
+
+    for (const [decision, expected] of [
+      ["accept", { behavior: "allow" }],
+      ["acceptForSession", { behavior: "allow" }],
+      ["decline", { behavior: "deny", message: "사용자가 권한을 거부했습니다." }],
+    ] as const) {
+      const result = service.handleCodexHook(input, chatId);
+      expect(database.prepare("SELECT provider, request_type AS requestType FROM approvals WHERE status = 'pending'").get()).toEqual({ provider: "codex", requestType: "permission" });
+      service.decide(pendingId(), decision, admin);
+      await expect(result).resolves.toEqual({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: expected } });
+    }
+  });
+
+  it("연결된 채팅을 못 찾으면 결정 없이 돌려줘 Codex 기본 승인 화면으로 넘긴다", async () => {
+    const database = createTestDatabase();
+    const service = new ApprovalService(loadConfig(), database, new RealtimeHub(fakeHttpServer(), database), new SlackNotifier(loadConfig(), database));
+
+    await expect(service.handleCodexHook({ session_id: "unknown", tool_name: "Bash" }, null)).resolves.toEqual({});
+    expect(database.prepare("SELECT COUNT(*) AS count FROM approvals").get()).toEqual({ count: 0 });
+  });
+
+  it("훅이 기다리는 Codex 요청을 닫으면 터미널 키가 아니라 훅 응답으로 거부를 돌려준다", async () => {
+    const database = createTestDatabase();
+    const chatId = createCodexChat(database);
+    const service = new ApprovalService(loadConfig(), database, new RealtimeHub(fakeHttpServer(), database), new SlackNotifier(loadConfig(), database));
+    const terminalDecisions: string[] = [];
+    service.setTerminalDecisionHandler((_chatId, decision) => terminalDecisions.push(decision));
+
+    const result = service.handleCodexHook(input, chatId);
+    const { id } = database.prepare("SELECT id FROM approvals WHERE status = 'pending'").get() as { id: string };
+    service.dismiss(id, admin);
+
+    await expect(result).resolves.toEqual({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "deny", message: "사용자가 이 요청을 닫았습니다." } } });
+    expect(terminalDecisions).toEqual([]);
+  });
+});
+
+describe("ApprovalService Codex app-server 구조화 승인", () => {
+  function createCodexChat(database: AppDatabase): number {
+    database.prepare("INSERT OR IGNORE INTO users(id, username, password_hash, role) VALUES (1, 'admin', 'x', 'admin')").run();
+    database.prepare("INSERT INTO projects(name, path) VALUES ('structured', '/tmp/structured')").run();
+    const project = database.prepare("SELECT id FROM projects WHERE path = '/tmp/structured'").get() as { id: number };
+    return Number(database.prepare(`
+      INSERT INTO chats(project_id, provider, provider_session_id, tmux_name, status, title, busy)
+      VALUES (?, 'codex', 'structured-thread', 'structured-tmux', 'running', 'structured', 1)
+    `).run(project.id).lastInsertRowid);
+  }
+
+  it("식별 메타데이터만 저장하고 기존 decide 결과를 app-server 결정으로 돌려준다", async () => {
+    const database = createTestDatabase();
+    const chatId = createCodexChat(database);
+    const service = new ApprovalService(loadConfig(), database, new RealtimeHub(fakeHttpServer(), database), new SlackNotifier(loadConfig(), database));
+    const result = service.awaitCodexAppServerDecision({
+      requestId: "approval-1",
+      chatId,
+      requestType: "command_execution",
+      threadId: "structured-thread",
+      turnId: "turn-1",
+      itemId: "item-1",
+      availableDecisions: ["accept", "decline"],
+    });
+    const pending = database.prepare("SELECT id, request_type AS requestType, request_payload AS payload FROM approvals WHERE status = 'pending'").get() as { id: string; requestType: string; payload: string };
+
+    expect(pending.requestType).toBe("app_server_command_execution");
+    expect(JSON.parse(pending.payload)).toEqual({ requestId: "approval-1", threadId: "structured-thread", turnId: "turn-1", itemId: "item-1", availableDecisions: ["accept", "decline"] });
+    expect(pending.payload).not.toContain("command");
+    service.decide(pending.id, "accept", { id: 1, username: "admin", role: "admin" });
+
+    await expect(result).resolves.toBe("accept");
+    expect(database.prepare("SELECT status, decision FROM approvals WHERE id = ?").get(pending.id)).toEqual({ status: "accepted", decision: "accept" });
+  });
+
+  it("동일 server request 재수신은 승인 하나에 합류하고 닫기는 decline으로 둘 다 해제한다", async () => {
+    const database = createTestDatabase();
+    const chatId = createCodexChat(database);
+    const service = new ApprovalService(loadConfig(), database, new RealtimeHub(fakeHttpServer(), database), new SlackNotifier(loadConfig(), database));
+    const request = {
+      requestId: 77,
+      chatId,
+      requestType: "file_change" as const,
+      threadId: "structured-thread",
+      turnId: "turn-2",
+      itemId: "item-2",
+      availableDecisions: ["accept", "decline", "cancel"] as const,
+    };
+    const first = service.awaitCodexAppServerDecision({ ...request, availableDecisions: [...request.availableDecisions] });
+    const second = service.awaitCodexAppServerDecision({ ...request, availableDecisions: [...request.availableDecisions] });
+    const rows = database.prepare("SELECT id FROM approvals WHERE status = 'pending'").all() as Array<{ id: string }>;
+    expect(rows).toHaveLength(1);
+
+    service.dismiss(rows[0].id, { id: 1, username: "admin", role: "admin" });
+
+    await expect(Promise.all([first, second])).resolves.toEqual(["decline", "decline"]);
+    expect(database.prepare("SELECT status, decision FROM approvals WHERE id = ?").get(rows[0].id)).toEqual({ status: "declined", decision: "decline" });
+  });
+
+  it("다른 thread에 속한 요청은 승인 행을 만들지 않는다", async () => {
+    const database = createTestDatabase();
+    const chatId = createCodexChat(database);
+    const service = new ApprovalService(loadConfig(), database, new RealtimeHub(fakeHttpServer(), database), new SlackNotifier(loadConfig(), database));
+
+    await expect(service.awaitCodexAppServerDecision({
+      requestId: 1,
+      chatId,
+      requestType: "command_execution",
+      threadId: "other-thread",
+      turnId: "turn",
+      itemId: "item",
+      availableDecisions: ["decline"],
+    })).rejects.toThrow("채팅을 찾을 수 없습니다");
+    expect(database.prepare("SELECT COUNT(*) AS count FROM approvals").get()).toEqual({ count: 0 });
+  });
+});

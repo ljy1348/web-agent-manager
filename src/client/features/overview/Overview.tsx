@@ -77,99 +77,6 @@ function TokenUsageAnalytics(): React.ReactElement {
   </article>;
 }
 
-// 관리자 전용 Slack bot token·channel id 설정 카드를 표시한다.
-function SlackSettingsCard(): React.ReactElement {
-  const [settings, setSettings] = useState<Json | null>(null);
-  const [botToken, setBotToken] = useState("");
-  const [channelId, setChannelId] = useState("");
-  const [status, setStatus] = useState("");
-  useEffect(() => { void api("/admin/slack-settings").then((data) => { setSettings(data); setChannelId(data.channelId || ""); }).catch(() => undefined); }, []);
-  async function save(event: React.FormEvent): Promise<void> {
-    event.preventDefault();
-    setStatus("저장 중…");
-    try {
-      const data = await api("/admin/slack-settings", { method: "PUT", body: JSON.stringify({ botToken, channelId }) });
-      setSettings(data); setBotToken(""); setStatus("저장했습니다.");
-    } catch (error: any) {
-      setStatus(error?.message || "저장에 실패했습니다.");
-    }
-  }
-  async function test(): Promise<void> {
-    setStatus("테스트 메시지 전송 중…");
-    try { await api("/slack/test", { method: "POST" }); setStatus("테스트 메시지를 보냈습니다."); } catch (error: any) { setStatus(error?.message || "전송에 실패했습니다."); }
-  }
-  return <article className="card"><div className="card-top">Slack 설정</div>
-    <form className="slack-settings-form" onSubmit={save}>
-      <label>Bot Token<input type="password" value={botToken} onChange={(event) => setBotToken(event.target.value)} placeholder={settings?.botTokenConfigured ? "설정됨 (바꾸려면 새로 입력)" : "xoxb-..."} /></label>
-      <label>Channel ID<input value={channelId} onChange={(event) => setChannelId(event.target.value)} placeholder="C0123456789" /></label>
-      <div className="slack-settings-actions"><button className="primary">저장</button><button type="button" onClick={test}>테스트 전송</button></div>
-      {status && <span className="attachment-status">{status}</span>}
-    </form>
-  </article>;
-}
-
-// 관리자 전용 유휴 채팅 자동 종료 정책 카드를 표시한다.
-function IdleChatSettingsCard(): React.ReactElement {
-  const [enabled, setEnabled] = useState(true);
-  const [timeoutHours, setTimeoutHours] = useState(24);
-  const [status, setStatus] = useState("");
-  useEffect(() => {
-    void api("/admin/idle-chat-settings")
-      .then((data) => { setEnabled(!!data.enabled); setTimeoutHours(Number(data.timeoutHours) || 24); })
-      .catch(() => undefined);
-  }, []);
-  async function save(event: React.FormEvent): Promise<void> {
-    event.preventDefault();
-    setStatus("저장 중…");
-    try {
-      const data = await api("/admin/idle-chat-settings", { method: "PUT", body: JSON.stringify({ enabled, timeoutHours }) });
-      setEnabled(!!data.enabled); setTimeoutHours(Number(data.timeoutHours)); setStatus("저장했습니다.");
-    } catch (error: any) {
-      setStatus(error?.message || "저장에 실패했습니다.");
-    }
-  }
-  return <article className="card"><div className="card-top">유휴 채팅 자동 종료</div>
-    <form className="slack-settings-form" onSubmit={save}>
-      <label className="idle-toggle"><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} />설정한 시간 동안 아무 활동이 없는 터미널을 자동 종료</label>
-      <label>기준 시간(시간)<input type="number" min={1} max={720} value={timeoutHours} onChange={(event) => setTimeoutHours(Number(event.target.value))} /></label>
-      <p className="muted idle-note">작업 중이거나 리밋 재개를 기다리거나 승인 응답을 기다리는 채팅은 종료하지 않습니다. 10분마다 검사합니다.</p>
-      <div className="slack-settings-actions"><button className="primary">저장</button></div>
-      {status && <span className="attachment-status">{status}</span>}
-    </form>
-  </article>;
-}
-
-// 관리자 전용 ntfy topic·서버 URL 설정 카드를 표시한다.
-function NtfySettingsCard(): React.ReactElement {
-  const [settings, setSettings] = useState<Json | null>(null);
-  const [topic, setTopic] = useState("");
-  const [serverUrl, setServerUrl] = useState("");
-  const [status, setStatus] = useState("");
-  useEffect(() => { void api("/admin/ntfy-settings").then((data) => { setSettings(data); setTopic(data.topic || ""); setServerUrl(data.serverUrl || ""); }).catch(() => undefined); }, []);
-  async function save(event: React.FormEvent): Promise<void> {
-    event.preventDefault();
-    setStatus("저장 중…");
-    try {
-      const data = await api("/admin/ntfy-settings", { method: "PUT", body: JSON.stringify({ topic, serverUrl }) });
-      setSettings(data); setStatus("저장했습니다.");
-    } catch (error: any) {
-      setStatus(error?.message || "저장에 실패했습니다.");
-    }
-  }
-  async function test(): Promise<void> {
-    setStatus("테스트 알림 전송 중…");
-    try { await api("/ntfy/test", { method: "POST" }); setStatus("테스트 알림을 보냈습니다."); } catch (error: any) { setStatus(error?.message || "전송에 실패했습니다."); }
-  }
-  return <article className="card"><div className="card-top">ntfy 설정</div>
-    <form className="slack-settings-form" onSubmit={save}>
-      <label>Topic<input value={topic} onChange={(event) => setTopic(event.target.value)} placeholder={settings?.topic || "my_web_agent_z6119"} /></label>
-      <label>서버 URL<input value={serverUrl} onChange={(event) => setServerUrl(event.target.value)} placeholder="https://ntfy.sh" /></label>
-      <div className="slack-settings-actions"><button className="primary">저장</button><button type="button" onClick={test}>테스트 전송</button></div>
-      {status && <span className="attachment-status">{status}</span>}
-    </form>
-  </article>;
-}
-
 // 프로세스 표 정렬 키에 맞춰 비교값을 뽑아낸다.
 function processSortValue(process: Json, key: string): string | number {
   if (key === "chat") return process.chat ? `${process.chat.projectName} ${process.chat.title}` : "";
@@ -248,7 +155,8 @@ function ResetCreditsSummary({ record, canRedeem, redeeming, onRedeem }: { recor
 }
 
 // 사용량과 호스트 자원 요약을 대시보드 카드로 표시한다.
-export function Overview({ user, providers, usage, system, runtime, slack, ntfy, refresh }: Json): React.ReactElement {
+export function Overview({ user, deploymentSecurity, providers, providerCapabilities, providerCanaries, providerUpdates, providerRollouts, providerRolloutConfigured, usage, system, runtime, refresh }: Json): React.ReactElement {
+  const canRunTests = user?.role === "admin" || user?.access_scope === "test_only";
   // 새로고침 버튼으로 해당 공급자의 사용량을 즉시 다시 조회하도록 요청한다(실제 파싱 결과는
   // usage_updated 브로드캐스트를 통해 usage 목록이 갱신되면서 반영된다).
   async function refreshUsage(provider: string): Promise<void> {
@@ -258,7 +166,45 @@ export function Overview({ user, providers, usage, system, runtime, slack, ntfy,
       window.alert(error?.message || "사용량 새로고침 요청에 실패했습니다.");
     }
   }
+  const [restartingUsageMonitor, setRestartingUsageMonitor] = useState<string | null>(null);
+  // 새로고침과 달리 조회 전용 터미널 자체를 껐다 켠다. 플랜을 바꾸면 CLI가 시작 시점 값을 계속
+  // 돌려줘 새로고침만으로는 갱신되지 않기 때문이다(실행 중인 채팅에는 영향이 없다).
+  async function restartUsageMonitor(provider: string): Promise<void> {
+    setRestartingUsageMonitor(provider);
+    try {
+      await api(`/usage/${provider}/restart`, { method: "POST" });
+    } catch (error: any) {
+      window.alert(error?.message || "조회 터미널 재시작에 실패했습니다.");
+    } finally {
+      setRestartingUsageMonitor(null);
+    }
+  }
   const [redeemingResetCredit, setRedeemingResetCredit] = useState(false);
+  const [updatingProvider, setUpdatingProvider] = useState<string | null>(null);
+  const [rollingBackProvider, setRollingBackProvider] = useState<string | null>(null);
+  const [changingRolloutProvider, setChangingRolloutProvider] = useState<string | null>(null);
+  const [runningCanary, setRunningCanary] = useState<string | null>(null);
+  const [candidateVersions, setCandidateVersions] = useState<Record<string, string>>({});
+  async function runProviderCanary(provider: string): Promise<void> {
+    const candidateVersion = candidateVersions[provider]?.trim();
+    if (!candidateVersion) {
+      window.alert("테스트할 후보 CLI 버전을 입력하세요.");
+      return;
+    }
+    setRunningCanary(provider);
+    try {
+      await api(`/providers/${provider}/canaries`, {
+        method: "POST",
+        headers: { "Idempotency-Key": crypto.randomUUID() },
+        body: JSON.stringify({ candidateVersion }),
+      });
+      await refresh();
+    } catch (error: any) {
+      window.alert(error?.message || `${providerLabel(provider)} CLI canary 실행에 실패했습니다.`);
+    } finally {
+      setRunningCanary(null);
+    }
+  }
   // 확인창 뒤 Codex 맨 위 Full reset 초기화권 하나를 사용하고 대시보드 데이터를 다시 읽는다.
   async function redeemResetCredit(record: Json): Promise<void> {
     const credits = usageResetCredits(record);
@@ -274,6 +220,64 @@ export function Overview({ user, providers, usage, system, runtime, slack, ntfy,
       window.alert(error?.message || "Codex 초기화권 사용에 실패했습니다.");
     } finally {
       setRedeemingResetCredit(false);
+    }
+  }
+  // 설치 업데이트는 해당 공급자의 실행 중 작업까지 재시작하므로 명시적으로 확인한 뒤 한 번만 보낸다.
+  async function updateProviderCli(provider: string, canaryRunId: string, rolloutRunId?: string): Promise<void> {
+    const label = providerLabel(provider);
+    if (!window.confirm(`${label} CLI를 최신 버전으로 업데이트할까요?\n\n업데이트가 끝나면 ${label}의 실행 중인 모든 채팅과 모델·사용량 조회 터미널이 재시작됩니다. 진행 중인 응답은 중단될 수 있습니다.`)) return;
+    setUpdatingProvider(provider);
+    try {
+      const result = await api(`/providers/${provider}/update`, { method: "POST", headers: { "Idempotency-Key": crypto.randomUUID() }, body: JSON.stringify({ canaryRunId, ...(rolloutRunId ? { rolloutRunId } : {}) }) });
+      await refresh();
+      if (result.failures?.length || result.warnings?.length) {
+        const details = [
+          ...(result.warnings || []),
+          ...(result.failures || []).map((item: Json) => `#${item.chatId}: ${item.error}`),
+        ].join("\n");
+        window.alert(`${label} CLI 업데이트는 완료됐지만 확인할 항목이 있습니다.\n\n${details}`);
+      } else {
+        window.alert(`${label} CLI 업데이트와 터미널 재시작이 완료되었습니다.\n${result.previousVersion || "이전 버전 미상"} → ${result.currentVersion}`);
+      }
+    } catch (error: any) {
+      window.alert(error?.message || `${label} CLI 업데이트에 실패했습니다.`);
+    } finally {
+      setUpdatingProvider(null);
+    }
+  }
+  async function startProviderRollout(provider: string, canaryRunId: string): Promise<void> {
+    setChangingRolloutProvider(provider);
+    try {
+      await api(`/providers/${provider}/rollouts`, { method: "POST", headers: { "Idempotency-Key": crypto.randomUUID() }, body: JSON.stringify({ canaryRunId, maxNewChats: 1 }) });
+      await refresh();
+      window.alert("단계 rollout을 시작했습니다. 다음 신규 채팅 1개가 후보 CLI로 실행됩니다.");
+    } catch (error: any) {
+      window.alert(error?.message || "단계 rollout 시작에 실패했습니다.");
+    } finally { setChangingRolloutProvider(null); }
+  }
+  async function haltProviderRollout(provider: string, runId: string): Promise<void> {
+    if (!window.confirm("단계 rollout을 중단할까요? 후보 채팅을 다시 시작하면 기존 CLI로 돌아갑니다.")) return;
+    setChangingRolloutProvider(provider);
+    try {
+      await api(`/providers/${provider}/rollouts/${runId}/halt`, { method: "POST" });
+      await refresh();
+    } catch (error: any) {
+      window.alert(error?.message || "단계 rollout 중단에 실패했습니다.");
+    } finally { setChangingRolloutProvider(null); }
+  }
+  async function rollbackProviderCli(provider: string, runId: string): Promise<void> {
+    const label = providerLabel(provider);
+    if (!window.confirm(`${label} CLI를 업데이트 전 버전으로 롤백할까요?\n\n검증된 백업만 복원하며 ${label}의 실행 중 채팅과 조회 터미널이 재시작됩니다.`)) return;
+    setRollingBackProvider(provider);
+    try {
+      const result = await api(`/providers/${provider}/updates/${runId}/rollback`, { method: "POST", headers: { "Idempotency-Key": crypto.randomUUID() } });
+      await refresh();
+      window.alert(`${label} CLI 롤백이 완료되었습니다.\n복원 버전: ${result.restoredVersion || "확인 필요"}`);
+    } catch (error: any) {
+      await refresh();
+      window.alert(error?.message || `${label} CLI 롤백에 실패했습니다.`);
+    } finally {
+      setRollingBackProvider(null);
     }
   }
   // 사용량 파싱이 이상하거나 실패했을 때 숫자만으로는 원인을 알기 어려워, 파서에 실제로 넘어간
@@ -295,13 +299,17 @@ export function Overview({ user, providers, usage, system, runtime, slack, ntfy,
   refreshRef.current = refresh;
   // 웹소켓 실시간 갱신과 별개로 1분마다 자원·사용량을 안전하게 다시 불러온다.
   useEffect(() => {
-    const timer = setInterval(() => { void refreshRef.current(); }, 60_000);
+    const timer = setInterval(() => { void Promise.resolve(refreshRef.current()).catch(() => undefined); }, 60_000);
     return () => clearInterval(timer);
   }, []);
   const [sortKey, setSortKey] = useState("cpu");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
   const providerList = Array.isArray(providers) ? providers : [];
   const providerLabel = (provider: string): string => providerList.find((item: Json) => item.id === provider)?.label || provider;
+  const usageWindowLabel = (provider: string, window: Json): string => {
+    const metadata = providerList.find((item: Json) => item.id === provider);
+    return metadata?.usageWindowLabels?.[window.id] || window.label || "사용량";
+  };
   // 같은 컬럼을 다시 누르면 방향만 뒤집고, 다른 컬럼이면 그 컬럼의 내림차순부터 시작한다.
   function toggleSort(key: string): void {
     if (key === sortKey) setSortDir((current) => current === "asc" ? "desc" : "asc");
@@ -363,7 +371,8 @@ export function Overview({ user, providers, usage, system, runtime, slack, ntfy,
     }
   }
   return <section className="content-grid">
-    <div className="section-head"><div><span className="eyebrow">실시간 현황</span><h2>운영 대시보드</h2></div><button onClick={refresh}>새로고침</button></div>
+    <div className="section-head"><div><span className="eyebrow">실시간 현황</span><h2>운영 대시보드</h2></div><button onClick={() => void Promise.resolve(refresh()).catch(() => undefined)}>새로고침</button></div>
+    {user.role === "admin" && deploymentSecurity?.issues?.length > 0 && <article className="deployment-security-warning" role="alert"><strong>외부 접속 보안 설정을 확인하세요</strong>{deploymentSecurity.issues.map((issue: Json) => <span key={issue.code}><b>{issue.message}</b><small>{issue.remediation}</small></span>)}</article>}
     <div className="cards">
       {usage.map((item: Json) => <article className="card usage-card" key={item.provider}>
         <div className="card-top">
@@ -371,16 +380,25 @@ export function Overview({ user, providers, usage, system, runtime, slack, ntfy,
           <button className="usage-refresh" disabled={item.monitor_status === "refreshing"} onClick={() => void refreshUsage(item.provider)}>
             {item.monitor_status === "refreshing" ? "새로고침 중…" : "새로고침"}
           </button>
+          <button
+            className="usage-refresh"
+            disabled={restartingUsageMonitor === item.provider}
+            title="조회 전용 터미널을 껐다 켭니다. 플랜을 바꾼 뒤처럼 새로고침으로 값이 안 바뀔 때 사용하세요(실행 중인 채팅에는 영향 없음)."
+            onClick={() => void restartUsageMonitor(item.provider)}
+          >
+            {restartingUsageMonitor === item.provider ? "재시작 중…" : "터미널 재시작"}
+          </button>
           <button className="usage-refresh" onClick={() => void loadSnapshot(item.provider)}>터미널 보기</button>
         </div>
-        <p className="usage-parsed-at">파싱 시각 {formatTimestamp(item.last_checked_at)}{item.data_status === "stale" && ` · 마지막 성공 ${formatTimestamp(item.last_success_at)}`}</p>
+        <p className="usage-parsed-at">마지막 조회 {formatTimestamp(item.last_checked_at)}{item.data_status === "stale" && ` · 마지막 직접 확인 ${formatTimestamp(item.last_success_at)}`}</p>
+        {item.error_code && <p className="usage-parsed-at">{usageErrorLabel(item.error_code)}</p>}
         {item.keepalive_sent_at && <p className="usage-parsed-at">세션 유지 단답 · 마지막 전송 {formatTimestamp(item.keepalive_sent_at)} · {keepaliveReasonLabel(item.keepalive_reason)}</p>}
         {usageWindows(item).map((window) => <div className="meter-row" key={window.id}>
-          <div><strong>{window.label}</strong><span>{window.resetAt ? `초기화 ${window.resetAt}` : ""}</span></div>
+          <div><strong title={window.label || undefined}>{usageWindowLabel(item.provider, window)}</strong><span>{window.resetAt ? `초기화 ${window.resetAt}` : ""}</span></div>
           <div className="meter"><i style={{ width: `${window.usedPercent || 0}%` }} /></div><b>{window.usedPercent}%</b>
         </div>)}
         {item.provider === "codex" && <ResetCreditsSummary record={item} canRedeem={user?.role === "admin"} redeeming={redeemingResetCredit} onRedeem={() => void redeemResetCredit(item)} />}
-        {!usageWindows(item).length && <p className="muted">{usageErrorLabel(item.error_code)}</p>}
+        {!usageWindows(item).length && !item.error_code && <p className="muted">조회 중</p>}
         {item.provider in snapshots && (snapshots[item.provider]
           ? <div className="usage-snapshot">
               <div className="git-box-head"><h4>터미널 스냅샷</h4><span>{formatTimestamp(snapshots[item.provider]!.capturedAt)}</span><button onClick={() => closeSnapshot(item.provider)}>닫기</button></div>
@@ -392,14 +410,48 @@ export function Overview({ user, providers, usage, system, runtime, slack, ntfy,
         <div className="stat-pair"><span>CPU<b>{latest ? `${latest.cpuPercent.toFixed(1)}%` : "-"}</b></span><span>메모리<b>{latest ? `${((latest.memory.total - latest.memory.available) / latest.memory.total * 100).toFixed(1)}%` : "-"}</b></span></div>
         <div className="small-list">{latest?.disks?.slice(0, 3).map((disk: Json) => <span key={disk.mount}>{disk.mount} · {disk.usePercent.toFixed(0)}% · {bytes(disk.used)}</span>)}</div>
       </article>
-      <article className="card"><div className="card-top">런타임</div><div className="small-list">
-        {Object.entries(runtime || {}).map(([name, value]) => <span key={name}><b>{name}</b> {String(value || "없음")}</span>)}
-        <span><b>Slack</b> {slack?.enabled ? "연결됨" : "미설정"}</span>
-        <span><b>ntfy</b> {ntfy?.enabled ? "연결됨" : "미설정"}</span>
+      <article className="card"><div className="card-top">런타임</div><div className="small-list runtime-list">
+        {Object.entries(runtime || {}).map(([name, value]) => {
+          const provider = providerList.find((item: Json) => item.id === name);
+          const latestCanary = (providerCanaries || []).find((item: Json) => item.run?.provider === name);
+          const latestUpdate = (providerUpdates || []).find((item: Json) => item.provider === name);
+          const latestRollout = (providerRollouts || []).find((item: Json) => item.provider === name);
+          const canaryReady = latestCanary?.run?.state === "passed" && latestCanary?.run?.currentVersion === value;
+          const rolloutReady = !providerRolloutConfigured || (latestRollout?.state === "active" && latestRollout.assignedCount >= latestRollout.maxNewChats && latestRollout.errorCount === 0);
+          const canUpdate = canaryReady && rolloutReady;
+          const canRollback = ["applied", "rollback_required", "rollback_failed"].includes(String(latestUpdate?.state || ""));
+          return <span key={name}><span><b>{name}</b> {String(value || "없음")}{latestUpdate && <small> · update {latestUpdate.state}</small>}{latestRollout && <small> · rollout {latestRollout.state} {latestRollout.assignedCount}/{latestRollout.maxNewChats} · 오류 {latestRollout.errorCount}</small>}</span>{user?.role === "admin" && provider?.supportsCliUpdate && <span className="runtime-actions">
+            {providerRolloutConfigured && canaryReady && latestRollout?.state !== "active" && <button type="button" disabled={changingRolloutProvider !== null} onClick={() => void startProviderRollout(name, latestCanary.run.id)}>{changingRolloutProvider === name ? "준비 중…" : "단계 시작"}</button>}
+            {providerRolloutConfigured && latestRollout?.state === "active" && <button type="button" disabled={changingRolloutProvider !== null} onClick={() => void haltProviderRollout(name, latestRollout.id)}>단계 중단</button>}
+            <button type="button" disabled={updatingProvider !== null || rollingBackProvider !== null || !canUpdate} title={canUpdate ? "통과한 canary 후보를 적용합니다." : "현재 버전 canary와 오류 없는 단계 rollout이 필요합니다."} onClick={() => void updateProviderCli(name, latestCanary.run.id, providerRolloutConfigured ? latestRollout?.id : undefined)}>{updatingProvider === name ? "업데이트 중…" : providerRolloutConfigured ? "전체 적용" : "업데이트"}</button>
+            {canRollback && <button type="button" className="danger" disabled={updatingProvider !== null || rollingBackProvider !== null} onClick={() => void rollbackProviderCli(name, latestUpdate.id)}>{rollingBackProvider === name ? "롤백 중…" : "롤백"}</button>}
+          </span>}</span>;
+        })}
+        {(providerCapabilities || []).map((capability: Json) => <span key={`capability:${capability.provider}`} title={(capability.fallbackReasons || []).join(", ")}>
+          <span><b>{capability.provider} 경로</b> {capability.structuredSession ? "구조화 세션" : "Hook·JSONL + TUI 폴백"}</span>
+        </span>)}
+        {canRunTests && providerList.filter((provider: Json) => provider.supportsCliUpdate).map((provider: Json) => {
+          const latestCanary = (providerCanaries || []).find((item: Json) => item.run?.provider === provider.id);
+          const state = latestCanary?.run?.state;
+          const stateLabel = state === "passed" ? "통과" : state === "failed" ? "실패" : state === "blocked" ? "확인 필요" : "미실행";
+          const diffCount = Array.isArray(latestCanary?.run?.capabilityDiff) ? latestCanary.run.capabilityDiff.length : 0;
+          const canarySteps = Array.isArray(latestCanary?.steps) ? latestCanary.steps as Json[] : [];
+          const passedSteps = canarySteps.filter((step: Json) => step.state === "passed").length;
+          const maxStepDuration = canarySteps.reduce((maximum: number, step: Json) => Math.max(maximum, Number(step.durationMs) || 0), 0);
+          return <div className="runtime-canary" key={`canary:${provider.id}`}>
+            <div className="runtime-canary-head"><span><b>{provider.label} canary</b> <i className={`canary-state ${state || "none"}`}>{stateLabel}</i></span>
+              {latestCanary?.run && <small>{latestCanary.run.currentVersion || "현재 미상"} → {latestCanary.run.candidateVersion} · capability 변경 {diffCount}개</small>}
+            </div>
+            <div className="runtime-canary-controls">
+              <input aria-label={`${provider.label} 후보 CLI 버전`} value={candidateVersions[provider.id] || ""} placeholder="후보 버전" onChange={(event) => setCandidateVersions((current) => ({ ...current, [provider.id]: event.target.value }))} />
+              <button type="button" disabled={runningCanary !== null} onClick={() => void runProviderCanary(provider.id)}>{runningCanary === provider.id ? "canary 실행 중…" : "canary 실행"}</button>
+            </div>
+            {!!canarySteps.length && <details className="canary-evidence"><summary>단계 증거 {passedSteps}/{canarySteps.length} · 최대 {maxStepDuration}ms</summary><div>
+              {canarySteps.map((step: Json) => <span key={`${provider.id}:${step.ordinal}`}><b>{step.name}</b> {step.state} · {Number(step.durationMs) || 0}ms{step.evidence?.code ? ` · ${step.evidence.code}` : ""}</span>)}
+            </div></details>}
+          </div>;
+        })}
       </div></article>
-      {user?.role === "admin" && <SlackSettingsCard />}
-      {user?.role === "admin" && <NtfySettingsCard />}
-      {user?.role === "admin" && <IdleChatSettingsCard />}
     </div>
     <TokenUsageAnalytics />
     <article className="card process-card"><h3>에이전트 프로세스</h3><div className="table-wrap"><table><thead><tr>

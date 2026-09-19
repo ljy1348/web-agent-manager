@@ -6,17 +6,20 @@ import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import type { AppDatabase } from "../core/database";
 import type { AppConfig } from "../core/config";
-import { parseExperimentEvaluators, type ExperimentEvaluatorConfig, type ExperimentVariantConfig } from "../../shared/experiments";
+import { parseExperimentEvaluators, type ExperimentEvaluatorConfig, type ExperimentVariantConfig, ExperimentProvider} from "../../shared/experiments";
 import { AgentAccountService } from "./agent-accounts";
 import { ExperimentRepository, type ExperimentRunRecord } from "./experiment-repository";
 import { CodexExecRuntime } from "../experiments/codex-exec-runtime";
 import { ClaudePrintRuntime } from "../experiments/claude-print-runtime";
+import { GrokPrintRuntime } from "../experiments/grok-print-runtime";
+import type { AgentRuntime, ExperimentSkillOverlaySnapshot } from "../experiments/agent-runtime";
 import { ExperimentSkillManifestService } from "../experiments/skill-manifest";
 import { ExperimentSkillBundleService } from "../experiments/skill-bundle";
 import { ExperimentWorkspaceService } from "../experiments/experiment-workspace";
 import { ExperimentFixtureStore } from "../experiments/fixture-store";
 import { runDeterministicCheck } from "../experiments/deterministic-check";
 import { recommend, rollupSuite, summarizeVariant, type SuiteCell, type SuiteRecommendation, type SuiteRollup, type VariantSummary } from "../experiments/suite-summary";
+import { FINDING_REPORT_OUTPUT_SCHEMA } from "../experiments/finding-output";
 import { SingleHarness } from "../experiments/single-harness";
 import { GraphHarness } from "../experiments/graph-harness";
 import { createBuiltinExperimentHookBus } from "../experiments/builtin-hooks";
@@ -53,9 +56,15 @@ export function buildEvaluatorVariantConfig(config: ExperimentEvaluatorConfig, a
     runtime: {
       provider: config.provider, accountId, model: config.model,
       reasoningEffort: config.reasoningEffort, sandbox: "read-only",
-      maxTurns: config.provider === "claude" ? null : 3,
+      // Grok headless만 --max-turns를 받는다. Claude는 capability가 없고 Codex exec에도 해당 옵션이 없다.
+      maxTurns: config.provider === "grok" ? 3 : null,
     },
-    skills: { mode: "none", enabled: [], disabled: [], profile: "native", baseline: "clean", additions: [], comparisonId: null, activation: "native" },
+    // Grok CLI에는 발견된 스킬을 끄는 수단이 없어 mode:none이면 실행 자체가 거부된다. 평가자를 아예 못
+    // 쓰게 하는 대신 스킬이 보이는 상태로 돌리고, 그 사실은 실행 스냅샷(skillIsolation)에 남는다.
+    skills: {
+      mode: config.provider === "grok" ? "all" : "none",
+      enabled: [], disabled: [], profile: "native", baseline: "clean", additions: [], comparisonId: null, activation: "native",
+    },
     harness: { type: "single", maxIterations: 1, minimumScore: null, maxNoImprovement: 0, workerCount: 2, secondaryRuntime: null },
     hooks: [], budget: { maxSeconds: 300, maxTokens: 100_000, maxCostUsd: 2 },
   };
@@ -90,6 +99,22 @@ function restrictedEnvironment(accountEnvironment: Record<string, string>): Node
 }
 
 // 실험 생성·격리 실행·취소와 공급자별 Runtime 조립을 관리한다.
+// 공급자별 비대화형 Runtime을 한곳에서 만든다. 예전의 `provider === "codex" ? Codex : Claude` 삼항식은
+// 새로 추가된 공급자를 전부 Claude로 떨어뜨려 엉뚱한 CLI를 실행하므로 분기를 명시적으로 나눈다.
+function createExperimentRuntime(provider: ExperimentProvider, options: {
+  environment: NodeJS.ProcessEnv;
+  inheritProcessEnvironment: boolean;
+  skillManifest: () => Promise<Array<{ id: string; path: string; sha256: string }>>;
+  skillOverlay?: () => Promise<ExperimentSkillOverlaySnapshot | null>;
+  verifySkillOverlay?: (snapshot: ExperimentSkillOverlaySnapshot) => void;
+}): AgentRuntime {
+  if (provider === "codex") return new CodexExecRuntime(options);
+  if (provider === "grok") return new GrokPrintRuntime(options);
+  if (provider === "claude") return new ClaudePrintRuntime(options);
+  // 공급자를 목록에만 추가하고 Runtime을 빠뜨리면 여기서 즉시 드러나야 한다(조용한 Claude 폴백 금지).
+  throw new Error(`실험 Runtime이 없는 공급자입니다: ${provider satisfies never}`);
+}
+
 export class ExperimentService {
   readonly repository: ExperimentRepository;
   private readonly workspaces: ExperimentWorkspaceService;
@@ -128,7 +153,7 @@ export class ExperimentService {
   }
 
   // 프로젝트·계정 기준 스킬 overlay 후보를 원본 경로 없이 반환한다.
-  listSkillCandidates(projectId: number, provider: "codex" | "claude", accountId: number | null) {
+  listSkillCandidates(projectId: number, provider: ExperimentProvider, accountId: number | null) {
     const project = this.database.prepare("SELECT path FROM projects WHERE id = ? AND active = 1").get(projectId) as { path: string } | undefined;
     if (!project) throw new Error("프로젝트를 찾을 수 없습니다.");
     const account = this.accounts.requireForProvider(provider, accountId);
@@ -160,7 +185,7 @@ export class ExperimentService {
     let fixtureMirror: string | null = null;
     let usesFixtureStore = false;
     let skillOverlay: ReturnType<ExperimentSkillBundleService["prepare"]> = null;
-    const skillOverlays = new Map<"codex" | "claude", NonNullable<ReturnType<ExperimentSkillBundleService["prepare"]>>>();
+    const skillOverlays = new Map<ExperimentProvider, NonNullable<ReturnType<ExperimentSkillBundleService["prepare"]>>>();
     try {
       if (!variant) throw new Error("실험 변형을 찾을 수 없습니다.");
       if (variant.config.runtime.sandbox === "danger-full-access") {
@@ -202,11 +227,11 @@ export class ExperimentService {
         throw new Error(`같은 실험의 Git 기준 commit이 바뀌었습니다. 기존 ${priorBaseline.slice(0, 12)}, 현재 ${workspace.baselineCommit.slice(0, 12)}`);
       }
       this.assertSkillIsolationVariant(experiment.id, variant.config);
-      const runtimeAccounts: Array<{ provider: "codex" | "claude"; configDir: string | null }> = [
+      const runtimeAccounts: Array<{ provider: ExperimentProvider; configDir: string | null }> = [
         { provider: variant.config.runtime.provider, configDir: account.config_dir },
         { provider: secondaryConfig.provider, configDir: secondaryAccount.config_dir },
       ];
-      const providerAccounts = new Map<"codex" | "claude", string | null>();
+      const providerAccounts = new Map<ExperimentProvider, string | null>();
       runtimeAccounts.forEach((entry) => {
         if (!providerAccounts.has(entry.provider)) providerAccounts.set(entry.provider, entry.configDir);
       });
@@ -230,7 +255,7 @@ export class ExperimentService {
         if (prepared) skillOverlays.set(provider, prepared);
       }
       skillOverlay = skillOverlays.get(variant.config.runtime.provider) ?? null;
-      const overlayFor = (provider: "codex" | "claude") => () => Promise.resolve(skillOverlays.get(provider) ?? null);
+      const overlayFor = (provider: ExperimentProvider) => () => Promise.resolve(skillOverlays.get(provider) ?? null);
       const verifyOverlay = (snapshot: NonNullable<typeof skillOverlay>) => {
         this.skillBundles.verify(snapshot);
         projectSkills.forEach((entry) => this.skillBundles.verifyMaterialized(entry));
@@ -238,15 +263,17 @@ export class ExperimentService {
       const manifest = () => Promise.resolve(this.skills.discover(
         variant.config.runtime.provider, workspace!.workingDirectory, account.config_dir,
       ));
-      const runtime = variant.config.runtime.provider === "codex"
-        ? new CodexExecRuntime({ environment, inheritProcessEnvironment: false, skillManifest: manifest, skillOverlay: overlayFor("codex"), verifySkillOverlay: verifyOverlay })
-        : new ClaudePrintRuntime({ environment, inheritProcessEnvironment: false, skillManifest: manifest, skillOverlay: overlayFor("claude"), verifySkillOverlay: verifyOverlay });
+      const runtime = createExperimentRuntime(variant.config.runtime.provider, {
+        environment, inheritProcessEnvironment: false, skillManifest: manifest,
+        skillOverlay: overlayFor(variant.config.runtime.provider), verifySkillOverlay: verifyOverlay,
+      });
       const secondaryManifest = () => Promise.resolve(this.skills.discover(
         secondaryConfig.provider, workspace!.workingDirectory, secondaryAccount.config_dir,
       ));
-      const secondaryRuntime = secondaryConfig.provider === "codex"
-        ? new CodexExecRuntime({ environment: secondaryEnvironment, inheritProcessEnvironment: false, skillManifest: secondaryManifest, skillOverlay: overlayFor("codex"), verifySkillOverlay: verifyOverlay })
-        : new ClaudePrintRuntime({ environment: secondaryEnvironment, inheritProcessEnvironment: false, skillManifest: secondaryManifest, skillOverlay: overlayFor("claude"), verifySkillOverlay: verifyOverlay });
+      const secondaryRuntime = createExperimentRuntime(secondaryConfig.provider, {
+        environment: secondaryEnvironment, inheritProcessEnvironment: false, skillManifest: secondaryManifest,
+        skillOverlay: overlayFor(secondaryConfig.provider), verifySkillOverlay: verifyOverlay,
+      });
       const expiresAt = new Date(Date.now() + WORKSPACE_RETENTION_MS).toISOString();
       const run = this.repository.createRun({
         variantId,
@@ -262,9 +289,11 @@ export class ExperimentService {
             id: secondaryAccount.id, label: secondaryAccount.label, provider: secondaryAccount.provider, configDirScoped: true,
           },
           processEnvironment: { inherited: false, keys: Object.keys(environment).sort() },
-          permissionSemantics: variant.config.runtime.provider === "claude"
-            ? "native-permission-mode-not-os-sandbox"
-            : "codex-sandbox",
+          // 셋의 통제 수단이 서로 다르다. Codex·Grok은 실제 OS 샌드박스 프로파일이 있고(Grok은
+          // `--sandbox`와 `--permission-mode`를 함께 건다), Claude만 권한 모드뿐이다.
+          permissionSemantics: variant.config.runtime.provider === "codex" ? "codex-sandbox"
+            : variant.config.runtime.provider === "grok" ? "grok-sandbox-and-permission-mode"
+              : "native-permission-mode-not-os-sandbox",
           skillIsolation: skillOverlay ? {
             profile: skillOverlay.profile, baseline: skillOverlay.baseline, comparisonId: skillOverlay.comparisonId,
             activation: skillOverlay.activation,
@@ -281,9 +310,12 @@ export class ExperimentService {
         },
       });
       const hookBus = createBuiltinExperimentHookBus(variant.config.hooks, workspace.workingDirectory);
-      const isProviderLimited = (provider: "codex" | "claude", limitedAccountId: number | null) => this.isAccountRateLimited(provider, limitedAccountId ?? account.id);
-      const waitForProviderLimit = (waitRunId: string, provider: "codex" | "claude", limitedAccountId: number | null, signal: AbortSignal) =>
+      const isProviderLimited = (provider: ExperimentProvider, limitedAccountId: number | null) => this.isAccountRateLimited(provider, limitedAccountId ?? account.id);
+      const waitForProviderLimit = (waitRunId: string, provider: ExperimentProvider, limitedAccountId: number | null, signal: AbortSignal) =>
         this.awaitProviderLimit(waitRunId, provider, limitedAccountId ?? account.id, signal);
+      const outputSchema = experiment.outputContract === "finding_report"
+        ? { ...FINDING_REPORT_OUTPUT_SCHEMA } as Record<string, unknown>
+        : undefined;
       const harness = variant.config.harness.type === "single"
         ? new SingleHarness({
           repository: this.repository, runtimes: { [variant.config.runtime.provider]: runtime }, hookBus,
@@ -296,7 +328,11 @@ export class ExperimentService {
             ? (skillOverlay?.additions ?? []).map((entry) => `/${entry.name}`).join(" ")
             : "",
         })
-        : new GraphHarness({ repository: this.repository, primaryRuntime: runtime, secondaryRuntime, hookBus, isProviderLimited, waitForProviderLimit });
+        : new GraphHarness({
+          repository: this.repository, primaryRuntime: runtime, secondaryRuntime, hookBus, isProviderLimited, waitForProviderLimit,
+          allowedCommands: fixture?.testCommand.length ? [fixture.testCommand] : [],
+          outputSchema,
+        });
       const checkCommand = fixture?.testCommand ?? [];
       const checkDirectory = workspace.workingDirectory;
       const promise = harness.execute(run.id).then(async (finished) => {
@@ -499,9 +535,7 @@ export class ExperimentService {
       evaluationDirectory = await this.createEvaluationWorkspace(evaluation.id);
       const runtimeEntries: RubricEvaluatorRuntime[] = prepared.map(({ config, account, environment, runtimeConfig }) => {
         const manifest = () => Promise.resolve(this.skills.discover(config.provider, evaluationDirectory!, account.config_dir));
-        const runtime = config.provider === "codex"
-          ? new CodexExecRuntime({ environment, inheritProcessEnvironment: false, skillManifest: manifest })
-          : new ClaudePrintRuntime({ environment, inheritProcessEnvironment: false, skillManifest: manifest });
+        const runtime = createExperimentRuntime(config.provider, { environment, inheritProcessEnvironment: false, skillManifest: manifest });
         const call = this.repository.createEvaluationCall({
           evaluationId: evaluation!.id, idempotencyKey: `${run.id}:${config.label}:rubric-v1`,
           evaluatorLabel: config.label, evaluatorProvider: config.provider,
@@ -610,7 +644,7 @@ export class ExperimentService {
 
   // 한도가 풀릴 때까지 usage_status를 폴링한다. 대기 중에는 전역 실행 슬롯을 반납해 다른 계정·공급자
   // 작업이 그동안 진행될 수 있게 하고, 상한을 넘거나 취소되면 재개하지 않는다.
-  private async awaitProviderLimit(runId: string, provider: "codex" | "claude", accountId: number, signal: AbortSignal): Promise<boolean> {
+  private async awaitProviderLimit(runId: string, provider: ExperimentProvider, accountId: number, signal: AbortSignal): Promise<boolean> {
     this.waitingOnLimit.add(runId);
     try {
       const deadline = Date.now() + MAX_LIMIT_WAIT_MS;
@@ -639,7 +673,7 @@ export class ExperimentService {
   // 실행 실패 시점에 그 계정이 실제로 사용량 한도에 걸려 있었는지 usage-monitor가 갱신한 상태로 본다.
   // CLI 오류 문구를 새로 파싱하지 않고 이미 검증된 데이터만 쓰며, 잔여 사용량이 완전히 0일 때만
   // 한도로 판정해 일반 실행 오류를 한도로 잘못 분류하지 않는다.
-  private async isAccountRateLimited(provider: "codex" | "claude", accountId: number): Promise<boolean> {
+  private async isAccountRateLimited(provider: ExperimentProvider, accountId: number): Promise<boolean> {
     const row = this.database.prepare(
       "SELECT reset_at AS resetAt, remaining_percent AS remainingPercent FROM usage_status WHERE provider = ? AND account_id = ?",
     ).get(provider, accountId) as { resetAt: string | null; remainingPercent: number | null } | undefined;

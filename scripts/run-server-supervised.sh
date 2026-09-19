@@ -43,8 +43,10 @@ log() { printf '%s [supervisor] %s\n' "$(date -Is)" "$1" | tee -a "$LOG_FILE"; }
 
 # 프로세스 생존만으로는 부족하다. 서버가 SIGTERM을 받으면 server.close() 콜백이 열린 WebSocket 때문에
 # 끝나지 않아, 리스너만 닫힌 채 프로세스가 매달리는 상태가 실제로 발생한다(서비스는 죽었는데 PID는 살아있음).
-# 그래서 헬스 응답을 살아있음의 기준으로 삼는다.
-health_ok() { curl -sf -o /dev/null --max-time 3 "http://127.0.0.1:${WEB_AGENT_MANAGER_PORT}/health"; }
+# 그래서 헬스 응답을 살아있음의 기준으로 삼는다. curl은 설치 의존성이 아니라서, 이미 쓰는 Node로 친다.
+health_ok() {
+  "$NODE_BIN" -e 'const p=process.env.WEB_AGENT_MANAGER_PORT||"14003";const r=require("http").get({hostname:"127.0.0.1",port:p,path:"/health",timeout:3000},s=>{s.resume();process.exit(s.statusCode>=200&&s.statusCode<400?0:1)});r.on("error",()=>process.exit(1));r.on("timeout",()=>{r.destroy();process.exit(1);});'
+}
 
 # 종료를 기다리다 grace 시간이 지나면 SIGKILL로 확실히 정리한다(위의 hang 때문에 SIGTERM만으로는 부족하다).
 stop_child() {

@@ -4,7 +4,7 @@ const spawnSync = vi.fn();
 
 vi.mock("node:child_process", () => ({ spawnSync }));
 
-const { pastePromptToTmux, sendTmuxEnter, scrollTmuxHistory, exitTmuxCopyMode, resizeTmuxWindow } = await import("../src/server/services/tmux-input");
+const { exactTmuxTarget, pastePromptToTmux, sendTmuxEnter, sendTmuxEscape, sendTmuxBackspace, sendTmuxLeft, sendTmuxRight, sendTmuxShiftTab, sendTmuxText, scrollTmuxHistory, exitTmuxCopyMode, resizeTmuxWindow } = await import("../src/server/services/tmux-input");
 
 describe("tmux 입력 전달", () => {
   beforeEach(() => {
@@ -19,9 +19,9 @@ describe("tmux 입력 전달", () => {
     const bufferName = spawnSync.mock.calls[0][1][2];
     expect(spawnSync.mock.calls).toEqual([
       ["tmux", ["load-buffer", "-b", bufferName, "-"], { input: "안녕\n두 번째 줄", encoding: "utf8" }],
-      ["tmux", ["paste-buffer", "-p", "-t", "web_agent_manager_chat_44", "-b", bufferName], { encoding: "utf8" }],
+      ["tmux", ["paste-buffer", "-p", "-t", "=web_agent_manager_chat_44:", "-b", bufferName], { encoding: "utf8" }],
       ["tmux", ["delete-buffer", "-b", bufferName], { stdio: "ignore" }],
-      ["tmux", ["send-keys", "-t", "web_agent_manager_chat_44", "Enter"], { encoding: "utf8" }],
+      ["tmux", ["send-keys", "-t", "=web_agent_manager_chat_44:", "Enter"], { encoding: "utf8" }],
     ]);
   });
 
@@ -46,9 +46,9 @@ describe("tmux 기록 스크롤", () => {
     const inMode = scrollTmuxHistory("web_agent_manager_chat_7", 5);
 
     expect(spawnSync.mock.calls.map((call) => call[1])).toEqual([
-      ["copy-mode", "-e", "-t", "web_agent_manager_chat_7"],
-      ["send-keys", "-X", "-t", "web_agent_manager_chat_7", "-N", "5", "scroll-up"],
-      ["display-message", "-p", "-t", "web_agent_manager_chat_7", "#{pane_in_mode}"],
+      ["copy-mode", "-e", "-t", "=web_agent_manager_chat_7:"],
+      ["send-keys", "-X", "-t", "=web_agent_manager_chat_7:", "-N", "5", "scroll-up"],
+      ["display-message", "-p", "-t", "=web_agent_manager_chat_7:", "#{pane_in_mode}"],
     ]);
     expect(inMode).toBe(true);
   });
@@ -62,7 +62,7 @@ describe("tmux 기록 스크롤", () => {
 
     const inMode = scrollTmuxHistory("web_agent_manager_chat_7", -3);
 
-    expect(spawnSync.mock.calls[2][1]).toEqual(["send-keys", "-X", "-t", "web_agent_manager_chat_7", "-N", "3", "scroll-down"]);
+    expect(spawnSync.mock.calls[2][1]).toEqual(["send-keys", "-X", "-t", "=web_agent_manager_chat_7:", "-N", "3", "scroll-down"]);
     expect(inMode).toBe(false);
   });
 
@@ -78,7 +78,7 @@ describe("tmux 기록 스크롤", () => {
   it("기록 보기 종료는 copy-mode 취소 키를 보낸다", () => {
     exitTmuxCopyMode("web_agent_manager_chat_7");
 
-    expect(spawnSync.mock.calls[0][1]).toEqual(["send-keys", "-X", "-t", "web_agent_manager_chat_7", "cancel"]);
+    expect(spawnSync.mock.calls[0][1]).toEqual(["send-keys", "-X", "-t", "=web_agent_manager_chat_7:", "cancel"]);
   });
 });
 
@@ -89,6 +89,29 @@ describe("tmux 화면 크기", () => {
 
     resizeTmuxWindow("web_agent_manager_chat_7", 256, 58);
 
-    expect(spawnSync).toHaveBeenCalledWith("tmux", ["resize-window", "-t", "web_agent_manager_chat_7", "-x", "256", "-y", "58"], { encoding: "utf8" });
+    expect(spawnSync).toHaveBeenCalledWith("tmux", ["resize-window", "-t", "=web_agent_manager_chat_7:", "-x", "256", "-y", "58"], { encoding: "utf8" });
+  });
+});
+
+describe("tmux 세션 정확 이름 매칭", () => {
+  beforeEach(() => {
+    spawnSync.mockReset();
+    spawnSync.mockReturnValue({ status: 0, stderr: "", stdout: "0\n" });
+  });
+
+  it("대상 지정은 = 접두사로 정확 이름만 고른다", () => {
+    // 판 대상은 `=이름`이 아니라 `=이름:`이어야 한다 — `=이름`은 tmux가 can't find pane으로 거부한다(실측).
+    expect(exactTmuxTarget("web_agent_manager_chat_1")).toBe("=web_agent_manager_chat_1:");
+    sendTmuxEscape("web_agent_manager_chat_1");
+    sendTmuxBackspace("web_agent_manager_chat_1", 2);
+    sendTmuxLeft("web_agent_manager_chat_1");
+    sendTmuxRight("web_agent_manager_chat_1");
+    sendTmuxShiftTab("web_agent_manager_chat_1");
+    sendTmuxText("web_agent_manager_chat_1", "x");
+    for (const call of spawnSync.mock.calls) {
+      const args = call[1] as string[];
+      const index = args.indexOf("-t");
+      if (index >= 0) expect(args[index + 1]).toBe("=web_agent_manager_chat_1:");
+    }
   });
 });

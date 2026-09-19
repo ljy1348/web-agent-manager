@@ -1,4 +1,9 @@
 import { describe, expect, it } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import type { AppConfig } from "../src/server/core/config";
+import { openDatabase } from "../src/server/core/database";
 import { DEFAULT_LOGIN_RATE_LIMIT_OPTIONS, LoginRateLimiter, type LoginRateLimitOptions } from "../src/server/core/login-rate-limit";
 
 // 기본값 일부만 바꾼 로그인 제한 테스트 옵션을 만든다.
@@ -18,6 +23,23 @@ describe("로그인 요청 제한", () => {
     const repeated = limiter.begin("127.0.0.1", "admin", 4);
     expect(blocked).toMatchObject({ allowed: false, scope: "account", shouldAudit: true });
     expect(repeated).toMatchObject({ allowed: false, scope: "account", shouldAudit: false });
+  });
+
+  it("서로 다른 IP의 실패도 계정 전체 잠금으로 합치고 재시작 뒤 유지한다", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "wam-login-limit-"));
+    try {
+      const database = openDatabase({ dataDir: root } as AppConfig);
+      const configured = options({ accountFailureLimit: 2, ipAttemptLimit: 100 });
+      const first = new LoginRateLimiter(configured, database);
+      first.recordFailure("192.0.2.1", "admin", 1_000);
+      first.recordFailure("198.51.100.2", "ADMIN", 1_001);
+      expect(first.begin("203.0.113.3", "admin", 1_002)).toMatchObject({ allowed: false, scope: "account", shouldAudit: true });
+      const restarted = new LoginRateLimiter(configured, database);
+      expect(restarted.begin("203.0.113.4", "admin", 1_003)).toMatchObject({ allowed: false, scope: "account", shouldAudit: false });
+      const stored = database.prepare("SELECT scope, key_hash FROM login_rate_limit_buckets WHERE scope = 'account'").get() as any;
+      expect(stored.key_hash).not.toContain("admin");
+      database.close();
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
 
   it("계정명을 바꿔도 IP 전체 요청 창을 초과하면 비밀번호 검증 전에 차단한다", () => {

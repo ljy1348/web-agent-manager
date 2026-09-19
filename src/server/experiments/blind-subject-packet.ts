@@ -1,7 +1,7 @@
 import { collectGitChangeSnapshot } from "./git-change-snapshot";
 const MAX_FINAL_ANSWER_CHARS = 24_000;
 const MAX_DIFF_CHARS = 60_000;
-const PROVIDER_FINGERPRINT = /claude|anthropic|codex|openai|gpt-[\w.-]*|sonnet|opus|haiku|session[_ -]?id|co-authored-by/gi;
+const PROVIDER_FINGERPRINT = /claude|anthropic|codex|openai|gpt-[\w.-]*|grok-[\w.-]*|grok|xai|sonnet|opus|haiku|session[_ -]?id|co-authored-by/gi;
 
 export interface BlindSubjectPacket {
   blindLabel: string;

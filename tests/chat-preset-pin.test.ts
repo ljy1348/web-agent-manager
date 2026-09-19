@@ -90,6 +90,8 @@ describe("채팅의 Agent preset 버전 고정", () => {
     expect(row.versionId).toBe(versionId);
     expect(row.model).toBe("gpt-winner");
     expect(JSON.parse(row.config).runtime.model).toBe("gpt-winner");
+    const audit = database.prepare("SELECT details FROM audit_logs WHERE action = 'chat.create'").get() as { details: string };
+    expect(JSON.parse(audit.details)).toMatchObject({ projectId, provider: "codex", profileVersionId: versionId });
   });
 
   it("나중에 preset의 활성 버전이 바뀌어도 이미 시작한 채팅은 그대로 남는다", async () => {
@@ -142,5 +144,76 @@ describe("채팅의 Agent preset 버전 고정", () => {
     const row = database.prepare("SELECT preset_version_id AS versionId FROM chats WHERE id = ?")
       .get(created.chat.id) as { versionId: string | null };
     expect(row.versionId).toBeNull();
+    const audit = database.prepare("SELECT details FROM audit_logs WHERE action = 'chat.create'").get() as { details: string };
+    expect(JSON.parse(audit.details)).toMatchObject({ profileVersionId: null });
+  });
+});
+
+describe("프로젝트 profile API", () => {
+  it("미저장 초안을 검토한 뒤 draft/version/activation을 명시적으로 진행한다", async () => {
+    const { base, database, projectId } = await startServer();
+    const projectPath = (database.prepare("SELECT path FROM projects WHERE id = ?").get(projectId) as { path: string }).path;
+    fs.writeFileSync(path.join(projectPath, "AGENTS.md"), "rules");
+    fs.writeFileSync(path.join(projectPath, "package.json"), JSON.stringify({ scripts: { test: "vitest" } }));
+
+    const draftResponse = await fetch(`${base}/projects/${projectId}/profile-draft`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ provider: "codex", taskKind: "analysis" }),
+    });
+    expect(draftResponse.status).toBe(200);
+    const draft = (await draftResponse.json() as any).draft;
+    expect(draft.configSnapshot).toMatchObject({ taskKind: "analysis", runtime: { provider: "codex" }, permissions: { sandbox: "read-only" } });
+    expect(database.prepare("SELECT COUNT(*) AS count FROM agent_presets").get()).toEqual({ count: 0 });
+
+    const createResponse = await fetch(`${base}/projects/${projectId}/profiles`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "분석", taskKind: "analysis", configSnapshot: draft.configSnapshot }),
+    });
+    expect(createResponse.status).toBe(201);
+    const profile = (await createResponse.json() as any).profile;
+    expect(profile).toMatchObject({ status: "draft", activeVersion: null, taskKind: "analysis" });
+
+    const versionResponse = await fetch(`${base}/projects/${projectId}/profiles/${profile.id}/versions`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ configSnapshot: { ...draft.configSnapshot, runtime: { provider: "codex", model: "gpt-next" } } }),
+    });
+    expect(versionResponse.status).toBe(201);
+    const versioned = (await versionResponse.json() as any).profile;
+    expect(versioned.versions.map((version: any) => version.version)).toEqual([2, 1]);
+
+    const activateResponse = await fetch(`${base}/projects/${projectId}/profiles/${profile.id}/activate`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ versionId: versioned.versions[0].id }),
+    });
+    expect(activateResponse.status).toBe(200);
+    await expect(activateResponse.json()).resolves.toMatchObject({ profile: { status: "active", activeVersion: 2 } });
+
+    const list = await fetch(`${base}/projects/${projectId}/profiles`);
+    await expect(list.json()).resolves.toMatchObject({ profiles: [{ id: profile.id, taskKind: "analysis", activeVersion: 2 }] });
+    expect(database.prepare("SELECT action FROM audit_logs ORDER BY id").all()).toEqual([
+      { action: "project.profile_create" }, { action: "project.profile_version_create" }, { action: "project.profile_activate" },
+    ]);
+  });
+
+  it("taskKind만 지정한 새 채팅이 해당 프로젝트의 활성 profile version을 자동 pin한다", async () => {
+    const { base, database, projectId } = await startServer();
+    const create = await fetch(`${base}/projects/${projectId}/profiles`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "일반 구현", taskKind: "implementation", configSnapshot: { runtime: { provider: "codex", model: "profile-model" } } }),
+    });
+    const profile = (await create.json() as any).profile;
+    await fetch(`${base}/projects/${projectId}/profiles/${profile.id}/activate`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ versionId: profile.versions[0].id }),
+    });
+
+    const created = await (await fetch(`${base}/chats`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ projectId, provider: "codex", taskKind: "implementation" }),
+    })).json() as any;
+    const chat = database.prepare("SELECT preset_version_id AS versionId, model, preset_config_json AS config FROM chats WHERE id = ?").get(created.chat.id) as any;
+    expect(chat.versionId).toBe(profile.versions[0].id);
+    expect(chat.model).toBe("profile-model");
+    expect(JSON.parse(chat.config).taskKind).toBe("implementation");
   });
 });

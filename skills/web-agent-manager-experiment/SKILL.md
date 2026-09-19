@@ -13,6 +13,7 @@ description: web-agent-manager 실험실에서 구성(스킬셋·하네스·모�
 1. `web_agent_manager_experiment_list`로 프로젝트의 실험과 Variant를 본다.
 2. 외부 공개 저장소를 대상으로 하는 실험이면 `web_agent_manager_experiment_fixtures`로 fixture 상태를 본다.
    `status`가 `ready`가 아닌 fixture는 적격성 게이트를 통과하지 못한 것이라 실행할 수 없다.
+   이 조회는 채점용 정답을 포함하지 않는다.
 
 ## 2. 비교 실행
 

@@ -6,10 +6,13 @@ import type { Json } from "../types";
 import { AuthTerminal } from "../features/terminal/AuthTerminal";
 import { useDialogHistory } from "../lib/dialog-history";
 
-const LABELS: Record<string, string> = { codex: "Codex", claude: "Claude", github: "GitHub" };
+export const CLI_AUTH_LABELS: Record<string, string> = { codex: "Codex", claude: "Claude", grok: "Grok", github: "GitHub" };
+// 계정 슬롯이 있는 CLI만 그룹으로 그린다. GitHub는 슬롯이 없어 아래 별도 버튼이다.
+export const CLI_ACCOUNT_PROVIDERS = ["codex", "claude", "grok"] as const;
+const LABELS = CLI_AUTH_LABELS;
 
 // 세 CLI의 인증 상태와 공식 로그인 터미널을 한 화면에서 관리한다.
-// Codex·Claude는 계정 슬롯마다 설정 디렉터리가 따로라 계정별로 각각 로그인한다.
+// Codex·Claude·Grok은 계정 슬롯마다 설정 디렉터리가 따로라 계정별로 각각 로그인한다.
 export function CliAuthPanel({ open, user, socket, onClose, onRequireOpen, onPendingChange }: { open: boolean; user: Json; socket: WebSocket | null; onClose: () => void; onRequireOpen: () => void; onPendingChange: (pending: boolean) => void }): React.ReactElement | null {
   const [providers, setProviders] = useState<Json[]>([]);
   const [accounts, setAccounts] = useState<Json[]>([]);
@@ -126,7 +129,7 @@ export function CliAuthPanel({ open, user, socket, onClose, onRequireOpen, onPen
       <div className="cli-auth-layout">
         <aside className="cli-auth-providers">
           {loading && <span><LoaderCircle className="spin" size={15} />확인 중</span>}
-          {["codex", "claude"].map((provider) => <React.Fragment key={provider}>
+          {CLI_ACCOUNT_PROVIDERS.map((provider) => <React.Fragment key={provider}>
             <div className="cli-auth-group">
               <span>{LABELS[provider]}</span>
               <button type="button" className="icon-button" title={`${LABELS[provider]} 계정 추가`} aria-label={`${LABELS[provider]} 계정 추가`} onClick={() => void addAccount(provider)}><Plus size={14} /></button>

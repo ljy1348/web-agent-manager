@@ -10,6 +10,7 @@ import { requireTrustedNetwork } from "../core/network";
 import { writeAudit } from "../core/audit";
 import { resolveProjectPath } from "./helpers";
 import type { Provider } from "../../shared/types";
+import { CredentialVault, type McpSecretReferences } from "../services/credential-vault";
 
 type ToolKind = "commands" | "skills" | "marketplace" | "mcp";
 type ToolStatus = "active" | "disabled" | "needs_auth" | "error" | "incompatible" | "not_installed";
@@ -398,19 +399,19 @@ function sanitizeMcpConfig(config: Record<string, unknown>): Record<string, unkn
   };
 }
 
-// Codex 설정 TOML 하나를 읽어 MCP 목록을 도구 카탈로그 항목으로 변환한다.
-function listCodexMcpFile(file: string, scope: ToolScope, source: string): ToolItem[] {
+// 공급자 설정 TOML 하나를 읽어 MCP 목록을 도구 카탈로그 항목으로 변환한다.
+function listTomlMcpFile(provider: TomlMcpProvider, file: string, scope: ToolScope, source: string): ToolItem[] {
   let text = "";
   try {
     text = fs.readFileSync(file, "utf8");
   } catch {
     return [];
   }
-  return readCodexMcpServers(text).map((server) => {
-    const description = server.url || server.command || "Codex MCP server";
+  return readTomlMcpServers(text).map((server) => {
+    const description = server.url || server.command || `${provider} MCP server`;
     return {
-      id: `codex:mcp:user:${server.name}`,
-      provider: "codex",
+      id: `${provider}:mcp:user:${server.name}`,
+      provider,
       kind: "mcp",
       name: server.name,
       label: server.name,
@@ -418,16 +419,30 @@ function listCodexMcpFile(file: string, scope: ToolScope, source: string): ToolI
       status: server.enabled === false ? "disabled" : "active",
       scope,
       source,
-      details: { transport: server.url ? "http" : "stdio", envKeys: Object.keys(server.env ?? {}), headerKeys: Object.keys(server.headers ?? {}), config: { ...server, env: undefined, headers: undefined, envKeys: Object.keys(server.env ?? {}), headerKeys: Object.keys(server.headers ?? {}) } },
+      details: {
+        transport: server.url ? "http" : "stdio",
+        envKeys: [...new Set([...Object.keys(server.env ?? {}), ...(server.envVars ?? [])])],
+        headerKeys: [...new Set([...Object.keys(server.headers ?? {}), ...Object.keys(server.envHttpHeaders ?? {})])],
+        config: {
+          ...server,
+          env: undefined,
+          headers: undefined,
+          envVars: undefined,
+          envHttpHeaders: undefined,
+          envKeys: [...new Set([...Object.keys(server.env ?? {}), ...(server.envVars ?? [])])],
+          headerKeys: [...new Set([...Object.keys(server.headers ?? {}), ...Object.keys(server.envHttpHeaders ?? {})])],
+        },
+      },
     } as ToolItem;
   });
 }
 
-// 사용자/프로젝트 Codex 설정을 함께 읽어 MCP 목록을 만든다.
-function listCodexMcp(projectRoot: string): ToolItem[] {
+// 사용자/프로젝트 설정을 함께 읽어 한 공급자의 MCP 목록을 만든다.
+function listTomlMcp(provider: TomlMcpProvider, projectRoot: string): ToolItem[] {
+  const dir = provider === "grok" ? ".grok" : ".codex";
   return [
-    ...listCodexMcpFile(path.join(os.homedir(), ".codex", "config.toml"), "user", "~/.codex/config.toml"),
-    ...listCodexMcpFile(path.join(projectRoot, ".codex", "config.toml"), "project", ".codex/config.toml"),
+    ...listTomlMcpFile(provider, path.join(os.homedir(), dir, "config.toml"), "user", `~/${dir}/config.toml`),
+    ...listTomlMcpFile(provider, path.join(projectRoot, dir, "config.toml"), "project", `${dir}/config.toml`),
   ];
 }
 
@@ -463,13 +478,13 @@ function parseStringList(value: unknown): string[] {
 // MCP 생성/수정 요청 본문과 라우트 파라미터를 내부 입력 구조로 검증한다.
 function parseMcpInput(body: Record<string, unknown>, providerParam?: string, projectIdParam?: number, nameParam?: string): McpInput {
   const provider = (providerParam ?? body.provider) as Provider;
-  if (!["claude", "codex"].includes(provider)) throw new Error("지원하지 않는 MCP 공급자입니다.");
+  if (!["claude", "codex", "grok"].includes(provider)) throw new Error("지원하지 않는 MCP 공급자입니다.");
   const name = String(nameParam ?? body.name ?? "").trim();
   if (!MCP_NAME_PATTERN.test(name)) throw new Error("MCP 이름은 영문, 숫자, 하이픈, 밑줄만 사용할 수 있습니다.");
   const transport = String(body.transport ?? body.type ?? (body.url ? "http" : "stdio")) as McpInput["transport"];
   if (!["stdio", "http", "sse", "ws"].includes(transport)) throw new Error("지원하지 않는 MCP transport입니다.");
   const projectId = Number(projectIdParam ?? body.projectId);
-  return {
+  const input: McpInput = {
     provider,
     projectId: Number.isInteger(projectId) && projectId > 0 ? projectId : undefined,
     name,
@@ -482,6 +497,9 @@ function parseMcpInput(body: Record<string, unknown>, providerParam?: string, pr
     env: parseJsonMap(body.env, "env"),
     headers: parseJsonMap(body.headers, "headers"),
   };
+  if (transport === "stdio" && input.headers && Object.keys(input.headers).length) throw new Error("stdio MCP에는 headers를 설정할 수 없습니다.");
+  if (transport !== "stdio" && input.env && Object.keys(input.env).length) throw new Error("원격 MCP에는 env 대신 vault-backed headers를 사용하세요.");
+  return input;
 }
 
 // 공급자 설정 파일에 저장할 MCP 서버 설정을 입력값과 기존 비밀 필드로 조합한다.
@@ -543,7 +561,11 @@ function toggleClaudeMcp(database: AppDatabase, projectId: number | undefined, n
   throw new Error("Claude MCP는 공식 설정에서 enabled 토글을 지원하지 않습니다. 삭제 후 필요할 때 다시 추가하세요.");
 }
 
-interface CodexMcpServer {
+// Codex와 Grok은 사용자 설정 파일 형식(`config.toml`의 `[mcp_servers.<이름>]` 블록)이 같아
+// 읽기·쓰기 로직을 공급자 인자로 공유한다. Claude만 JSON(`~/.claude.json`)이라 별도 경로다.
+type TomlMcpProvider = "codex" | "grok";
+
+export interface TomlMcpServer {
   name: string;
   command?: string;
   args?: string[];
@@ -552,6 +574,8 @@ interface CodexMcpServer {
   enabled?: boolean;
   env?: Record<string, string>;
   headers?: Record<string, string>;
+  envVars?: string[];
+  envHttpHeaders?: Record<string, string>;
 }
 
 // 단순 TOML 문자열 값을 내부 문자열로 복원한다.
@@ -584,19 +608,51 @@ function parseTomlInlineMap(value: string): Record<string, string> {
   return result;
 }
 
-// Codex config.toml에서 mcp_servers 블록들을 추출한다.
-function readCodexMcpServers(text: string): CodexMcpServer[] {
+// config.toml에서 mcp_servers 블록들을 추출한다.
+// HTTP 헤더 키 이름이 공급자마다 다르다(실측: Codex `http_headers`, Grok `headers`). 쓰기는 대상
+// 공급자 문법을 따르고, 읽기는 어느 쪽 파일이 오든 깨지지 않게 둘 다 받는다.
+function headerKey(provider: TomlMcpProvider): "http_headers" | "headers" {
+  return provider === "grok" ? "headers" : "http_headers";
+}
+
+// `[mcp_servers.<이름>]`과 `[mcp_servers.<이름>.env|headers|http_headers]`를 구분한다. 예전 정규식은
+// 이름 부분이 `.`을 포함할 수 있어(따옴표 없는 이름) 서브테이블 접미사까지 이름으로 삼켰다 — 실측:
+// 우리 자동 연동이 쓰는 `grok mcp add -e ...`가 남기는 `[mcp_servers.web-agent-manager.env]`가
+// `web-agent-manager.env`라는 유령 서버로 목록에 올라왔다.
+function parseMcpSectionName(raw: string): { name: string; subtable: "env" | "headers" | null } {
+  const quoted = raw.match(/^"([^"]*)"(?:\.(env|headers|http_headers))?$/);
+  if (quoted) return { name: quoted[1], subtable: !quoted[2] ? null : quoted[2] === "env" ? "env" : "headers" };
+  const suffixed = raw.match(/^(.+)\.(env|headers|http_headers)$/);
+  if (suffixed) return { name: suffixed[1], subtable: suffixed[2] === "env" ? "env" : "headers" };
+  return { name: raw, subtable: null };
+}
+
+export function readTomlMcpServers(text: string): TomlMcpServer[] {
   const lines = text.split("\n");
-  const servers: CodexMcpServer[] = [];
-  let current: CodexMcpServer | null = null;
+  const servers: TomlMcpServer[] = [];
+  let current: TomlMcpServer | null = null;
   let currentSubtable: "env" | "headers" | null = null;
+  // CLI가 쓴 여러 줄 배열을 이어 붙이기 위한 버퍼. 실측: `grok mcp add`(와 codex)는 긴 명령의 args를
+  // 한 줄이 아니라 여러 줄로 쓴다. 한 줄만 읽으면 args가 빈 배열이 되고, 그 상태로 도구 화면에서
+  // 저장·토글하면 블록을 다시 쓰면서 실행 인자가 통째로 사라진다.
+  let pendingKey: string | null = null;
+  let pendingValue = "";
   for (const line of lines) {
-    const section = line.match(/^\s*\[mcp_servers\.("?[^"\]]+"?)(?:\.(env|http_headers))?\]\s*$/);
+    if (pendingKey && current) {
+      pendingValue += line.trim();
+      if (line.includes("]")) {
+        if (pendingKey === "args") current.args = parseTomlArray(pendingValue);
+        pendingKey = null;
+        pendingValue = "";
+      }
+      continue;
+    }
+    const section = line.match(/^\s*\[mcp_servers\.(.+)\]\s*$/);
     if (section) {
-      const name = section[1].replace(/^"|"$/g, "");
+      const { name, subtable } = parseMcpSectionName(section[1].trim());
       current = servers.find((item) => item.name === name) ?? { name };
       if (!servers.includes(current)) servers.push(current);
-      currentSubtable = section[2] === "env" ? "env" : section[2] === "http_headers" ? "headers" : null;
+      currentSubtable = subtable;
       continue;
     }
     if (!current || /^\s*(#|$)/.test(line)) continue;
@@ -610,22 +666,29 @@ function readCodexMcpServers(text: string): CodexMcpServer[] {
     if (key === "cwd") current.cwd = unquoteToml(value);
     if (key === "url") current.url = unquoteToml(value);
     if (key === "enabled") current.enabled = value.trim() !== "false";
-    if (key === "args") current.args = parseTomlArray(value);
+    if (key === "args") {
+      // 여는 대괄호만 있고 닫히지 않았으면 다음 줄부터 이어 읽는다.
+      if (value.includes("[") && !value.includes("]")) { pendingKey = "args"; pendingValue = value.trim(); continue; }
+      current.args = parseTomlArray(value);
+    }
     if (key === "env") current.env = parseTomlInlineMap(value);
-    if (key === "http_headers") current.headers = parseTomlInlineMap(value);
+    if (key === "env_vars") current.envVars = parseTomlArray(value);
+    if (key === "env_http_headers") current.envHttpHeaders = parseTomlInlineMap(value);
+    // inline 표기도 공급자에 따라 키 이름이 달라 둘 다 받는다.
+    if (key === "http_headers" || key === "headers") current.headers = parseTomlInlineMap(value);
   }
   return servers;
 }
 
-// Codex 사용자 설정 파일 경로를 만들고 상위 디렉터리를 보장한다.
-function codexConfigFile(): string {
-  const dir = path.join(os.homedir(), ".codex");
+// 공급자 사용자 설정 파일 경로를 만들고 상위 디렉터리를 보장한다.
+function tomlConfigFile(provider: TomlMcpProvider): string {
+  const dir = path.join(os.homedir(), provider === "grok" ? ".grok" : ".codex");
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   return path.join(dir, "config.toml");
 }
 
-// Codex MCP 서버 설정 하나를 TOML 블록으로 직렬화한다.
-function codexServerBlock(server: CodexMcpServer): string {
+// MCP 서버 설정 하나를 TOML 블록으로 직렬화한다.
+export function tomlServerBlock(server: TomlMcpServer, provider: TomlMcpProvider = "codex"): string {
   const lines = [`[mcp_servers.${quoteToml(server.name)}]`];
   if (server.url) lines.push(`url = ${quoteToml(server.url)}`);
   if (server.command) lines.push(`command = ${quoteToml(server.command)}`);
@@ -633,17 +696,19 @@ function codexServerBlock(server: CodexMcpServer): string {
   if (server.cwd) lines.push(`cwd = ${quoteToml(server.cwd)}`);
   if (server.enabled === false) lines.push("enabled = false");
   if (server.env && Object.keys(server.env).length) lines.push(`env = { ${Object.entries(server.env).map(([key, value]) => `${key} = ${quoteToml(value)}`).join(", ")} }`);
-  if (server.headers && Object.keys(server.headers).length) lines.push(`http_headers = { ${Object.entries(server.headers).map(([key, value]) => `${key} = ${quoteToml(value)}`).join(", ")} }`);
+  if (server.headers && Object.keys(server.headers).length) lines.push(`${headerKey(provider)} = { ${Object.entries(server.headers).map(([key, value]) => `${key} = ${quoteToml(value)}`).join(", ")} }`);
+  if (server.envVars?.length) lines.push(`env_vars = [${server.envVars.map(quoteToml).join(", ")}]`);
+  if (server.envHttpHeaders && Object.keys(server.envHttpHeaders).length) lines.push(`env_http_headers = { ${Object.entries(server.envHttpHeaders).map(([key, value]) => `${quoteToml(key)} = ${quoteToml(value)}`).join(", ")} }`);
   return lines.join("\n");
 }
 
-// 기존 Codex MCP 서버 블록을 이름 기준으로 제거한다.
-function removeCodexServerBlock(text: string, name: string): string {
+// 기존 MCP 서버 블록을 이름 기준으로 제거한다.
+export function removeTomlServerBlock(text: string, name: string): string {
   const lines: string[] = [];
   let skipping = false;
   for (const line of text.split("\n")) {
-    const section = line.match(/^\s*\[mcp_servers\.("?[^"\]]+"?)(?:\.(env|http_headers))?\]\s*$/);
-    if (section && section[1].replace(/^"|"$/g, "") === name) {
+    const section = line.match(/^\s*\[mcp_servers\.(.+)\]\s*$/);
+    if (section && parseMcpSectionName(section[1].trim()).name === name) {
       skipping = true;
       continue;
     }
@@ -653,54 +718,60 @@ function removeCodexServerBlock(text: string, name: string): string {
   return lines.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd();
 }
 
-// Codex config.toml에 MCP 서버 설정을 추가하거나 갱신한다.
-function writeCodexMcp(input: McpInput, replaceName?: string): void {
-  const file = codexConfigFile();
+// 공급자 config.toml에 MCP 서버 설정을 추가하거나 갱신한다.
+function writeTomlMcp(provider: TomlMcpProvider, input: McpInput, replaceName?: string, secretReferences?: McpSecretReferences): void {
+  const file = tomlConfigFile(provider);
   const text = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
-  const existing = readCodexMcpServers(text).find((server) => server.name === (replaceName ?? input.name));
-  const server: CodexMcpServer = {
+  const existing = readTomlMcpServers(text).find((server) => server.name === (replaceName ?? input.name));
+  const server: TomlMcpServer = {
     name: replaceName ?? input.name,
     command: input.transport === "stdio" ? input.command : undefined,
     args: input.args,
     cwd: input.cwd,
     url: input.transport !== "stdio" ? input.url : undefined,
     enabled: input.enabled,
-    env: input.env ?? existing?.env,
-    headers: input.headers ?? existing?.headers,
+    env: secretReferences && Object.prototype.hasOwnProperty.call(secretReferences, "env") ? secretReferences.env : input.env ?? existing?.env,
+    headers: secretReferences && Object.prototype.hasOwnProperty.call(secretReferences, "headers") ? secretReferences.headers : input.headers ?? existing?.headers,
+    envVars: secretReferences && Object.prototype.hasOwnProperty.call(secretReferences, "envVars") ? secretReferences.envVars : existing?.envVars,
+    envHttpHeaders: secretReferences && Object.prototype.hasOwnProperty.call(secretReferences, "envHttpHeaders") ? secretReferences.envHttpHeaders : existing?.envHttpHeaders,
   };
   if (!server.command && !server.url) throw new Error("MCP에는 command 또는 URL이 필요합니다.");
-  const without = removeCodexServerBlock(text, server.name);
-  fs.writeFileSync(file, `${without ? `${without}\n\n` : ""}${codexServerBlock(server)}\n`, { mode: 0o600 });
+  const without = removeTomlServerBlock(text, server.name);
+  fs.writeFileSync(file, `${without ? `${without}\n\n` : ""}${tomlServerBlock(server, provider)}\n`, { mode: 0o600 });
 }
 
-// Codex config.toml에서 MCP 서버 설정을 삭제한다.
-function deleteCodexMcp(name: string): void {
-  const file = codexConfigFile();
+// 공급자 config.toml에서 MCP 서버 설정을 삭제한다.
+function deleteTomlMcp(provider: TomlMcpProvider, name: string): void {
+  const file = tomlConfigFile(provider);
   const text = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
-  fs.writeFileSync(file, `${removeCodexServerBlock(text, name)}\n`, { mode: 0o600 });
+  fs.writeFileSync(file, `${removeTomlServerBlock(text, name)}\n`, { mode: 0o600 });
 }
 
-// Codex MCP 서버의 enabled 플래그를 갱신한다.
-function toggleCodexMcp(name: string, enabled: boolean): void {
-  const file = codexConfigFile();
+// 공급자 MCP 서버의 enabled 플래그를 갱신한다.
+function toggleTomlMcp(provider: TomlMcpProvider, name: string, enabled: boolean): void {
+  const file = tomlConfigFile(provider);
   const text = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
-  const server = readCodexMcpServers(text).find((item) => item.name === name);
+  const server = readTomlMcpServers(text).find((item) => item.name === name);
   if (!server) throw new Error("MCP 서버를 찾을 수 없습니다.");
   server.enabled = enabled;
-  const without = removeCodexServerBlock(text, name);
-  fs.writeFileSync(file, `${without ? `${without}\n\n` : ""}${codexServerBlock(server)}\n`, { mode: 0o600 });
+  const without = removeTomlServerBlock(text, name);
+  fs.writeFileSync(file, `${without ? `${without}\n\n` : ""}${tomlServerBlock(server, provider)}\n`, { mode: 0o600 });
 }
 
 async function catalog(projectRoot: string): Promise<ToolItem[]> {
   const configuredMcp = [
     ...listClaudeMcp(projectRoot),
-    ...listCodexMcp(projectRoot),
+    ...listTomlMcp("codex", projectRoot),
+    ...listTomlMcp("grok", projectRoot),
   ];
-  const [claudeCliMcp, codexCliMcp] = await Promise.all([
+  // 일부 CLI(Grok의 JSON 목록)는 확장된 env 원문을 출력하므로 카탈로그 조회에는 vault를
+  // 절대 주입하지 않는다. 실제 자격증명은 채팅 CLI 시작 경로에만 전달한다.
+  const [claudeCliMcp, codexCliMcp, grokCliMcp] = await Promise.all([
     listCliMcp("claude", projectRoot),
     listCliMcp("codex", projectRoot),
+    listCliMcp("grok", projectRoot),
   ]);
-  const discoveredMcp = [...claudeCliMcp, ...codexCliMcp];
+  const discoveredMcp = [...claudeCliMcp, ...codexCliMcp, ...grokCliMcp];
   return [
     ...BUILTIN_COMMANDS,
     ...BUNDLED_CLAUDE_SKILLS,
@@ -713,9 +784,10 @@ async function catalog(projectRoot: string): Promise<ToolItem[]> {
   ];
 }
 
-export function createToolRouter(database: AppDatabase): Router {
+export function createToolRouter(database: AppDatabase, vault?: CredentialVault): Router {
+  const credentialVault = vault;
   const router = Router();
-  router.get("/tools/catalog", async (request, response, next) => {
+  router.get("/tools/catalog", async (request: AuthenticatedRequest, response, next) => {
     try {
       const projectId = Number(request.query.projectId);
       const row = Number.isInteger(projectId) && projectId > 0
@@ -730,8 +802,19 @@ export function createToolRouter(database: AppDatabase): Router {
   router.post("/tools/mcp", requireAdmin, (request: AuthenticatedRequest, response, next) => {
     try {
       const input = parseMcpInput(request.body ?? {});
-      if (input.provider === "claude") writeClaudeMcp(database, input);
-      else writeCodexMcp(input);
+      const save = () => {
+        let references: McpSecretReferences | undefined;
+        if (credentialVault && input.projectId) {
+          projectRootFor(database, input.projectId);
+          references = credentialVault.replaceMcpSecrets(input.provider, input.projectId, input.name,
+            input.transport === "stdio" ? input.env : {}, input.transport === "stdio" ? {} : input.headers);
+        } else if (credentialVault && (input.env !== undefined || input.headers !== undefined)) {
+          throw new Error("MCP 자격증명은 프로젝트 범위가 필요합니다.");
+        }
+        if (input.provider === "claude") writeClaudeMcp(database, references ? { ...input, env: references.env, headers: references.headers } : input);
+        else writeTomlMcp(input.provider as TomlMcpProvider, input, undefined, references);
+      };
+      database.transaction(save)();
       writeAudit(database, request.authUser!.id, "mcp.save", "mcp", `${input.provider}:${input.name}`, { provider: input.provider, projectId: input.projectId, transport: input.transport, hasEnv: !!input.env, hasHeaders: !!input.headers });
       response.status(201).json({ saved: true });
     } catch (error) {
@@ -743,8 +826,19 @@ export function createToolRouter(database: AppDatabase): Router {
       const name = String(request.params.name);
       const providerParam = String(request.params.provider);
       const input = parseMcpInput(request.body ?? {}, providerParam, Number(request.body?.projectId), name);
-      if (input.provider === "claude") writeClaudeMcp(database, input, name);
-      else writeCodexMcp(input, name);
+      const save = () => {
+        let references: McpSecretReferences | undefined;
+        if (credentialVault && input.projectId) {
+          projectRootFor(database, input.projectId);
+          references = credentialVault.replaceMcpSecrets(input.provider, input.projectId, name,
+            input.transport === "stdio" ? input.env : {}, input.transport === "stdio" ? {} : input.headers);
+        } else if (credentialVault && (input.env !== undefined || input.headers !== undefined)) {
+          throw new Error("MCP 자격증명은 프로젝트 범위가 필요합니다.");
+        }
+        if (input.provider === "claude") writeClaudeMcp(database, references ? { ...input, env: references.env, headers: references.headers } : input, name);
+        else writeTomlMcp(input.provider as TomlMcpProvider, input, name, references);
+      };
+      database.transaction(save)();
       writeAudit(database, request.authUser!.id, "mcp.update", "mcp", `${input.provider}:${name}`, { provider: input.provider, projectId: input.projectId, transport: input.transport, hasEnv: !!input.env, hasHeaders: !!input.headers });
       response.json({ saved: true });
     } catch (error) {
@@ -754,13 +848,13 @@ export function createToolRouter(database: AppDatabase): Router {
   router.post("/tools/mcp/:provider/:scope/:name/toggle", requireAdmin, (request: AuthenticatedRequest, response, next) => {
     try {
       const provider = String(request.params.provider) as Provider;
-      if (!["claude", "codex"].includes(provider)) throw new Error("지원하지 않는 MCP 공급자입니다.");
+      if (!["claude", "codex", "grok"].includes(provider)) throw new Error("지원하지 않는 MCP 공급자입니다.");
       const enabled = request.body?.enabled !== false;
       const name = String(request.params.name);
       if (!MCP_NAME_PATTERN.test(name)) throw new Error("유효하지 않은 MCP 이름입니다.");
       const projectId = Number(request.body?.projectId);
       if (provider === "claude") toggleClaudeMcp(database, Number.isInteger(projectId) ? projectId : undefined, name, enabled);
-      else toggleCodexMcp(name, enabled);
+      else toggleTomlMcp(provider as TomlMcpProvider, name, enabled);
       writeAudit(database, request.authUser!.id, "mcp.toggle", "mcp", `${provider}:${name}`, { provider, projectId: Number.isInteger(projectId) ? projectId : null, enabled });
       response.json({ saved: true });
     } catch (error) {
@@ -770,12 +864,16 @@ export function createToolRouter(database: AppDatabase): Router {
   router.delete("/tools/mcp/:provider/:scope/:name", requireAdmin, requireTrustedNetwork, (request: AuthenticatedRequest, response, next) => {
     try {
       const provider = String(request.params.provider) as Provider;
-      if (!["claude", "codex"].includes(provider)) throw new Error("지원하지 않는 MCP 공급자입니다.");
+      if (!["claude", "codex", "grok"].includes(provider)) throw new Error("지원하지 않는 MCP 공급자입니다.");
       const name = String(request.params.name);
       if (!MCP_NAME_PATTERN.test(name)) throw new Error("유효하지 않은 MCP 이름입니다.");
       const projectId = Number(request.query.projectId);
-      if (provider === "claude") deleteClaudeMcp(database, Number.isInteger(projectId) ? projectId : undefined, name);
-      else deleteCodexMcp(name);
+      const validProjectId = Number.isInteger(projectId) && projectId > 0 ? projectId : undefined;
+      database.transaction(() => {
+        if (provider === "claude") deleteClaudeMcp(database, validProjectId, name);
+        else deleteTomlMcp(provider as TomlMcpProvider, name);
+        if (credentialVault && validProjectId) credentialVault.removeMcpServer(provider, validProjectId, name);
+      })();
       writeAudit(database, request.authUser!.id, "mcp.delete", "mcp", `${provider}:${name}`, { provider, projectId: Number.isInteger(projectId) ? projectId : null });
       response.status(204).end();
     } catch (error) {

@@ -80,3 +80,13 @@ describe("승인 요약·버튼 라벨", () => {
     });
   });
 });
+
+describe("Codex 훅 승인 카드(#95)", () => {
+  it("Codex PermissionRequest는 세션 허용 없이 1회 허용·거부만 보여주고 명령을 요약한다", () => {
+    const item = { provider: "codex", request_type: "permission", request_payload: JSON.stringify({ tool_name: "Bash", tool_input: { command: "touch /tmp/x", description: null } }) };
+    expect(approvalActions(item).map((action) => action.decision)).toEqual(["accept", "decline"]);
+    expect(approvalSummary(item)).toBe("Bash: touch /tmp/x");
+    // Claude 권한 요청은 기존처럼 세션 허용을 유지한다.
+    expect(approvalActions({ provider: "claude", request_type: "permission" }).map((action) => action.decision)).toEqual(["accept", "acceptForSession", "decline"]);
+  });
+});

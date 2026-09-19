@@ -81,6 +81,12 @@ export function approvalActions(item: Json): ApprovalAction[] {
     { decision: "accept", label: "예 (y)", className: "primary" },
     { decision: "decline", label: "아니오 (n)", className: "danger" },
   ];
+  // Codex PermissionRequest 훅(#95)은 허용/거부만 돌려줄 수 있어 세션 단위 허용이 없다. 버튼을 두면
+  // 1회 허용과 똑같이 동작해 오해를 부르므로 두 가지만 보여준다.
+  if (item.request_type === "permission" && item.provider === "codex") return [
+    { decision: "accept", label: "1회 허용", className: "primary" },
+    { decision: "decline", label: "거부", className: "danger" },
+  ];
   // Codex가 새 디렉터리에서 처음 묻는 "이 디렉터리를 신뢰합니까?" 화면. 실제 선택지가 2개뿐이다.
   if (item.request_type === "trust_directory") return [
     { decision: "accept", label: "신뢰함 (계속)", className: "primary" },

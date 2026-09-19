@@ -1,4 +1,4 @@
-export type Tab = "overview" | "chat" | "files" | "instructions" | "git" | "experiments" | "tools";
+export type Tab = "overview" | "tasks" | "chat" | "files" | "instructions" | "git" | "schedules" | "experiments" | "tools" | "settings";
 
 export type Json = Record<string, any>;
 
