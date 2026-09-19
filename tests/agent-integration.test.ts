@@ -67,6 +67,13 @@ function fakeRuntime(
           ? { status: 0, stdout: "web-agent-manager\n", stderr: "" }
           : { status: 1, stdout: "", stderr: "not found" };
       }
+      if (args[0] === "mcp" && args[1] === "list") {
+        // 실제 `grok mcp list --json` 형식. 서버가 없어도 종료 코드는 0이다.
+        const servers = installedMcp.has(provider)
+          ? [{ name: "web-agent-manager", command: "node", args: ["agent.js", "--mcp"], enabled: true, scope: "user" }]
+          : [];
+        return { status: 0, stdout: `${JSON.stringify(servers)}\n`, stderr: "" };
+      }
       if (args[0] === "mcp" && args[1] === "remove") {
         installedMcp.delete(provider);
         return { status: 0, stdout: "", stderr: "" };
@@ -94,6 +101,7 @@ describe("에이전트 전역 연동 관리", () => {
     expect((await manager.status()).integrations).toEqual([
       expect.objectContaining({ provider: "codex", cliInstalled: true, ready: false }),
       expect.objectContaining({ provider: "claude", cliInstalled: false, ready: false }),
+      expect.objectContaining({ provider: "grok", cliInstalled: false, ready: false }),
     ]);
     const result = await manager.install("codex");
     const addCall = fixture.calls.find((call) => call.args[0] === "mcp" && call.args[1] === "add");
@@ -125,6 +133,48 @@ describe("에이전트 전역 연동 관리", () => {
     expect(fs.realpathSync(path.join(fixture.config.homeDir, ".claude", "skills", "web-agent-manager-delegate"))).toBe(
       fs.realpathSync(path.join(fixture.config.rootDir, "skills", "web-agent-manager-delegate")),
     );
+  });
+
+  it("Grok은 mcp get이 없어 mcp list 출력으로 연동을 판정하고 ~/.grok/skills에 설치한다", async () => {
+    const fixture = createFixture();
+    const runtime = fakeRuntime(new Set(["grok"]), fixture.installedMcp, fixture.calls);
+    const manager = new AgentIntegrationManager(fixture.config, fixture.database, runtime);
+
+    // mcp list는 서버가 없어도 종료 코드 0이라, 설치 전에는 출력에 이름이 없어야 미연동으로 봐야 한다.
+    expect((await manager.status()).integrations[2]).toMatchObject({ provider: "grok", cliInstalled: true, mcpInstalled: false, ready: false });
+
+    const result = await manager.install("grok");
+    const addCall = fixture.calls.find((call) => call.args[0] === "mcp" && call.args[1] === "add");
+
+    expect(result.integration).toMatchObject({ provider: "grok", skillsInstalled: true, mcpInstalled: true, ready: true });
+    expect(addCall?.args).toEqual([
+      "mcp", "add", "--scope", "user", "web-agent-manager", "-e",
+      `WEB_AGENT_MANAGER_BRIDGE_SOCKET=${path.join(fixture.config.dataDir, "web-agent-manager-agent.sock")}`,
+      "--", process.execPath, path.join(fixture.config.rootDir, "dist", "server", "scripts", "web-agent-manager-agent.js"), "--mcp",
+    ]);
+    expect(fixture.calls.every((call) => !(call.args[0] === "mcp" && call.args[1] === "get"))).toBe(true);
+    expect(fixture.calls.some((call) => call.args.join(" ") === "mcp list --json")).toBe(true);
+    expect(fs.realpathSync(path.join(fixture.config.homeDir, ".grok", "skills", "web-agent-manager-experiment"))).toBe(
+      fs.realpathSync(path.join(fixture.config.rootDir, "skills", "web-agent-manager-experiment")),
+    );
+  });
+
+  it("이름이 다른 서버의 실행 경로에 web-agent-manager가 있어도 Grok 연동으로 오판하지 않는다", async () => {
+    const fixture = createFixture();
+    const runtime: AgentIntegrationRuntime = {
+      findExecutable: (command) => command === "grok" ? "/usr/local/bin/grok" : null,
+      run: async (command, args) => {
+        fixture.calls.push({ command, args });
+        if (args[0] === "mcp" && args[1] === "list") {
+          // 실행 경로에만 같은 문자열이 들어 있는 남의 서버. 출력 전체를 부분 문자열로 보면 오탐한다.
+          return { status: 0, stdout: JSON.stringify([{ name: "other", command: "/tmp/web-agent-manager-agent.js", scope: "user" }]), stderr: "" };
+        }
+        return { status: 1, stdout: "", stderr: "지원하지 않는 명령" };
+      },
+    };
+    const manager = new AgentIntegrationManager(fixture.config, fixture.database, runtime);
+
+    expect((await manager.status()).integrations[2]).toMatchObject({ provider: "grok", cliInstalled: true, mcpInstalled: false, ready: false });
   });
 
   it("공급자 CLI가 없으면 사용자 설정을 만들지 않고 실패한다", async () => {

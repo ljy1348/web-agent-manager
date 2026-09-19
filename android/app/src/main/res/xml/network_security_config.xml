@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <network-security-config>
-    <!-- 평문 HTTP는 앱 코드가 사설망·로컬 호스트 주소일 때만 허용한다. 인증서 검증은 우회하지 않는다. -->
+    <!-- 사설 IP 평문 접속이 필요해 플랫폼 cleartext는 연다. CIDR 예외를 XML로 적을 수 없다. 공개망 HTTP는 ServerConfig가 거부하며 인증서 검증은 우회하지 않는다. -->
     <base-config cleartextTrafficPermitted="true">
         <trust-anchors>
             <certificates src="system" />

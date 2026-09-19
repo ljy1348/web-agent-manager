@@ -12,6 +12,7 @@ function run(overrides: Partial<ExperimentRunRecord>): ExperimentRunRecord {
     outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0, totalTokensSource: "reported", costUsd: null,
     terminationReason: "success", error: null, waitedSeconds: 0, waitCount: 0,
     checkStatus: null, checkExitCode: null, checkDurationMs: null, checkOutput: null,
+    outputStatus: null, observation: {},
     startedAt: "2026-08-15 00:00:00", finishedAt: "2026-08-15 00:01:00",
     createdAt: "2026-08-15 00:00:00", updatedAt: "2026-08-15 00:01:00",
     ...overrides,

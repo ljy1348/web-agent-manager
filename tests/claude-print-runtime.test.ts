@@ -55,7 +55,30 @@ describe("Claude print 런타임", () => {
 
   it("read-only는 native plan으로 기록하고 선택 스킬의 허위 격리를 거부한다", () => {
     expect(buildClaudePrintArgs(runInput({ sandbox: "read-only" }))).toContain("plan");
-    expect(() => buildClaudePrintArgs(runInput({ skills: "selected" }))).toThrow("개별 스킬");
+    expect(() => parseExperimentVariantConfig({
+      schemaVersion: 1,
+      runtime: { provider: "claude", model: "opus", reasoningEffort: "high", sandbox: "workspace-write" },
+      skills: { mode: "selected", enabled: ["review"], disabled: [] },
+      harness: { type: "single" },
+      budget: { maxSeconds: 600 },
+    })).toThrow("개별 스킬");
+    expect(() => parseExperimentVariantConfig({
+      schemaVersion: 1,
+      runtime: { provider: "claude", model: "opus", reasoningEffort: "high", sandbox: "workspace-write" },
+      skills: { mode: "all", enabled: [], disabled: ["review"] },
+      harness: { type: "single" },
+      budget: { maxSeconds: 600 },
+    })).toThrow("개별 스킬");
+    expect(() => parseExperimentVariantConfig({
+      schemaVersion: 1,
+      runtime: { provider: "codex", model: "gpt-test", reasoningEffort: "high", sandbox: "workspace-write" },
+      skills: { mode: "selected", enabled: ["review"], disabled: [] },
+      harness: { type: "orchestrator_worker", secondaryRuntime: { provider: "claude", model: "opus" } },
+      budget: { maxSeconds: 600 },
+    })).toThrow("개별 스킬");
+    const selected = runInput({ skills: "all" });
+    selected.config.skills = { ...selected.config.skills, mode: "selected", enabled: ["review"] };
+    expect(() => buildClaudePrintArgs(selected)).toThrow("개별 스킬");
     const unsupported = runInput();
     unsupported.snapshot.toolProfile.supportsMaxTurns = false;
     expect(() => buildClaudePrintArgs(unsupported)).toThrow("maxTurns");

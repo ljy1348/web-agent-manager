@@ -4,7 +4,8 @@ import { requireAdmin, type AuthenticatedRequest } from "../core/auth";
 import { writeAudit } from "../core/audit";
 import { ExperimentCapacityError, type ExperimentService } from "../services/experiment-service";
 import { AgentPresetService } from "../services/agent-preset-service";
-import { parseExperimentVariantConfig } from "../../shared/experiments";
+import { isExperimentProvider, parseExperimentVariantConfig } from "../../shared/experiments";
+import type { Provider } from "../../shared/types";
 
 // Agent Lab 실험·Variant·run 조회와 관리자 쓰기 API를 구성한다.
 export function createExperimentRouter(database: AppDatabase, service: ExperimentService): Router {
@@ -52,6 +53,8 @@ export function createExperimentRouter(database: AppDatabase, service: Experimen
         projectId, createdBy: request.authUser!.id,
         name: request.body?.name, command: request.body?.command,
         design: request.body?.design, rubric: request.body?.rubric,
+        taskKind: request.body?.taskKind, fixtureId: request.body?.fixtureId ?? null,
+        outputContract: request.body?.outputContract,
       });
       writeAudit(database, request.authUser!.id, "experiment.create", "experiment", experiment.id, { projectId: experiment.projectId });
       response.status(201).json({ experiment });
@@ -62,7 +65,9 @@ export function createExperimentRouter(database: AppDatabase, service: Experimen
 
   router.post("/experiments/:id/variants", requireAdmin, (request: AuthenticatedRequest, response, next) => {
     try {
-      const config = parseExperimentVariantConfig(request.body?.config);
+      const experiment = repository.getExperiment(String(request.params.id));
+      if (!experiment) throw new Error("실험을 찾을 수 없습니다.");
+      const config = parseExperimentVariantConfig(request.body?.config, { outputContract: experiment.outputContract });
       service.assertSkillIsolationVariant(String(request.params.id), config);
       const variant = repository.createVariant({
         experimentId: String(request.params.id), name: request.body?.name,
@@ -79,8 +84,8 @@ export function createExperimentRouter(database: AppDatabase, service: Experimen
     try {
       const projectId = Number(request.params.id);
       requireActiveProject(projectId);
-      const provider = request.query.provider;
-      if (provider !== "codex" && provider !== "claude") throw new Error("스킬 후보 공급자가 올바르지 않습니다.");
+      const provider = request.query.provider as Provider;
+      if (typeof provider !== "string" || !isExperimentProvider(provider)) throw new Error("스킬 후보 공급자가 올바르지 않습니다.");
       const rawAccountId = request.query.accountId;
       const accountId = rawAccountId == null || rawAccountId === "" ? null : Number(rawAccountId);
       if (accountId !== null && (!Number.isInteger(accountId) || accountId < 1)) throw new Error("스킬 후보 계정 ID가 올바르지 않습니다.");

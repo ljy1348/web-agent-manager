@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import type { ExperimentSkillConfig } from "../../shared/experiments";
+import type { ExperimentSkillConfig, ExperimentProvider} from "../../shared/experiments";
 import type { ExperimentSkillOverlaySnapshot } from "./agent-runtime";
 import { ExperimentSkillManifestService, type ExperimentSkillCandidate } from "./skill-manifest";
 
@@ -16,7 +16,7 @@ export interface BundleFile {
 }
 
 export interface MaterializedProjectSkills {
-  provider: "codex" | "claude";
+  provider: ExperimentProvider;
   root: string;
   files: BundleFile[];
   digest: string;
@@ -104,18 +104,21 @@ export class ExperimentSkillBundleService {
   }
 
   // 선택 가능한 후보에서 원본 경로를 제외한 API용 목록을 만든다.
-  catalog(provider: "codex" | "claude", workingDirectory: string, accountConfigDir?: string | null) {
+  catalog(provider: ExperimentProvider, workingDirectory: string, accountConfigDir?: string | null) {
     return this.manifest.catalog(provider, workingDirectory, accountConfigDir).map(({ skillFile: _skillFile, directory: _directory, ...candidate }) => candidate);
   }
 
   // 원본 checkout의 project 스킬을 detached worktree에 동일하게 복제하고 해시를 반환한다.
   materializeProjectSkills(input: {
-    provider: "codex" | "claude";
+    provider: ExperimentProvider;
     sourceDirectory: string;
     targetDirectory: string;
     accountConfigDir?: string | null;
   }): MaterializedProjectSkills {
-    const relativeRoot = input.provider === "codex" ? path.join(".agents", "skills") : path.join(".claude", "skills");
+    // 공급자가 project 스킬로 발견하는 네이티브 경로에 그대로 복제한다.
+    const relativeRoot = input.provider === "codex" ? path.join(".agents", "skills")
+      : input.provider === "grok" ? path.join(".grok", "skills")
+        : path.join(".claude", "skills");
     const targetRoot = path.join(input.targetDirectory, relativeRoot);
     const candidates = this.manifest.catalog(input.provider, input.sourceDirectory, input.accountConfigDir)
       .filter((entry) => entry.source === "installed" && entry.scope === "project");
@@ -133,7 +136,7 @@ export class ExperimentSkillBundleService {
   // baseline과 additions만 다른 실행별 bundle·지시 파일을 생성한다.
   prepare(input: {
     key: string;
-    provider: "codex" | "claude";
+    provider: ExperimentProvider;
     workingDirectory: string;
     accountConfigDir?: string | null;
     additionalNativeDirectories?: string[];

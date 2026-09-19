@@ -1,6 +1,6 @@
 ---
 name: web-agent-manager-session-context
-description: web-agent-manager의 다른 Claude·Codex 채팅 번호나 프로젝트 작업 문맥을 조회한다. 사용자가 "채팅 160 참고", "세션 #160에서 이어서", "이 프로젝트의 Claude 작업 확인"처럼 말하면 사용한다.
+description: web-agent-manager의 다른 Claude·Codex·Grok 채팅 번호나 프로젝트 작업 문맥을 조회한다. 사용자가 "채팅 160 참고", "세션 #160에서 이어서", "이 프로젝트의 Claude 작업 확인"처럼 말하면 사용한다.
 ---
 
 # web-agent-manager 세션 문맥
@@ -12,7 +12,7 @@ description: web-agent-manager의 다른 Claude·Codex 채팅 번호나 프로�
 5. MCP가 없으면 아래 CLI로 같은 구조화 API를 호출한다.
 
 ```bash
-WEB_AGENT_MANAGER_ROOT="$(dirname "$(dirname "$(realpath .agents/skills/web-agent-manager-session-context 2>/dev/null || realpath .claude/skills/web-agent-manager-session-context)")")"
+WEB_AGENT_MANAGER_ROOT="$(dirname "$(dirname "$(realpath .agents/skills/web-agent-manager-session-context 2>/dev/null || realpath .claude/skills/web-agent-manager-session-context 2>/dev/null || realpath .grok/skills/web-agent-manager-session-context)")")"
 npm --silent --prefix "$WEB_AGENT_MANAGER_ROOT" run agent -- call context.get '{"chatId":160,"limit":80}'
 ```
 

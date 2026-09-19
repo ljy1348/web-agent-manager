@@ -9,6 +9,13 @@ describe("릴리즈 버전과 Android wrapper", () => {
     expect(androidBuild).toContain(`versionName "${packageVersion}"`);
   });
 
+  it("packaging 안내의 고정 버전이 package.json과 어긋나지 않는다", () => {
+    const packageVersion = (JSON.parse(fs.readFileSync("package.json", "utf8")) as { version: string }).version;
+    const readme = fs.readFileSync("packaging/README.txt", "utf8");
+    const pinned = [...readme.matchAll(/v(\d+\.\d+\.\d+)/g)].map((match) => match[1]);
+    for (const version of pinned) expect(version).toBe(packageVersion);
+  });
+
   it("Gradle 9.5.0 배포 파일과 wrapper JAR의 공식 해시를 고정한다", () => {
     const properties = fs.readFileSync("android/gradle/wrapper/gradle-wrapper.properties", "utf8");
     const wrapperHash = createHash("sha256").update(fs.readFileSync("android/gradle/wrapper/gradle-wrapper.jar")).digest("hex");

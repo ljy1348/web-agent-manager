@@ -1,11 +1,21 @@
 # TODO 목록
 
+상태 정본은 [WAM Agent Control Plane 구현 계획](docs/agent-control-plane-roadmap.md)이다. 이 파일은 공급자별 기능 후보 인벤토리로 유지하며, 표시가 없는 항목은 아직 우선순위가 확정되지 않은 후보로 본다.
+
+2026-09-13 기준선 대조 결과:
+
+- 완료: 프로젝트별 worktree·브랜치 생성/연결/정리, Git diff·commit·push·PR 흐름, 예약 실행, 교차 공급자 위임, Agent Lab 이벤트 원장·하네스·평가, Agent preset 승격·채팅 버전 pinning, 현재 8개 프로젝트 맞춤 profile 초안 catalog·공급자 실행 정책 강제·검증 gate, CLI canary·단계 rollout·rollback, 전체 백업·빈 환경 복구 훈련, 목표 작업 보드·승인형 자원 추천·동시 실행 queue. 실제 profile 활성화는 저장소 owner 승인 대기다.
+- 부분 완료: MCP 관리(수동 등록 UI만 있음), 모바일 dispatch, 훅 기반 상태(구조화 신호와 폴백이 병행 중), Codex 구조화 채팅 어댑터(JSON-RPC·shadow·신규 채팅 limited session/turn transport와 격리 QA 완료, 운영 opt-in 대기), 로그인 보안(영속 limiter·TOTP MFA·idle/re-auth·세션 제어·WebSocket 폐기·HTTPS 기동 진단 완료).
+- 운영 입력 대기 핵심: Codex 구조화 transport의 실제 7일 shadow·전용 credential acceptance와 quota 확대 승인. 원격 worker는 host 등록·key 회전·probe, workspace 제한 project mapping·명시 승인형 task 접수/status client와 고정 recipe worker CLI까지 완료했으며 실제 원격 host 설치·프로젝트별 recipe 승인은 남아 있다.
+- 선택 보류: Monaco는 현재 256KiB 제한 편집기의 저장·dirty 이동 경고 대비 production 초기 JS 약 1.04MB에 큰 런타임을 더할 근거가 없어 추가하지 않았다. 대형 파일·검색·다중 cursor 실사용 요구가 확인되면 lazy-load 방식으로 재평가한다.
+- 완료 이슈 정리: 운영 신뢰성 이슈 #90~#103은 구현·운영 기록과 전체 검증을 대조한 뒤 2026-09-12 GitHub에서 완료 처리했다.
+
 Codex CLI, Codex App, Claude Code CLI, Claude Code Desktop 기준으로 web-agent-manager에 없는 기능을 정리한다.
 현재 web-agent-manager는 tmux 기반 Codex/Claude 세션을 웹에서 관리하는 운영 콘솔에 가깝고, 아래 항목은 공식 앱 수준의 작업대 경험으로 확장하기 위한 후보이다.
 
 ## 최우선
 
-1. 프로젝트별 worktree 격리
+1. 프로젝트별 worktree 격리 — 완료
    - 새 작업/채팅 시작 시 Git worktree와 작업 브랜치를 자동 생성한다.
    - 병렬 에이전트가 같은 프로젝트 파일을 동시에 수정해도 충돌하지 않게 한다.
    - 작업 완료 후 diff, 테스트, 커밋, PR, worktree 정리를 한 화면에서 처리한다.
@@ -15,17 +25,17 @@ Codex CLI, Codex App, Claude Code CLI, Claude Code Desktop 기준으로 web-agen
    - 카드마다 공급자, 프로젝트, worktree/브랜치, 변경 파일 수, 승인 대기, 테스트 상태, 마지막 활동 시간을 표시한다.
    - Claude agent view와 Codex App의 병렬 작업 흐름을 웹에서 대체할 수 있게 한다.
 
-3. Live preview 패널
+3. Live preview 패널 — loopback sandbox view·Chrome 증거 수집 완료
    - 에이전트가 띄운 dev server 포트를 감지해 iframe preview로 보여준다.
    - 데스크톱/모바일 viewport 전환, console/network 로그, screenshot 캡처를 지원한다.
    - Playwright 검증 결과와 연결해 "눈으로 확인 가능한 작업 완료" 흐름을 만든다.
    - (Orca Design Mode 참고) preview에서 UI 요소를 클릭하면 해당 요소의 HTML·computed CSS·크롭 스크린샷을 묶어 에이전트 입력으로 전달한다.
 
-4. Visual diff review
-   - 파일별 diff뿐 아니라 hunk별 accept/reject를 지원한다.
+4. Visual diff review — hunk 결정·라인 주석 prompt 재전송·screenshot 회귀/접근성 완료, 주석 해결 상태 추적은 후보
+   - 파일별 diff뿐 아니라 hunk별 accept/reject를 지원한다. — 완료
    - 파일 단위 되돌리기, hunk 단위 적용, review 완료 후 커밋을 지원한다.
    - 이미지/바이너리 변경은 미리보기 또는 파일 메타데이터 중심으로 보여준다.
-   - (Orca Annotate AI Diff 참고) diff 라인에 리뷰 주석을 달고, 주석 전체를 라인 앵커와 함께 하나의 프롬프트로 묶어 에이전트에 재전송한다. 주석은 수정 후에도 유지해 해결 여부를 확인한다.
+   - (Orca Annotate AI Diff 참고) diff 라인 의견을 파일·side·line·hunk anchor와 함께 prompt로 재전송한다. — 재전송 완료, 수정 후 해결 여부의 별도 상태는 후보
 
 ## Codex CLI parity
 
@@ -57,14 +67,15 @@ Codex CLI, Codex App, Claude Code CLI, Claude Code Desktop 기준으로 web-agen
    - `codex cloud` 작업 목록, 새 작업 생성, 결과 diff 확인, 로컬 적용을 지원한다.
    - cloud task와 로컬 web-agent-manager 작업을 같은 보드에 표시한다.
 
-8. app-server 기반 어댑터
+8. app-server 기반 어댑터 — shadow·신규 채팅 quota 제한 transport/ACK/재시작 안전성과 전용 credential 10단계 acceptance harness 완료, 실제 운영 seed 실행·7일 관찰 opt-in 대기
    - tmux/TUI 파싱 대신 Codex app-server의 stream event, approval, history 표면을 사용하는 선택 어댑터를 만든다.
    - 기존 TUI 어댑터와 병행 운영한다.
 
 ## Codex App/Desktop parity
 
 1. 원격 호스트 연결
-   - SSH host 등록, 연결 테스트, remote project folder 선택을 지원한다.
+   - SSH host 등록, key 회전, pinned host key 기반 고정 capability 연결 테스트는 완료했다.
+   - remote project folder 선택과 명시 승인형 task dispatch/status client를 지원한다. — 완료
    - 원격 호스트에서 web-agent-manager worker 또는 Codex app-server를 시작하고 상태를 감시한다.
 
 2. 모바일 dispatch UX
@@ -146,8 +157,8 @@ Codex CLI, Codex App, Claude Code CLI, Claude Code Desktop 기준으로 web-agen
    - 에이전트가 preview를 열거나 스크린샷을 찍은 결과를 대화에 첨부한다.
 
 5. PR monitoring with auto-merge
-   - PR checks, review, conflict, branch 상태를 주기 조회한다.
-   - 조건 충족 시 자동 merge하거나 실패 시 follow-up agent를 생성한다.
+   - 선택 PR의 checks, review, conflict, head와 GitHub native auto-merge 상태를 보이는 동안 주기 조회하는 기능은 완료했다.
+   - 동일 head·안전 check 조건에서 native auto-merge 예약/취소는 완료했다. 실패 시 follow-up agent 자동 생성은 별도 정책 승인 전까지 자동화하지 않는다.
 
 6. Scheduled tasks
    - Claude Desktop scheduled task 흐름처럼 자연어 기반 예약 작업 생성 UI를 제공한다.
@@ -162,7 +173,8 @@ Codex CLI, Codex App, Claude Code CLI, Claude Code Desktop 기준으로 web-agen
    - 사용자가 위험 동작을 승인할 수 있는 별도 approval UI를 제공한다.
 
 9. Connectors / enterprise config
-   - Slack/ntfy 외에 GitHub, Sentry, Linear, Jira, Figma, Google Drive 같은 connector 상태를 관리한다.
+   - 공통 CI·incident·사내 자동화 연결용 HTTPS signed outbound webhook은 완료했다. endpoint/HMAC secret vault, public-DNS IP pinning, redirect/SSRF 차단, 중복 전송 원장을 적용한다.
+   - Sentry, Linear, Jira, Figma, Google Drive 전용 connector는 실제 등록 프로젝트의 필요와 운영 자격증명이 확인될 때 추가한다.
    - 조직 정책, 허용 도구, 감사 로그 export를 제공한다.
 
 ## 서드파티 참고 (Orca)

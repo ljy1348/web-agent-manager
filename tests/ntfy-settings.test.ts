@@ -58,6 +58,22 @@ describe("ntfy 알림 설정", () => {
     expect(fetchSpy).toHaveBeenCalledTimes(1);
     fetchSpy.mockRestore();
   });
+
+  it("창별 초기화 제목을 기본 세션 제목 대신 그대로 보낸다", async () => {
+    const database = createTestDatabase();
+    const ntfy = new NtfyNotifier(loadConfig(), database);
+    ntfy.updateSettings("my_web_agent_z6119", "https://ntfy.sh");
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 200 }));
+
+    await ntfy.notify("evt-five-hour", "usage_session_reset", "Codex 5시간 사용량 초기화가 확인되었습니다.", { title: "Codex 5시간 사용량 초기화" });
+
+    const body = JSON.parse(String(fetchSpy.mock.calls[0]?.[1]?.body));
+    expect(body).toMatchObject({
+      title: "Codex 5시간 사용량 초기화",
+      message: "Codex 5시간 사용량 초기화가 확인되었습니다.",
+    });
+    fetchSpy.mockRestore();
+  });
 });
 
 describe("NotificationHub", () => {

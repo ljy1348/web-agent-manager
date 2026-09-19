@@ -1,7 +1,9 @@
-import React, { useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { Check, Copy } from "lucide-react";
 import { projectFileContentUrl, projectFilePathFromHref } from "./file-links";
+import { copyText } from "./clipboard";
 
 // 업로드 첨부 참조 표시("[첨부: 경로]")와 이미지 확장자 판정에 쓰는 공통 규칙.
 const ATTACHMENT_MARKER = /\[첨부: ([^\]]+)\]/g;
@@ -68,6 +70,27 @@ function AttachmentImage({ src, alt, projectFile, onOpenProjectFile }: { src: st
   return <a className="attachment-thumb-box attachment-thumb-link" href={src}><img src={src} alt={alt} loading="lazy" onError={() => setFailed(true)} /></a>;
 }
 
+// 응답 속 명령·코드를 드래그 없이 옮기도록 코드 블록 오른쪽 위에 복사 버튼을 둔다(#101). 모바일은
+// hover가 없어 항상 보이게 하고, 렌더된 텍스트를 그대로 복사하되 코드 끝 줄바꿈은 뺀다.
+function CopyableCodeBlock({ children }: { children?: React.ReactNode }): React.ReactElement {
+  const preRef = useRef<HTMLPreElement>(null);
+  const resetTimer = useRef<number | undefined>(undefined);
+  const [copied, setCopied] = useState(false);
+  useEffect(() => () => window.clearTimeout(resetTimer.current), []);
+  function copy(): void {
+    copyText((preRef.current?.textContent ?? "").replace(/\n$/, ""));
+    setCopied(true);
+    window.clearTimeout(resetTimer.current);
+    resetTimer.current = window.setTimeout(() => setCopied(false), 1500);
+  }
+  return <div className="code-block">
+    <pre ref={preRef}>{children}</pre>
+    <button type="button" className={`code-copy-button${copied ? " copied" : ""}`} aria-label={copied ? "복사됨" : "코드 복사"} title="코드 복사" onClick={copy}>
+      {copied ? <Check size={12} aria-hidden="true" /> : <Copy size={12} aria-hidden="true" />}<span className="code-copy-label">{copied ? "복사됨" : "복사"}</span>
+    </button>
+  </div>;
+}
+
 // react-markdown은 XSS 방지를 위해 알 수 없는 URI scheme의 href를 기본적으로 빈 문자열로 지운다
 // (defaultUrlTransform). "#채팅" 멘션이 쓰는 chat: pseudo-scheme만 예외로 통과시키고 나머지는 그대로
 // 기본 정책을 따른다.
@@ -87,6 +110,7 @@ export function MessageBody({ content, projectId, projectPath, workspacePath, ch
       remarkPlugins={[remarkGfm]}
       urlTransform={urlTransform}
       components={{
+        pre: ({ children }) => <CopyableCodeBlock>{children}</CopyableCodeBlock>,
         img: ({ src, alt }) => {
           const source = String(src ?? "");
           const projectFile = isAttachmentUrl(source, projectId) ? null : messageProjectFile(source, projectPath, workspacePath, linkBasePath);

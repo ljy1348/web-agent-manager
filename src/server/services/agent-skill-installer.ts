@@ -78,19 +78,29 @@ export function installProjectAgentSkills(projectPath: string, rootDir: string):
   ], rootDir);
 }
 
+export type AgentSkillProvider = "codex" | "claude" | "grok";
+
+// 공급자별 사용자 범위 스킬 디렉터리. Grok은 `~/.claude/skills`도 호환으로 읽지만, Claude 설정
+// 유무에 연동이 좌우되지 않도록 네이티브 경로(`~/.grok/skills`)에 설치·확인한다.
+const GLOBAL_SKILL_DIRECTORIES: Record<AgentSkillProvider, string> = {
+  codex: ".codex",
+  claude: ".claude",
+  grok: ".grok",
+};
+
+// 공급자 사용자 홈의 공식 스킬 디렉터리 경로를 만든다.
+function globalSkillRoot(provider: AgentSkillProvider, homeDir: string): string {
+  return path.join(homeDir, GLOBAL_SKILL_DIRECTORIES[provider], "skills");
+}
+
 // 공급자 사용자 홈의 공식 스킬 디렉터리에 중앙 web-agent-manager 스킬 링크를 설치한다.
-export function installGlobalAgentSkills(provider: "codex" | "claude", homeDir: string, rootDir: string): SkillInstallResult {
-  const destination = provider === "codex"
-    ? path.join(homeDir, ".codex", "skills")
-    : path.join(homeDir, ".claude", "skills");
-  return installAgentSkills([destination], rootDir);
+export function installGlobalAgentSkills(provider: AgentSkillProvider, homeDir: string, rootDir: string): SkillInstallResult {
+  return installAgentSkills([globalSkillRoot(provider, homeDir)], rootDir);
 }
 
 // 공급자 사용자 홈의 web-agent-manager 스킬 링크가 모두 현재 중앙 원본을 가리키는지 확인한다.
-export function globalAgentSkillsInstalled(provider: "codex" | "claude", homeDir: string, rootDir: string): boolean {
-  const destination = provider === "codex"
-    ? path.join(homeDir, ".codex", "skills")
-    : path.join(homeDir, ".claude", "skills");
+export function globalAgentSkillsInstalled(provider: AgentSkillProvider, homeDir: string, rootDir: string): boolean {
+  const destination = globalSkillRoot(provider, homeDir);
   return AGENT_SKILL_NAMES.every((skillName) => {
     const target = path.join(destination, skillName);
     try {

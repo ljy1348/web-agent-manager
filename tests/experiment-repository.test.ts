@@ -67,6 +67,18 @@ describe("실험 변형 설정", () => {
     expect(() => parseExperimentVariantConfig({
       schemaVersion: 1, runtime: { provider: "codex" }, budget: { maxSeconds: 0 },
     })).toThrow("최대 실행 시간");
+    expect(parseExperimentVariantConfig(
+      { schemaVersion: 1, runtime: { provider: "claude" } },
+      { outputContract: "finding_report" },
+    ).runtime.sandbox).toBe("read-only");
+    expect(() => parseExperimentVariantConfig({
+      schemaVersion: 1,
+      runtime: { provider: "claude", model: "claude-test", reasoningEffort: "high" },
+      harness: { type: "orchestrator_worker", secondaryRuntime: { provider: "codex", model: "gpt-test", reasoningEffort: "high" } },
+    }, { outputContract: "finding_report" })).toThrow("single 하네스");
+    expect(() => parseExperimentVariantConfig({
+      schemaVersion: 1, runtime: { provider: "claude" }, harness: { type: "evaluator_optimizer" },
+    }, { outputContract: "finding_report" })).toThrow("single 하네스");
   });
 
   it("통제 변수와 평가 변수를 분리해 native 차이도 실험 대상으로 선언하게 한다", () => {

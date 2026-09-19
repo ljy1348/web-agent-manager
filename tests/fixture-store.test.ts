@@ -34,6 +34,7 @@ function fixture(overrides: Partial<ExperimentFixtureRecord>): ExperimentFixture
     id: "11111111-1111-4111-8111-111111111111", name: "sample",
     url: "file:///missing", pinnedCommit: "0".repeat(40), sizeClass: "small",
     language: null, license: null, linesOfCode: null, setupCommand: [], testCommand: [],
+    reviewTarget: null, findingTaxonomy: null, groundTruth: null,
     status: "ready", gate: {}, mirrorPath: null,
     createdAt: "2026-08-15T00:00:00.000Z", updatedAt: "2026-08-15T00:00:00.000Z",
     ...overrides,

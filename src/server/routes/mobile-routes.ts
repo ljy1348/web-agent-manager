@@ -6,16 +6,35 @@ import type { UsageMonitor } from "../services/usage-monitor";
 import type { SystemMetricsService } from "../services/system-metrics";
 import type { FcmNotifier } from "../services/fcm";
 import type { UsageRecord } from "../../shared/types";
+import type { ProviderAdapter } from "../providers/provider";
+
+type UsageWindowMetadata = Pick<ProviderAdapter, "id" | "usageWindowId" | "usageWindowLabels">;
+
+function mobileUsageWindowLabel(row: UsageRecord, adapter: UsageWindowMetadata | undefined): string | null {
+  let windowId = adapter?.usageWindowId;
+  try {
+    const windows = row.details_json ? (JSON.parse(row.details_json) as { windows?: Array<{ id: string }> }).windows ?? [] : [];
+    windowId = windows.find((window) => window.id === adapter?.usageWindowId)?.id
+      ?? windows.find((window) => window.id === "weekly" || window.id.startsWith("weekly_"))?.id
+      ?? windows[0]?.id
+      ?? windowId;
+  } catch {
+    // 손상된 상세 JSON이어도 대표 창 계약으로 위젯 표시를 유지한다.
+  }
+  return windowId ? adapter?.usageWindowLabels?.[windowId] ?? null : null;
+}
 
 // 홈 화면 위젯이 필요한 사용량·CPU·메모리만 작은 응답으로 구성한다.
-export function buildMobileWidgetSnapshot(database: AppDatabase, usageRows: UsageRecord[], system: ReturnType<SystemMetricsService["snapshot"]>) {
+export function buildMobileWidgetSnapshot(database: AppDatabase, usageRows: UsageRecord[], system: ReturnType<SystemMetricsService["snapshot"]>, adapters: UsageWindowMetadata[] = []) {
   const accountLabels = new Map((database.prepare("SELECT id, label FROM agent_accounts").all() as Array<{ id: number; label: string }>).map((row) => [row.id, row.label]));
+  const adapterById = new Map(adapters.map((adapter) => [adapter.id, adapter]));
   const latest = system.latest;
   return {
     capturedAt: new Date().toISOString(),
     usage: usageRows.map((row) => ({
       provider: row.provider,
       accountLabel: accountLabels.get(row.account_id) ?? null,
+      windowLabel: mobileUsageWindowLabel(row, adapterById.get(row.provider)),
       usedPercent: row.used_percent,
       remainingPercent: row.remaining_percent,
       resetAt: row.reset_at,
@@ -30,10 +49,10 @@ export function buildMobileWidgetSnapshot(database: AppDatabase, usageRows: Usag
 }
 
 // Android WebView 앱의 위젯 스냅샷과 FCM 기기 등록 API를 구성한다.
-export function createMobileRouter(database: AppDatabase, usage: UsageMonitor, metrics: SystemMetricsService, fcm: FcmNotifier): Router {
+export function createMobileRouter(database: AppDatabase, usage: UsageMonitor, metrics: SystemMetricsService, fcm: FcmNotifier, adapters: ProviderAdapter[] = []): Router {
   const router = Router();
   router.get("/mobile/widget", (_request, response) => {
-    response.json(buildMobileWidgetSnapshot(database, usage.list(), metrics.snapshot()));
+    response.json(buildMobileWidgetSnapshot(database, usage.list(), metrics.snapshot(), adapters));
   });
   router.get("/mobile/push", requireAdmin, (_request, response) => response.json(fcm.status()));
   router.post("/mobile/push-token", requireAdmin, (request: AuthenticatedRequest, response, next) => {

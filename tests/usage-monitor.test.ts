@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { CodexAdapter } from "../src/server/providers/codex";
 import { ClaudeAdapter } from "../src/server/providers/claude";
-import { detectUsageKeepaliveReason, detectUsageKeepaliveTrigger, detectUsageRegression, isSameUsageKeepaliveWindow, isUsageDetailsDue, isUsageKeepaliveDue, mergeCodexResetCredits, reconcileStaleClaudeSessionWindow, shouldAdoptRejectedUsage } from "../src/server/services/usage-monitor";
+import { claudeUsageBackoffMs, decideFreshUsageAdoption, detectUsageKeepaliveReason, detectUsageKeepaliveTrigger, detectUsageRegression, isClaudeUsageFallbackError, isImplausibleClaudeSessionReset, isMonitorTerminalAged, isSameUsageKeepaliveWindow, isUsageDetailsDue, isUsageKeepaliveDue, mergeCodexResetCredits, reconcileStaleClaudeSessionWindow } from "../src/server/services/usage-monitor";
+import { parseResetTime } from "../src/server/services/rate-limit-resume";
+import { isExpiredResetTime, todayResetTime } from "../src/server/providers/usage-utils";
 
 const codex = new CodexAdapter();
 const claude = new ClaudeAdapter("/tmp/claude-settings.json", {});
@@ -29,8 +31,11 @@ Each column = 1 week · tallest 62.2M
       { id: "weekly", label: "Weekly limit", usedPercent: 25, remainingPercent: 75, resetAt: "19:05 on 9 Jul" },
       { id: "five_hour", label: "5h limit", usedPercent: 87, remainingPercent: 13, resetAt: "16:56" },
     ]);
-    expect(parsed.used_percent).toBe(25);
-    expect(parsed.reset_at).toBe("19:05 on 9 Jul");
+    // 다시 제공되는 5시간 창이 대표값이라 채팅 상태바·위젯·자동 재개가 이 수치를 사용한다.
+    expect(codex.usageWindowId).toBe("five_hour");
+    expect(parsed.used_percent).toBe(87);
+    expect(parsed.remaining_percent).toBe(13);
+    expect(parsed.reset_at).toBe("16:56");
     expect(details.activity).toHaveLength(2);
   });
 
@@ -45,6 +50,21 @@ Usage limit resets
     expect(credits.availableCount).toBe(1);
     expect(new Date(credits.expiresAt).getHours()).toBe(2);
     expect(new Date(credits.expiresAt).getMinutes()).toBe(28);
+  });
+
+  // Codex 0.148.0의 /status에는 "gpt-reserve Weekly limit"이 진짜 "Weekly limit"보다 위에 나온다.
+  // 라벨을 includes로 찾으면 이쪽이 먼저 걸려, 실제로는 54% 사용 중인 창을 0%로 읽고 리셋 시각도
+  // 매분 밀리는 값으로 표시했다(#60). 그 오파싱이 "초기화됐다"는 오판과 알림 중복까지 불렀다.
+  it("Codex /status의 gpt-reserve가 아니라 진짜 주간 한도를 읽는다", () => {
+    const screen = `/status
+╭────────────────────────────────────────────────────────────────────────────────────────╮
+│  >_ OpenAI Codex (v0.148.0)                                                            │
+│  gpt-reserve Weekly limit:   [████████████████████] 100% left (resets 11:46 on 29 Aug) │
+│  Weekly limit:               [█████████░░░░░░░░░░░] 46% left (resets 12:43 on 27 Aug)  │
+╰────────────────────────────────────────────────────────────────────────────────────────╯`;
+    const parsed = codex.parseUsage(screen);
+    expect(parsed.used_percent).toBe(54);
+    expect(parsed.reset_at).toBe("12:43 on 27 Aug");
   });
 
   it("Claude /usage의 현재 모델명이 달라도 모든 구간을 추출한다", () => {
@@ -79,6 +99,24 @@ Resets Jul 11, 1am (Asia/Seoul)`;
     expect(parsed.reset_at).toBe("7:10pm (Asia/Seoul)");
   });
 
+  it("Claude가 밤에 표시한 날짜 없는 새벽 리셋은 다음 날의 5시간 창으로 해석한다", () => {
+    const screen = `Current session
+40% 40% used
+Resets 1am (Asia/Seoul)
+Current week (all models)
+30% 30% used
+Resets Sep 12, 1am (Asia/Seoul)`;
+    const parsed = claude.parseUsage(screen, new Date("2026-09-08T13:53:55.000Z")); // 서울 22:53
+
+    expect(parsed).toMatchObject({
+      data_status: "fresh",
+      error_code: null,
+      used_percent: 40,
+      remaining_percent: 60,
+      reset_at: "1am (Asia/Seoul)",
+    });
+  });
+
   it("인증 요구 화면은 사용 불가로 표시한다", () => {
     const parsed = claude.parseUsage("Login required. Sign in to continue.");
     expect(parsed).toMatchObject({ data_status: "unavailable", error_code: "auth_required" });
@@ -88,6 +126,65 @@ Resets Jul 11, 1am (Asia/Seoul)`;
     const parsed = codex.parseUsage("temporary spinner without usage data");
     expect(parsed).toMatchObject({ data_status: "unavailable", error_code: "parse_failed" });
     expect(parsed.details_json).toBeNull();
+  });
+
+  // Claude 2.1.251 설치본의 seeded/loading 문구 전체를 fixture로 고정한다. 어느 변형이든 막대 숫자는
+  // live endpoint 응답이 아니므로 파서가 반환하거나 DB에 채택하면 안 된다.
+  it.each([
+    ["헤더 seed + 상세 제한", "Per-model breakdown unavailable (rate limited — try again in a moment)", "usage_seeded_headers_throttled"],
+    ["영속 seed + 상세 제한", "Showing last-known usage as of 5m ago (rate limited — try again in a moment)", "usage_seeded_persisted_throttled"],
+    ["헤더 seed + 갱신 실패", "Could not refresh usage data", "usage_seeded_headers_refresh_failed"],
+    ["영속 seed + 갱신 실패", "Showing last-known usage as of 5m ago (could not refresh)", "usage_seeded_persisted_refresh_failed"],
+    ["갱신 진행 중", "Refreshing…", "usage_refreshing"],
+  ])("Claude /usage %s 화면의 퍼센트를 성공 스냅샷으로 쓰지 않는다", (_label, footer, errorCode) => {
+    const screen = `you: /usage
+Settings  Status   Config   Usage   Stats
+Session
+Total cost:            $0.0000
+Current session
+1% 1% used
+Resets 8:30am (Asia/Seoul)
+Current week (all models)
+1% 1% used
+Resets Sep 5, 1am (Asia/Seoul)
+${footer}
+r to retry · Esc to cancel`;
+    const parsed = claude.parseUsage(screen, new Date("2026-08-30T21:34:00.000Z"));
+    expect(parsed).toMatchObject({
+      data_status: "stale",
+      error_code: errorCode,
+      used_percent: null,
+      remaining_percent: null,
+      reset_at: null,
+      details_json: null,
+    });
+  });
+
+  it("Claude usage endpoint 제한은 사용자 session quota 초과와 다른 상태로 분류한다", () => {
+    const parsed = claude.parseUsage("Usage endpoint is rate limited. Please try again in a moment.");
+    expect(parsed).toMatchObject({ data_status: "stale", error_code: "usage_endpoint_throttled", used_percent: null, details_json: null });
+    expect(claude.detectApproval("⎿  You've hit your session limit · resets 7:10pm (Asia/Seoul)\n$ ")).toMatchObject({ requestType: "session_limit_notice" });
+  });
+
+  // 실측 23:30: Current session이 `0% used`만 있고 Resets가 없으면 세션 창이 빠지고 주간 4%가
+  // 대표값으로 fresh 저장됐다. 5시간 25%를 덮으면 안 된다.
+  it("Claude 세션 블록에 Resets가 없으면 주간 숫자로 5시간 창을 덮지 않는다", () => {
+    const screen = `Current session
+0% 0% used
+Current week (all models)
+4% 4% used
+Resets Sep 5, 1am (Asia/Seoul)
+Esc to cancel`;
+    const parsed = claude.parseUsage(screen, new Date("2026-08-30T23:30:33.000Z"));
+    expect(parsed).toMatchObject({
+      data_status: "stale",
+      used_percent: null,
+      error_code: null,
+    });
+    expect(JSON.parse(parsed.details_json!).windows).toEqual([
+      { id: "session", label: "Current session", usedPercent: 0, remainingPercent: 100, resetAt: null },
+      { id: "weekly_all", label: "Current week (all models)", usedPercent: 4, remainingPercent: 96, resetAt: "Sep 5, 1am (Asia/Seoul)" },
+    ]);
   });
 
   // 실제 운영 중 재현된 버그: 조회 전용 PTY를 며칠씩 켜두고 반복 조회하면 Claude CLI가 이미 지난
@@ -181,6 +278,47 @@ Resets Jul 2, 12:59am (Asia/Seoul)`;
     expect(detectUsageRegression(null, details([{ id: "session", usedPercent: 5, resetAt: "2:10pm" }]))).toBe(false);
     expect(detectUsageRegression(details([{ id: "session", usedPercent: 5, resetAt: "2:10pm" }]), null)).toBe(false);
     expect(detectUsageRegression("깨진 JSON", details([{ id: "session", usedPercent: 5, resetAt: "2:10pm" }]))).toBe(false);
+  });
+
+  it("같은 날짜에서 주간이 0%면 바로 채택하지 않고 2회 뒤 PTY 재시작 후 확정한다", () => {
+    const previous = details([
+      { id: "session", usedPercent: 1, resetAt: "3:49am (Asia/Seoul)" },
+      { id: "weekly_all", usedPercent: 21, resetAt: "Sep 5, 12:59am (Asia/Seoul)" },
+    ]);
+    const parsed = {
+      data_status: "fresh" as const,
+      used_percent: 0,
+      remaining_percent: 100,
+      reset_at: "1:50pm (Asia/Seoul)",
+      details_json: details([
+        { id: "session", usedPercent: 0, resetAt: "1:50pm (Asia/Seoul)" },
+        { id: "weekly_all", usedPercent: 0, resetAt: "Sep 5, 1am (Asia/Seoul)" },
+      ]),
+    };
+    const idle = { streak: 0, recycled: false };
+    const first = decideFreshUsageAdoption(parsed, previous, "session", idle);
+    expect(first.kind).toBe("hold-zero");
+    if (first.kind !== "hold-zero") throw new Error("expected hold-zero");
+    expect(first.recycle).toBe(false);
+    expect(JSON.parse(first.record.details_json!).windows).toEqual([
+      { id: "session", label: "session", remainingPercent: null, usedPercent: 0, resetAt: "1:50pm (Asia/Seoul)" },
+      { id: "weekly_all", label: "weekly_all", remainingPercent: null, usedPercent: 21, resetAt: "Sep 5, 12:59am (Asia/Seoul)" },
+    ]);
+
+    const second = decideFreshUsageAdoption(parsed, first.record.details_json, "session", first.zeroConfirm);
+    expect(second).toMatchObject({ kind: "hold-zero", recycle: true, zeroConfirm: { streak: 2, recycled: true } });
+
+    const confirmed = decideFreshUsageAdoption(parsed, first.record.details_json, "session", { streak: 2, recycled: true });
+    expect(confirmed).toEqual({ kind: "adopt", record: parsed, zeroConfirm: { streak: 0, recycled: false } });
+  });
+
+  it("대표 세션 창이 같은 리셋에서 0이 아닌 값으로 줄면 스냅샷 전체를 거절한다", () => {
+    const previous = details([{ id: "session", usedPercent: 56, resetAt: "2:10pm (Asia/Seoul)" }]);
+    const parsed = { data_status: "fresh" as const, details_json: details([{ id: "session", usedPercent: 26, resetAt: "2:10pm (Asia/Seoul)" }]) };
+    expect(decideFreshUsageAdoption(parsed, previous, "session", { streak: 0, recycled: false })).toEqual({
+      kind: "reject",
+      zeroConfirm: { streak: 0, recycled: false },
+    });
   });
 });
 
@@ -313,14 +451,125 @@ Resets Jul 11, 12:59am (Asia/Seoul)`, now);
     expect(parsed.data_status).toBe("fresh");
     expect(reconcileStaleClaudeSessionWindow(parsed, now)).toEqual(parsed);
   });
+
+  it("새 화면에 세션 Resets가 없고 직전 리셋이 지났으면 저장 창을 0%로 보정한다", () => {
+    const now = new Date("2026-09-01T13:21:00.000Z"); // 서울 기준 오후 10:21
+    const parsed = new ClaudeAdapter("/tmp/x.json", {}).parseUsage(`Current session
+0% 0% used
+Current week (all models)
+21% 21% used
+Resets Sep 5, 1am (Asia/Seoul)`, now);
+    const previous = JSON.stringify({ windows: [
+      { id: "session", label: "Current session", usedPercent: 14, remainingPercent: 86, resetAt: "8:50pm (Asia/Seoul)" },
+      { id: "weekly_all", label: "Current week (all models)", usedPercent: 21, remainingPercent: 79, resetAt: "Sep 5, 1am (Asia/Seoul)" },
+    ] });
+
+    const reconciled = reconcileStaleClaudeSessionWindow(parsed, now, previous);
+    expect(reconciled).toMatchObject({ data_status: "fresh", used_percent: 0, remaining_percent: 100, error_code: null, reset_at: "1:50am (Asia/Seoul)" });
+    expect(JSON.parse(reconciled.details_json!).windows).toEqual([
+      { id: "session", label: "Current session", usedPercent: 0, remainingPercent: 100, resetAt: "1:50am (Asia/Seoul)" },
+      { id: "weekly_all", label: "Current week (all models)", usedPercent: 21, remainingPercent: 79, resetAt: "Sep 5, 1am (Asia/Seoul)" },
+    ]);
+  });
+
+  it("직전 세션 리셋이 아직이면 Resets 없는 0%로 저장 값을 덮지 않는다", () => {
+    const now = new Date("2026-08-30T23:30:33.000Z");
+    const parsed = new ClaudeAdapter("/tmp/x.json", {}).parseUsage(`Current session
+0% 0% used
+Current week (all models)
+4% 4% used
+Resets Sep 5, 1am (Asia/Seoul)`, now);
+    const previous = JSON.stringify({ windows: [
+      { id: "session", label: "Current session", usedPercent: 25, remainingPercent: 75, resetAt: "Aug 31, 3:00am (Asia/Seoul)" },
+    ] });
+
+    expect(reconcileStaleClaudeSessionWindow(parsed, now, previous)).toEqual(parsed);
+    expect(parsed.used_percent).toBeNull();
+  });
 });
 
-describe("연속 거부 탈출", () => {
-  it("짧은 거부는 마지막 정상값을 지키고 5회부터 최신값을 채택한다", () => {
-    expect(shouldAdoptRejectedUsage(1)).toBe(false);
-    expect(shouldAdoptRejectedUsage(4)).toBe(false);
-    expect(shouldAdoptRejectedUsage(5)).toBe(true);
-    expect(shouldAdoptRejectedUsage(27)).toBe(true);
+// Claude CLI는 정각 리셋을 "6pm"처럼 분 없이 찍는데, 예전 정규식이 분을 필수로 요구해 이 표기를
+// 통째로 못 읽었다. 그 탓에 옛 스냅샷 방어 로직 3개가 정각 표기에서만 무력화돼, 5시간 롤링 창인데
+// 8시간 뒤인 리셋 시각이 fresh로 채택됐다(실사용 재현 — #53).
+describe("정각 리셋 표기 파싱", () => {
+  const now = new Date("2026-08-22T00:57:00.000Z"); // 서울 기준 오전 9:57
+
+  it("분이 없는 정각 표기도 시각으로 읽는다", () => {
+    // getHours()는 실행 환경의 로컬 타임존으로 표시해 KST에서만 18이 나오고 UTC CI에서는 9가 된다.
+    // 파싱 결과 자체는 타임존과 무관한 같은 절대 시각이므로 ISO로 비교한다(서울 18시 = 09:00Z).
+    expect(todayResetTime("6pm (Asia/Seoul)", now)?.toISOString()).toBe("2026-08-22T09:00:00.000Z");
+    expect(todayResetTime("3am (Asia/Seoul)", now)?.toISOString()).toBe("2026-08-21T18:00:00.000Z");
+    expect(parseResetTime("1pm (Asia/Seoul)", now)?.toISOString()).toBe("2026-08-22T04:00:00.000Z");
+  });
+
+  it("정각 표기도 콜론이 있는 표기와 같은 판정을 받는다", () => {
+    const session = (resetAt: string): string => JSON.stringify({ windows: [{ id: "session", label: "Current session", usedPercent: 89, remainingPercent: 11, resetAt }] });
+    // 09:57 기준 6pm은 8시간 뒤라 5시간 롤링 창에서는 나올 수 없는 값이다.
+    expect(isImplausibleClaudeSessionReset(session("6pm (Asia/Seoul)"), now)).toBe(true);
+    expect(isImplausibleClaudeSessionReset(session("6:00pm (Asia/Seoul)"), now)).toBe(true);
+    // 창 안에 있는 값은 그대로 통과해야 한다.
+    expect(isImplausibleClaudeSessionReset(session("2pm (Asia/Seoul)"), now)).toBe(false);
+  });
+
+  it("정각 표기가 이미 지났으면 stale로 잡는다", () => {
+    expect(isExpiredResetTime("3am (Asia/Seoul)", now)).toBe(true);
+    expect(isExpiredResetTime("2pm (Asia/Seoul)", now)).toBe(false);
+  });
+
+  // 날짜가 붙은 문구는 시:분만 보고 오늘/내일로 추측하면 CLI가 명시한 날짜를 무시하게 되므로,
+  // 정각 단독 매치를 허용하지 않던 기존 동작을 그대로 유지해야 한다.
+  it("날짜가 붙은 문구는 기존대로 시:분 전용 파싱을 유지한다", () => {
+    expect(todayResetTime("Aug 29, 1am (Asia/Seoul)", now)).toBeNull();
+    expect(parseResetTime("Aug 29, 1am (Asia/Seoul)", now)).toBeNull();
+    expect(isExpiredResetTime("Aug 22, 1am (Asia/Seoul)", now)).toBe(false);
+  });
+
+  it("실제로 파싱된 정각 세션 창을 화면에서 끝까지 통과시킨다", () => {
+    // 사용자 스냅샷에서 그대로 옮긴 화면(16시간 된 PTY가 돌려준 옛 값).
+    const parsed = new ClaudeAdapter("/tmp/x.json", {}).parseUsage(`Current session
+89% 89% used
+Resets 6pm (Asia/Seoul)
+Current week (all models)
+80% 80% used
+Resets Aug 22, 1am (Asia/Seoul)`, now);
+    expect(parsed.reset_at).toBe("6pm (Asia/Seoul)");
+    expect(isImplausibleClaudeSessionReset(parsed.details_json, now)).toBe(true);
+  });
+});
+
+// 조회 전용 PTY를 오래 켜두면 Claude CLI가 시작 시점 캐시를 돌려주는 게 실측됐다(#52).
+// 캐시가 묵기 전에 새 프로세스로 갈아타는 판정이다.
+describe("조회 PTY 수명 판정", () => {
+  const now = new Date("2026-08-22T01:00:00.000Z").getTime();
+  const hoursAgo = (hours: number): number => now - hours * 60 * 60_000;
+
+  it("수명 안쪽이면 그대로 쓴다", () => {
+    expect(isMonitorTerminalAged(hoursAgo(0), now)).toBe(false);
+    expect(isMonitorTerminalAged(hoursAgo(2.9), now)).toBe(false);
+  });
+
+  it("수명을 넘기면 갈아탈 대상으로 본다", () => {
+    expect(isMonitorTerminalAged(hoursAgo(3), now)).toBe(true);
+    // 실제 문제가 재현된 16시간짜리 PTY.
+    expect(isMonitorTerminalAged(hoursAgo(16), now)).toBe(true);
+  });
+
+  it("아직 뜬 적 없으면 판정 대상이 아니다", () => {
+    expect(isMonitorTerminalAged(undefined, now)).toBe(false);
+  });
+});
+
+describe("Claude usage fallback 백오프", () => {
+  it("상세 조회 fallback만 2·4·8·15분으로 자동 조회 간격을 벌린다", () => {
+    expect(isClaudeUsageFallbackError("usage_seeded_headers_throttled")).toBe(true);
+    expect(isClaudeUsageFallbackError("usage_seeded_persisted_refresh_failed")).toBe(true);
+    expect(isClaudeUsageFallbackError("usage_refreshing")).toBe(false);
+    expect(isClaudeUsageFallbackError("auth_required")).toBe(false);
+    expect(claudeUsageBackoffMs(1)).toBe(2 * 60_000);
+    expect(claudeUsageBackoffMs(2)).toBe(4 * 60_000);
+    expect(claudeUsageBackoffMs(3)).toBe(8 * 60_000);
+    expect(claudeUsageBackoffMs(4)).toBe(15 * 60_000);
+    expect(claudeUsageBackoffMs(20)).toBe(15 * 60_000);
   });
 });
 
@@ -331,6 +580,7 @@ describe("빈 사용량 창 최소 턴 판정", () => {
 
     expect(detectUsageKeepaliveReason("claude", null, weeklyOnly)).toBe("claude_session_missing");
     expect(detectUsageKeepaliveReason("claude", null, zeroSession)).toBe("claude_session_zero");
+    expect(detectUsageKeepaliveReason("claude", null, details([{ id: "session", usedPercent: 0, resetAt: null }]))).toBe("claude_session_zero");
     expect(detectUsageKeepaliveReason("claude", null, details([{ id: "session", usedPercent: 1, resetAt: "5:00pm" }]))).toBeNull();
   });
 
@@ -345,13 +595,70 @@ describe("빈 사용량 창 최소 턴 판정", () => {
     expect(JSON.parse(trigger!.windowKey!)).toEqual([{ id: "session", resetAt: "2026-08-11T18:40:00.000Z" }]);
   });
 
-  it("Codex는 양수에서 0%로 바뀐 경우에만 활성화한다", () => {
+  // 사용자의 정책에 따라 5시간과 주간 초기화를 모두 활성화하되, 실행 폭주는 별도 상한이 막는다.
+  it("Codex는 5시간 또는 주간 창이 0%인 동안 계속 활성화한다", () => {
     const before = details([{ id: "five_hour", usedPercent: 18, resetAt: "12:00" }]);
     const reset = details([{ id: "five_hour", usedPercent: 0, resetAt: "17:00" }]);
 
     expect(detectUsageKeepaliveReason("codex", before, reset)).toBe("codex_reset_zero");
-    expect(detectUsageKeepaliveReason("codex", reset, reset)).toBeNull();
-    expect(detectUsageKeepaliveReason("codex", null, reset)).toBeNull();
+    // 이미 0%가 이어지는 상태에서도, 직전 값을 몰라도 계속 활성화되어야 재시도가 가능하다.
+    expect(detectUsageKeepaliveReason("codex", reset, reset)).toBe("codex_reset_zero");
+    expect(detectUsageKeepaliveReason("codex", null, reset)).toBe("codex_reset_zero");
+    // 사용량이 잡히면(=고정 성공) 더는 활성화되지 않는다.
+    expect(detectUsageKeepaliveReason("codex", reset, before)).toBeNull();
+    expect(detectUsageKeepaliveReason("codex", null, details([{ id: "weekly", usedPercent: 0, resetAt: "Aug 29" }]))).toBe("codex_reset_zero");
+  });
+
+  it("Codex 5시간·주간 창이 동시에 0%여도 keepalive 작업 하나만 만든다", () => {
+    const reset = details([
+      { id: "five_hour", usedPercent: 0, resetAt: "14:01" },
+      { id: "weekly", usedPercent: 0, resetAt: "09:01 on 4 Sep" },
+    ]);
+
+    expect(detectUsageKeepaliveTrigger("codex", reset, reset)).toEqual({ reason: "codex_reset_zero", windowKey: null });
+  });
+
+  it("Codex 양수→0% 새 초기화는 직전 null 키 쿨다운을 넘는 창 키를 만든다", () => {
+    const now = new Date("2026-08-30T01:24:52.000Z");
+    const before = details([
+      { id: "weekly", usedPercent: 57, resetAt: "03:50 on 4 Sep" },
+      { id: "five_hour", usedPercent: 1, resetAt: "10:24" },
+    ]);
+    const reset = details([
+      { id: "weekly", usedPercent: 0, resetAt: "06:23 on 6 Sep" },
+      { id: "five_hour", usedPercent: 0, resetAt: "11:23" },
+    ]);
+
+    const trigger = detectUsageKeepaliveTrigger("codex", before, reset, now);
+
+    expect(trigger?.reason).toBe("codex_reset_zero");
+    expect(JSON.parse(trigger!.windowKey!)).toEqual([
+      { id: "five_hour", resetAt: "2026-08-30T02:23:00.000Z" },
+      { id: "weekly", resetAt: "2026-09-05T21:23:00.000Z" },
+    ]);
+    expect(isUsageKeepaliveDue("2026-08-29T20:27:07.000Z", null, trigger?.windowKey, now)).toBe(true);
+    expect(detectUsageKeepaliveTrigger("codex", reset, reset, now)?.windowKey).toBeNull();
+  });
+
+  // 0% 창은 리셋 시각이 계속 밀려 창 키를 만들 수 없다. 키를 비워야 isUsageKeepaliveDue가
+  // 5시간 쿨다운으로 재시도 간격을 잡는다.
+  it("Codex 주간 0% 창도 창 키 없이 활성화해 쿨다운으로 재시도 간격을 둔다", () => {
+    const reset = details([{ id: "weekly", usedPercent: 0, resetAt: "11:20 on 29 Aug" }]);
+    const trigger = detectUsageKeepaliveTrigger("codex", reset, reset, new Date("2026-08-22T02:20:00.000Z"));
+
+    expect(trigger?.reason).toBe("codex_reset_zero");
+    expect(trigger?.windowKey).toBeNull();
+    // 키가 없으면 마지막 전송으로부터 5시간이 지나야 다시 보낸다.
+    expect(isUsageKeepaliveDue("2026-08-22T02:00:00.000Z", null, null, new Date("2026-08-22T03:00:00.000Z"))).toBe(false);
+    expect(isUsageKeepaliveDue("2026-08-22T02:00:00.000Z", null, null, new Date("2026-08-22T08:00:00.000Z"))).toBe(true);
+  });
+
+  it("Grok 주간 한도가 양수에서 0%가 되어도 keepalive를 타지 않는다", () => {
+    const before = details([{ id: "weekly", usedPercent: 18, resetAt: "Aug 22" }]);
+    const reset = details([{ id: "weekly", usedPercent: 0, resetAt: "Aug 29" }]);
+
+    expect(detectUsageKeepaliveReason("grok", before, reset)).toBeNull();
+    expect(detectUsageKeepaliveTrigger("grok", before, reset)).toBeNull();
   });
 
   it("같은 초기화 창은 막고 다른 창은 5시간 안이어도 허용한다", () => {

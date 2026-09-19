@@ -20,6 +20,7 @@ export interface AuthUser {
   id: number;
   username: string;
   role: "admin" | "user";
+  access_scope?: "standard" | "test_only";
   last_project_id?: number | null;
   last_chat_id?: number | null;
   chat_view_mode?: "chat" | "terminal";
@@ -69,6 +70,7 @@ export interface ChatRecord {
   worktree_path: string | null;
   last_error: string | null;
   busy: number;
+  last_user_activity_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -96,7 +98,26 @@ export interface UsageRecord {
   account_id: number;
   monitor_status: "starting" | "ready" | "refreshing" | "error" | "stopped";
   data_status: "fresh" | "stale" | "unavailable";
-  error_code: "auth_required" | "timeout" | "parse_failed" | "cli_exited" | null;
+  error_code:
+    | "auth_required"
+    | "timeout"
+    | "parse_failed"
+    | "cli_exited"
+    // 이전 배포본이 저장한 Claude usage 상세 조회 제한 코드. 새 기록에는 아래 세분 코드를 쓴다.
+    | "rate_limited"
+    // Claude /usage 상세 endpoint가 제한됐지만 최근 응답 헤더 값은 화면에 남아 있는 상태다.
+    | "usage_seeded_headers_throttled"
+    // Claude /usage 상세 endpoint가 제한돼 디스크의 마지막 값을 화면에 대신 표시한 상태다.
+    | "usage_seeded_persisted_throttled"
+    // 제한 응답은 아니지만 상세 갱신에 실패해 최근 응답 헤더 값을 표시한 상태다.
+    | "usage_seeded_headers_refresh_failed"
+    // 제한 응답은 아니지만 상세 갱신에 실패해 디스크의 마지막 값을 표시한 상태다.
+    | "usage_seeded_persisted_refresh_failed"
+    // 사용할 seed도 없이 Claude /usage 상세 endpoint 자체가 제한된 상태다.
+    | "usage_endpoint_throttled"
+    // Claude /usage가 아직 로딩 중이라 숫자의 출처가 확정되지 않은 상태다.
+    | "usage_refreshing"
+    | null;
   summary: string | null;
   used_percent: number | null;
   remaining_percent: number | null;

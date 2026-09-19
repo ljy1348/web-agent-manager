@@ -4,6 +4,29 @@ import type { AppConfig } from "./config";
 
 export type AppDatabase = Database.Database;
 
+// 만료된 임시 사용자를 지우되 감사·승인 기록은 행위자만 비워 보존한다.
+// 기존 DB의 두 FK가 ON DELETE SET NULL 없이 생성돼 있어 먼저 참조를 끊지 않으면 사용자 삭제가 실패한다.
+export function deleteExpiredTemporaryUsers(database: AppDatabase): number {
+  return database.transaction(() => {
+    const cutoff = (database.prepare("SELECT datetime('now') AS value").get() as { value: string }).value;
+    database.prepare(`
+      UPDATE audit_logs SET user_id = NULL
+      WHERE user_id IN (
+        SELECT id FROM users WHERE temporary_expires_at IS NOT NULL AND temporary_expires_at <= ?
+      )
+    `).run(cutoff);
+    database.prepare(`
+      UPDATE approvals SET decided_by = NULL
+      WHERE decided_by IN (
+        SELECT id FROM users WHERE temporary_expires_at IS NOT NULL AND temporary_expires_at <= ?
+      )
+    `).run(cutoff);
+    return database.prepare(
+      "DELETE FROM users WHERE temporary_expires_at IS NOT NULL AND temporary_expires_at <= ?",
+    ).run(cutoff).changes;
+  })();
+}
+
 const schema = `
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
@@ -13,9 +36,13 @@ CREATE TABLE IF NOT EXISTS users (
   username TEXT NOT NULL UNIQUE,
   password_hash TEXT NOT NULL,
   role TEXT NOT NULL DEFAULT 'admin' CHECK(role IN ('admin', 'user')),
+  access_scope TEXT NOT NULL DEFAULT 'standard' CHECK(access_scope IN ('standard', 'test_only')),
+  temporary_expires_at TEXT,
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
   last_project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
   last_chat_id INTEGER REFERENCES chats(id) ON DELETE SET NULL,
   chat_view_mode TEXT NOT NULL DEFAULT 'chat' CHECK(chat_view_mode IN ('chat', 'terminal')),
+  password_changed_at TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -39,7 +66,58 @@ CREATE TABLE IF NOT EXISTS web_sessions (
   token_hash TEXT NOT NULL UNIQUE,
   csrf_token TEXT NOT NULL,
   mobile_trusted_device_id TEXT REFERENCES mobile_trusted_devices(id) ON DELETE SET NULL,
+  network_access_allowed INTEGER NOT NULL DEFAULT 1 CHECK(network_access_allowed IN (0, 1)),
   expires_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  reauthenticated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS login_rate_limit_buckets (
+  scope TEXT NOT NULL CHECK(scope IN ('ip', 'account')),
+  key_hash TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  failures INTEGER NOT NULL DEFAULT 0,
+  window_started_at_ms INTEGER NOT NULL DEFAULT 0,
+  blocked_until_ms INTEGER NOT NULL DEFAULT 0,
+  audited_block_until_ms INTEGER NOT NULL DEFAULT 0,
+  last_seen_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(scope, key_hash)
+);
+
+CREATE TABLE IF NOT EXISTS user_mfa (
+  user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  encrypted_secret TEXT NOT NULL,
+  nonce TEXT NOT NULL,
+  auth_tag TEXT NOT NULL,
+  last_used_step INTEGER,
+  enabled_at TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS user_mfa_recovery_codes (
+  user_id INTEGER NOT NULL REFERENCES user_mfa(user_id) ON DELETE CASCADE,
+  code_hash TEXT NOT NULL,
+  used_at TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY(user_id, code_hash)
+);
+
+CREATE TABLE IF NOT EXISTS mfa_login_challenges (
+  token_hash TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 관리자가 발급한 숫자 코드는 원문을 저장하지 않고 한 번만 임시 사용자 세션으로 교환한다.
+CREATE TABLE IF NOT EXISTS one_time_login_codes (
+  id TEXT PRIMARY KEY,
+  code_hash TEXT NOT NULL UNIQUE,
+  issued_by INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  expires_at TEXT NOT NULL,
+  consumed_at TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -79,15 +157,56 @@ CREATE TABLE IF NOT EXISTS chats (
   tmux_name TEXT NOT NULL UNIQUE,
   status TEXT NOT NULL DEFAULT 'stopped',
   title TEXT NOT NULL,
+  origin TEXT NOT NULL DEFAULT 'user' CHECK(origin IN ('user', 'delegation')),
   history_file TEXT,
   model TEXT,
   git_branch TEXT,
   worktree_path TEXT,
+  workspace_validation_status TEXT CHECK(workspace_validation_status IN ('valid', 'needs_review')),
+  workspace_validation_json TEXT,
   last_error TEXT,
+  last_user_activity_at TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(provider, provider_session_id)
 );
+
+-- Codex처럼 새 session ID를 실행 전에 지정할 수 없는 공급자의 첫 기록을 정확한 웹 채팅에 붙인다.
+-- 같은 프로젝트에 빈 터미널이 여러 개 떠 있어도 생성 순서나 일시적인 busy 상태로 추측하지 않고,
+-- 실제로 그 채팅에 전달한 첫 프롬프트와 JSONL의 첫 user 메시지를 대조한다.
+CREATE TABLE IF NOT EXISTS chat_history_claims (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  chat_id INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+  prompt TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+-- 서버 재시작 뒤에도 유지되는 매일 프롬프트 일정. 새 채팅 방식은 provider/account를, 기존 채팅
+-- 방식은 chat_id를 사용하며 마지막 실행 날짜를 현지 날짜로 선점해 같은 날 중복 실행을 막는다.
+CREATE TABLE IF NOT EXISTS prompt_schedules (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  mode TEXT NOT NULL CHECK(mode IN ('new_chat', 'existing_chat')),
+  provider TEXT CHECK(provider IN ('codex', 'claude', 'grok')),
+  account_id INTEGER REFERENCES agent_accounts(id) ON DELETE SET NULL,
+  chat_id INTEGER REFERENCES chats(id) ON DELETE SET NULL,
+  prompt TEXT NOT NULL,
+  daily_time TEXT NOT NULL,
+  timezone TEXT NOT NULL,
+  -- 값이 있으면 이 현지 날짜에 한 번만 실행하고 끈다(#99). 비어 있으면 매일 반복한다.
+  run_date TEXT,
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+  last_run_date TEXT,
+  last_run_at TEXT,
+  last_status TEXT CHECK(last_status IN ('running', 'success', 'error')),
+  last_error TEXT,
+  last_chat_id INTEGER REFERENCES chats(id) ON DELETE SET NULL,
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_prompt_schedules_due ON prompt_schedules(enabled, daily_time);
 
 CREATE TABLE IF NOT EXISTS approvals (
   id TEXT PRIMARY KEY,
@@ -119,12 +238,13 @@ CREATE TABLE IF NOT EXISTS usage_status (
 -- 대표 사용량 창의 예정 초기화와 발송 여부를 보존해 재시작 뒤에도 중복 없이 알린다.
 CREATE TABLE IF NOT EXISTS usage_reset_schedules (
   provider TEXT NOT NULL CHECK(provider IN ('codex', 'claude', 'grok')),
+  account_id INTEGER NOT NULL REFERENCES agent_accounts(id) ON DELETE CASCADE,
   window_id TEXT NOT NULL,
   scheduled_reset_at TEXT NOT NULL,
   used_percent REAL,
   notified_at TEXT,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  PRIMARY KEY(provider, window_id)
+  PRIMARY KEY(provider, account_id, window_id)
 );
 
 -- 한 번 정상 검증된 에이전트 연동은 재시작 뒤에도 무거운 CLI 상태 검사를 반복하지 않는다.
@@ -160,9 +280,138 @@ CREATE TABLE IF NOT EXISTS notification_deliveries (
 CREATE TABLE IF NOT EXISTS slack_settings (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   bot_token TEXT,
+  bot_token_vault_id TEXT REFERENCES credential_vault_entries(id) ON DELETE SET NULL,
   channel_id TEXT,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+-- WAM이 직접 받은 자격증명만 별도 master key로 암호화한다. 공급자 CLI의 공식 로그인
+-- 디렉터리는 이 테이블로 가져오지 않으며, 암호문도 용도·소유 범위와 묶어 바꿔치기를 막는다.
+CREATE TABLE IF NOT EXISTS credential_vault_entries (
+  id TEXT PRIMARY KEY,
+  owner_type TEXT NOT NULL CHECK(owner_type IN ('system', 'project')),
+  owner_id TEXT NOT NULL,
+  purpose TEXT NOT NULL,
+  secret_name TEXT NOT NULL,
+  encrypted_value TEXT NOT NULL,
+  nonce TEXT NOT NULL,
+  auth_tag TEXT NOT NULL,
+  version INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(owner_type, owner_id, purpose, secret_name)
+);
+
+-- MCP 설정 파일에는 이 바인딩이 가리키는 환경변수 참조만 기록한다. 원문은 실행 직전의
+-- 짧은 내부 lease 동안에만 복호화되고 API·감사 로그에는 반환하지 않는다.
+CREATE TABLE IF NOT EXISTS credential_vault_mcp_bindings (
+  provider TEXT NOT NULL CHECK(provider IN ('codex', 'claude', 'grok')),
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  server_name TEXT NOT NULL,
+  field_kind TEXT NOT NULL CHECK(field_kind IN ('env', 'header')),
+  field_name TEXT NOT NULL,
+  env_var TEXT NOT NULL,
+  credential_id TEXT NOT NULL REFERENCES credential_vault_entries(id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY(provider, project_id, server_name, field_kind, field_name)
+);
+
+CREATE TABLE IF NOT EXISTS credential_vault_leases (
+  id TEXT PRIMARY KEY,
+  credential_id TEXT NOT NULL REFERENCES credential_vault_entries(id) ON DELETE CASCADE,
+  consumer TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  released_at TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 범용 outbound webhook의 URL은 path/query 자체에 토큰이 포함될 수 있어 HMAC secret과 함께
+-- vault ID만 저장한다. 공개 설정 API에는 endpoint_host 외 원문을 반환하지 않는다.
+CREATE TABLE IF NOT EXISTS webhook_settings (
+  id INTEGER PRIMARY KEY CHECK(id = 1),
+  endpoint_vault_id TEXT REFERENCES credential_vault_entries(id) ON DELETE SET NULL,
+  signing_secret_vault_id TEXT REFERENCES credential_vault_entries(id) ON DELETE SET NULL,
+  endpoint_host TEXT,
+  enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0, 1)),
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 다른 알림 채널과 독립된 이벤트별 전송 원장. URL·payload·signature는 보존하지 않는다.
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+  event_id TEXT PRIMARY KEY,
+  event_type TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('sending', 'sent', 'failed')),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_http_status INTEGER,
+  last_error TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS remote_worker_hosts (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  hostname TEXT NOT NULL,
+  port INTEGER NOT NULL CHECK(port BETWEEN 1 AND 65535),
+  username TEXT NOT NULL,
+  workspace_root TEXT,
+  host_key TEXT NOT NULL,
+  host_key_fingerprint TEXT NOT NULL,
+  private_key_credential_id TEXT NOT NULL REFERENCES credential_vault_entries(id) ON DELETE RESTRICT,
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+  status TEXT NOT NULL DEFAULT 'unverified' CHECK(status IN ('unverified', 'ready', 'unreachable', 'incompatible')),
+  protocol_version TEXT,
+  worker_version TEXT,
+  capabilities_json TEXT NOT NULL DEFAULT '[]',
+  last_latency_ms INTEGER,
+  last_error TEXT,
+  last_probed_at TEXT,
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS remote_worker_project_mappings (
+  id TEXT PRIMARY KEY,
+  project_id INTEGER NOT NULL UNIQUE REFERENCES projects(id) ON DELETE CASCADE,
+  host_id TEXT NOT NULL REFERENCES remote_worker_hosts(id) ON DELETE CASCADE,
+  remote_path TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(host_id, remote_path)
+);
+
+CREATE TABLE IF NOT EXISTS remote_worker_dispatches (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES agent_tasks(id) ON DELETE CASCADE,
+  mapping_id TEXT NOT NULL REFERENCES remote_worker_project_mappings(id) ON DELETE RESTRICT,
+  host_id TEXT NOT NULL REFERENCES remote_worker_hosts(id) ON DELETE RESTRICT,
+  capability TEXT NOT NULL CHECK(capability IN ('build', 'test', 'verify', 'preview')),
+  idempotency_key TEXT NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('dispatching', 'queued', 'running', 'completed', 'failed', 'unknown')),
+  remote_dispatch_id TEXT,
+  summary TEXT,
+  last_error TEXT,
+  last_latency_ms INTEGER,
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(task_id, idempotency_key),
+  UNIQUE(host_id, remote_dispatch_id)
+);
+
+CREATE TRIGGER IF NOT EXISTS cleanup_orphaned_mcp_credential
+AFTER DELETE ON credential_vault_mcp_bindings
+BEGIN
+  DELETE FROM credential_vault_entries
+  WHERE id = OLD.credential_id
+    AND NOT EXISTS (SELECT 1 FROM credential_vault_mcp_bindings WHERE credential_id = OLD.credential_id);
+END;
 
 CREATE TABLE IF NOT EXISTS ntfy_settings (
   id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -338,6 +587,9 @@ CREATE TABLE IF NOT EXISTS experiment_fixtures (
   status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft', 'ready', 'rejected')),
   gate_json TEXT NOT NULL DEFAULT '{}',
   mirror_path TEXT,
+  review_target_json TEXT,
+  finding_taxonomy TEXT,
+  ground_truth_json TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -351,6 +603,7 @@ CREATE TABLE IF NOT EXISTS experiments (
   rubric_json TEXT NOT NULL DEFAULT '{}',
   suite_id TEXT REFERENCES experiment_suites(id) ON DELETE SET NULL,
   task_kind TEXT CHECK(task_kind IN ('maintenance', 'greenfield', 'feature', 'security')),
+  output_contract TEXT NOT NULL DEFAULT 'code_change' CHECK(output_contract IN ('code_change', 'finding_report')),
   fixture_id TEXT REFERENCES experiment_fixtures(id) ON DELETE SET NULL,
   status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft', 'active', 'archived')),
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -398,6 +651,8 @@ CREATE TABLE IF NOT EXISTS experiment_runs (
   check_exit_code INTEGER,
   check_duration_ms INTEGER,
   check_output TEXT,
+  output_status TEXT CHECK(output_status IN ('ok', 'malformed', 'missing', 'not_applicable')),
+  observation_json TEXT NOT NULL DEFAULT '{}',
   started_at TEXT,
   finished_at TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -438,7 +693,7 @@ CREATE TABLE IF NOT EXISTS experiment_nodes (
   ordinal INTEGER NOT NULL,
   attempt INTEGER NOT NULL DEFAULT 1,
   status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued', 'running', 'completed', 'failed', 'cancelled')),
-  provider TEXT CHECK(provider IN ('codex', 'claude')),
+  provider TEXT CHECK(provider IN ('codex', 'claude', 'grok')),
   model TEXT,
   input_json TEXT NOT NULL DEFAULT '{}',
   output_json TEXT,
@@ -527,7 +782,7 @@ CREATE TABLE IF NOT EXISTS experiment_evaluation_calls (
   evaluation_id TEXT NOT NULL REFERENCES experiment_evaluations(id) ON DELETE CASCADE,
   idempotency_key TEXT NOT NULL,
   evaluator_label TEXT NOT NULL,
-  evaluator_provider TEXT NOT NULL CHECK(evaluator_provider IN ('codex', 'claude')),
+  evaluator_provider TEXT NOT NULL CHECK(evaluator_provider IN ('codex', 'claude', 'grok')),
   evaluator_model TEXT,
   evaluator_family TEXT,
   evaluator_account_id INTEGER REFERENCES agent_accounts(id) ON DELETE SET NULL,
@@ -559,10 +814,10 @@ CREATE TABLE IF NOT EXISTS experiment_judgments (
   run_id TEXT NOT NULL REFERENCES experiment_runs(id) ON DELETE CASCADE,
   evaluator_label TEXT NOT NULL,
   evaluator_kind TEXT NOT NULL DEFAULT 'agent' CHECK(evaluator_kind IN ('agent', 'human', 'deterministic')),
-  evaluator_provider TEXT CHECK(evaluator_provider IN ('codex', 'claude')),
+  evaluator_provider TEXT CHECK(evaluator_provider IN ('codex', 'claude', 'grok')),
   evaluator_model TEXT,
   evaluator_family TEXT,
-  subject_provider TEXT CHECK(subject_provider IN ('codex', 'claude')),
+  subject_provider TEXT CHECK(subject_provider IN ('codex', 'claude', 'grok')),
   subject_model TEXT,
   subject_family TEXT,
   same_family INTEGER NOT NULL DEFAULT 0,
@@ -601,6 +856,7 @@ CREATE TABLE IF NOT EXISTS agent_presets (
   id TEXT PRIMARY KEY,
   project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   name TEXT NOT NULL,
+  task_kind TEXT NOT NULL DEFAULT 'implementation' CHECK(task_kind IN ('analysis', 'implementation', 'high_risk', 'operations')),
   status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft', 'active', 'archived')),
   active_version INTEGER,
   created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
@@ -627,13 +883,412 @@ CREATE TABLE IF NOT EXISTS agent_preset_versions (
   UNIQUE(preset_id, version)
 );
 
+-- 일반 채팅 작업과 프롬프트 전달의 정본 원장. 공급자 JSONL과 중복되는 메시지 원문은 저장하지 않는다.
+CREATE TABLE IF NOT EXISTS agent_tasks (
+  id TEXT PRIMARY KEY,
+  chat_id INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  profile_version_id TEXT REFERENCES agent_preset_versions(id) ON DELETE SET NULL,
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  state TEXT NOT NULL DEFAULT 'created' CHECK(state IN ('created', 'running', 'needs_input', 'verifying', 'completed', 'failed', 'cancelled', 'budget_exceeded')),
+  state_reason TEXT,
+  goal TEXT,
+  acceptance_criteria_json TEXT NOT NULL DEFAULT '[]',
+  checkpoints_json TEXT NOT NULL DEFAULT '[]',
+  next_action TEXT,
+  budget_json TEXT NOT NULL DEFAULT '{}',
+  priority INTEGER NOT NULL DEFAULT 50 CHECK(priority BETWEEN 0 AND 100),
+  last_verified_checkpoint TEXT,
+  selected_provider TEXT CHECK(selected_provider IS NULL OR selected_provider IN ('codex', 'claude', 'grok')),
+  selected_account_id INTEGER REFERENCES agent_accounts(id) ON DELETE SET NULL,
+  started_at TEXT,
+  finished_at TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS agent_task_events (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES agent_tasks(id) ON DELETE CASCADE,
+  sequence INTEGER NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  type TEXT NOT NULL,
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(task_id, sequence),
+  UNIQUE(task_id, idempotency_key)
+);
+
+CREATE TABLE IF NOT EXISTS task_routing_recommendations (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES agent_tasks(id) ON DELETE CASCADE,
+  idempotency_key TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'applied', 'rejected')),
+  candidates_json TEXT NOT NULL,
+  evidence_json TEXT NOT NULL,
+  selected_provider TEXT,
+  selected_account_id INTEGER REFERENCES agent_accounts(id) ON DELETE SET NULL,
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  decided_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  decided_at TEXT,
+  UNIQUE(task_id, idempotency_key)
+);
+
+CREATE TABLE IF NOT EXISTS task_concurrency_limits (
+  scope_type TEXT NOT NULL CHECK(scope_type IN ('project', 'provider', 'account')),
+  scope_id TEXT NOT NULL,
+  max_running INTEGER NOT NULL CHECK(max_running BETWEEN 1 AND 100),
+  updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY(scope_type, scope_id)
+);
+
+CREATE TABLE IF NOT EXISTS task_queue_entries (
+  task_id TEXT PRIMARY KEY REFERENCES agent_tasks(id) ON DELETE CASCADE,
+  priority INTEGER NOT NULL CHECK(priority BETWEEN 0 AND 100),
+  state TEXT NOT NULL DEFAULT 'queued' CHECK(state IN ('queued', 'admitted', 'released')),
+  provider TEXT NOT NULL CHECK(provider IN ('codex', 'claude', 'grok')),
+  account_id INTEGER NOT NULL REFERENCES agent_accounts(id) ON DELETE CASCADE,
+  queued_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  admitted_at TEXT,
+  released_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS project_preview_targets (
+  project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+  url TEXT NOT NULL,
+  viewport_width INTEGER NOT NULL CHECK(viewport_width BETWEEN 320 AND 1920),
+  viewport_height INTEGER NOT NULL CHECK(viewport_height BETWEEN 240 AND 1080),
+  updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS task_workbench_artifacts (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES agent_tasks(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK(kind IN ('preview_screenshot', 'visual_diff')),
+  path TEXT NOT NULL,
+  sha256 TEXT NOT NULL,
+  size_bytes INTEGER NOT NULL,
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS task_visual_baselines (
+  task_id TEXT PRIMARY KEY REFERENCES agent_tasks(id) ON DELETE CASCADE,
+  artifact_id TEXT NOT NULL REFERENCES task_workbench_artifacts(id) ON DELETE CASCADE,
+  set_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS prompt_commands (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES agent_tasks(id) ON DELETE CASCADE,
+  chat_id INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+  source TEXT NOT NULL CHECK(source IN ('web', 'schedule', 'delegation', 'system')),
+  idempotency_key TEXT NOT NULL,
+  request_fingerprint TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  delivery_content_hash TEXT,
+  content_length INTEGER NOT NULL,
+  replay_count INTEGER NOT NULL DEFAULT 0,
+  last_replayed_at TEXT,
+  state TEXT NOT NULL DEFAULT 'received' CHECK(state IN ('received', 'dispatching', 'delivered', 'queued', 'started', 'rejected', 'cancelled', 'delivery_unknown', 'reconciled_delivered', 'reconciled_failed')),
+  last_error TEXT,
+  received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(source, idempotency_key)
+);
+
+CREATE TABLE IF NOT EXISTS prompt_delivery_attempts (
+  id TEXT PRIMARY KEY,
+  command_id TEXT NOT NULL REFERENCES prompt_commands(id) ON DELETE CASCADE,
+  attempt INTEGER NOT NULL,
+  adapter TEXT NOT NULL,
+  evidence_type TEXT,
+  outcome TEXT NOT NULL CHECK(outcome IN ('attempting', 'delivered', 'queued', 'rejected', 'delivery_unknown')),
+  baseline_json TEXT NOT NULL DEFAULT '{}',
+  error TEXT,
+  started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  finished_at TEXT,
+  UNIQUE(command_id, attempt)
+);
+
+-- 공급자 CLI 버전별로 실제 사용할 수 있는 구조화 신호와 TUI 폴백 이유를 보존한다.
+CREATE TABLE IF NOT EXISTS provider_capability_snapshots (
+  id TEXT PRIMARY KEY,
+  provider TEXT NOT NULL CHECK(provider IN ('codex', 'claude', 'grok')),
+  account_id INTEGER REFERENCES agent_accounts(id) ON DELETE CASCADE,
+  cli_version TEXT,
+  cli_version_key TEXT NOT NULL,
+  transport TEXT NOT NULL CHECK(transport IN ('app_server', 'stream_json', 'hook_jsonl_tui', 'tui')),
+  capabilities_json TEXT NOT NULL,
+  fallback_reasons_json TEXT NOT NULL DEFAULT '[]',
+  checked_at TEXT NOT NULL,
+  UNIQUE(provider, cli_version_key, transport)
+);
+
+CREATE TABLE IF NOT EXISTS provider_event_observations (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL UNIQUE,
+  provider TEXT NOT NULL CHECK(provider IN ('codex', 'claude', 'grok')),
+  chat_id INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+  session_id TEXT,
+  turn_id TEXT,
+  type TEXT NOT NULL,
+  source TEXT NOT NULL CHECK(source IN ('provider_api', 'stream_json', 'hook', 'jsonl', 'tui')),
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  observed_at TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Codex app-server의 읽기 결과와 기존 TUI projection을 병행 비교하는 shadow 관측치.
+-- 메시지·도구 인자는 저장하지 않고 상태와 일치 여부만 남긴다.
+CREATE TABLE IF NOT EXISTS provider_shadow_observations (
+  id TEXT PRIMARY KEY,
+  provider TEXT NOT NULL CHECK(provider IN ('codex', 'claude', 'grok')),
+  chat_id INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+  session_id TEXT NOT NULL,
+  account_id INTEGER REFERENCES agent_accounts(id) ON DELETE SET NULL,
+  structured_status TEXT,
+  structured_busy INTEGER CHECK(structured_busy IN (0, 1)),
+  tui_status TEXT NOT NULL,
+  tui_busy INTEGER NOT NULL CHECK(tui_busy IN (0, 1)),
+  comparison TEXT NOT NULL CHECK(comparison IN ('match', 'mismatch', 'inconclusive', 'error')),
+  latency_ms INTEGER NOT NULL,
+  error_code TEXT,
+  observed_at TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- thread/turns/list(itemsView=notLoaded)에서 얻은 본문 없는 turn lifecycle 증거.
+-- scan은 매 probe의 완전성·지연을, event는 같은 turn의 최초 start/terminal 상태만 보존한다.
+CREATE TABLE IF NOT EXISTS provider_shadow_turn_scans (
+  id TEXT PRIMARY KEY,
+  provider TEXT NOT NULL CHECK(provider IN ('codex', 'claude', 'grok')),
+  chat_id INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+  session_id TEXT NOT NULL,
+  turns_seen INTEGER NOT NULL CHECK(turns_seen >= 0),
+  started_seen INTEGER NOT NULL CHECK(started_seen >= 0),
+  terminal_seen INTEGER NOT NULL CHECK(terminal_seen >= 0),
+  paired_seen INTEGER NOT NULL CHECK(paired_seen >= 0),
+  invalid_turns INTEGER NOT NULL CHECK(invalid_turns >= 0),
+  issues_json TEXT NOT NULL DEFAULT '[]',
+  latency_ms INTEGER NOT NULL CHECK(latency_ms >= 0),
+  error_code TEXT,
+  observed_at TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS provider_shadow_turn_events (
+  id TEXT PRIMARY KEY,
+  provider TEXT NOT NULL CHECK(provider IN ('codex', 'claude', 'grok')),
+  chat_id INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+  session_id TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  event_type TEXT NOT NULL CHECK(event_type IN ('started', 'completed', 'failed', 'interrupted')),
+  source_at TEXT NOT NULL,
+  duration_ms INTEGER CHECK(duration_ms IS NULL OR duration_ms >= 0),
+  observed_at TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(provider, chat_id, turn_id, event_type)
+);
+
+-- read-only shadow를 통과한 뒤 명시적 cohort/quota 안에서만 새 Codex 채팅을 app-server가 소유한다.
+-- prompt 본문은 기존 Codex history를 정본으로 유지하고 여기에는 transport provenance와 ACK 식별자만 둔다.
+CREATE TABLE IF NOT EXISTS codex_structured_transports (
+  chat_id INTEGER PRIMARY KEY REFERENCES chats(id) ON DELETE CASCADE,
+  cohort TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'assigned' CHECK(state IN (
+    'assigned', 'connecting', 'active', 'turn_accepted', 'stopped', 'fallback_tui', 'delivery_unknown', 'error'
+  )),
+  thread_id TEXT,
+  current_turn_id TEXT,
+  last_command_id TEXT,
+  fallback_reason TEXT,
+  error_code TEXT,
+  assigned_at TEXT NOT NULL,
+  connected_at TEXT,
+  updated_at TEXT NOT NULL,
+  UNIQUE(thread_id)
+);
+
+CREATE TABLE IF NOT EXISTS codex_structured_delivery_receipts (
+  command_id TEXT PRIMARY KEY,
+  chat_id INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+  thread_id TEXT,
+  turn_id TEXT,
+  state TEXT NOT NULL CHECK(state IN ('dispatching', 'accepted', 'completed', 'failed', 'interrupted', 'delivery_unknown')),
+  accepted_at TEXT,
+  terminal_at TEXT,
+  error_code TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS provider_canary_runs (
+  id TEXT PRIMARY KEY,
+  provider TEXT NOT NULL CHECK(provider IN ('codex', 'claude', 'grok')),
+  account_id INTEGER REFERENCES agent_accounts(id) ON DELETE SET NULL,
+  idempotency_key TEXT NOT NULL,
+  suite_version TEXT NOT NULL,
+  current_version TEXT,
+  candidate_version TEXT NOT NULL,
+  candidate_sha256 TEXT,
+  reported_version TEXT,
+  state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending', 'running', 'passed', 'failed', 'blocked')),
+  current_capabilities_json TEXT NOT NULL,
+  candidate_capabilities_json TEXT,
+  capability_diff_json TEXT NOT NULL DEFAULT '[]',
+  summary_json TEXT NOT NULL DEFAULT '{}',
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  started_at TEXT,
+  finished_at TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(provider, idempotency_key)
+);
+
+CREATE TABLE IF NOT EXISTS provider_canary_steps (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES provider_canary_runs(id) ON DELETE CASCADE,
+  ordinal INTEGER NOT NULL,
+  name TEXT NOT NULL CHECK(name IN ('login', 'new_session', 'resume', 'idle_input', 'follow_up', 'approval', 'interrupt', 'completion', 'rate_limit_sample', 'usage_read')),
+  state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending', 'running', 'passed', 'failed', 'blocked', 'skipped')),
+  evidence_json TEXT NOT NULL DEFAULT '{}',
+  duration_ms INTEGER,
+  started_at TEXT,
+  finished_at TEXT,
+  UNIQUE(run_id, ordinal),
+  UNIQUE(run_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS provider_update_runs (
+  id TEXT PRIMARY KEY,
+  provider TEXT NOT NULL CHECK(provider IN ('codex', 'claude', 'grok')),
+  canary_run_id TEXT NOT NULL REFERENCES provider_canary_runs(id),
+  idempotency_key TEXT NOT NULL,
+  previous_version TEXT,
+  candidate_version TEXT NOT NULL,
+  installed_version TEXT,
+  rollout_run_id TEXT,
+  state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending', 'updating', 'applied', 'failed', 'rollback_required', 'rolling_back', 'rolled_back', 'rollback_failed')),
+  session_invariant_hash TEXT NOT NULL,
+  session_invariant_count INTEGER NOT NULL,
+  backup_manifest_json TEXT NOT NULL DEFAULT '{}',
+  rollback_idempotency_key TEXT,
+  rolled_back_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  error_code TEXT,
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  started_at TEXT,
+  finished_at TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(provider, idempotency_key)
+);
+
+CREATE TABLE IF NOT EXISTS provider_update_events (
+  id TEXT PRIMARY KEY,
+  update_run_id TEXT NOT NULL REFERENCES provider_update_runs(id) ON DELETE CASCADE,
+  sequence INTEGER NOT NULL,
+  state TEXT NOT NULL,
+  evidence_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(update_run_id, sequence)
+);
+
+CREATE TABLE IF NOT EXISTS provider_rollout_runs (
+  id TEXT PRIMARY KEY,
+  provider TEXT NOT NULL CHECK(provider IN ('codex', 'claude', 'grok')),
+  canary_run_id TEXT NOT NULL REFERENCES provider_canary_runs(id),
+  idempotency_key TEXT NOT NULL,
+  candidate_version TEXT NOT NULL,
+  candidate_sha256 TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active', 'halted', 'promoted')),
+  max_new_chats INTEGER NOT NULL CHECK(max_new_chats BETWEEN 1 AND 100),
+  assigned_count INTEGER NOT NULL DEFAULT 0,
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  decided_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  decision_reason TEXT,
+  decided_at TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(provider, idempotency_key)
+);
+
+CREATE TABLE IF NOT EXISTS provider_rollout_chats (
+  rollout_run_id TEXT NOT NULL REFERENCES provider_rollout_runs(id) ON DELETE CASCADE,
+  chat_id INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+  assigned_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  failure_observed INTEGER NOT NULL DEFAULT 0 CHECK(failure_observed IN (0, 1)),
+  PRIMARY KEY(rollout_run_id, chat_id),
+  UNIQUE(chat_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_provider_rollout_active ON provider_rollout_runs(provider) WHERE state = 'active';
+
+CREATE TABLE IF NOT EXISTS verification_runs (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES agent_tasks(id) ON DELETE CASCADE,
+  profile_version_id TEXT REFERENCES agent_preset_versions(id) ON DELETE SET NULL,
+  source_run_id TEXT REFERENCES verification_runs(id) ON DELETE SET NULL,
+  idempotency_key TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending', 'running', 'passed', 'failed', 'blocked')),
+  trigger TEXT NOT NULL DEFAULT 'manual',
+  commit_hash TEXT,
+  diff_hash TEXT,
+  pull_request_number INTEGER CHECK(pull_request_number IS NULL OR pull_request_number > 0),
+  pull_request_head_sha TEXT,
+  pull_request_checks_json TEXT,
+  summary_json TEXT NOT NULL DEFAULT '{}',
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  approved_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  approval_idempotency_key TEXT,
+  approved_at TEXT,
+  started_at TEXT,
+  finished_at TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(task_id, idempotency_key)
+);
+
+CREATE TABLE IF NOT EXISTS verification_steps (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES verification_runs(id) ON DELETE CASCADE,
+  ordinal INTEGER NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN ('static', 'focused_test', 'full_test', 'build', 'ui', 'contract', 'live', 'human_review')),
+  command_json TEXT,
+  cwd TEXT NOT NULL,
+  timeout_ms INTEGER NOT NULL,
+  state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending', 'running', 'passed', 'failed', 'blocked', 'timed_out')),
+  exit_code INTEGER,
+  duration_ms INTEGER,
+  started_at TEXT,
+  finished_at TEXT,
+  UNIQUE(run_id, ordinal)
+);
+
+CREATE TABLE IF NOT EXISTS verification_artifacts (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES verification_runs(id) ON DELETE CASCADE,
+  step_id TEXT REFERENCES verification_steps(id) ON DELETE CASCADE,
+  path TEXT NOT NULL,
+  sha256 TEXT NOT NULL,
+  mime_type TEXT NOT NULL,
+  size_bytes INTEGER NOT NULL,
+  redaction_status TEXT NOT NULL CHECK(redaction_status IN ('safe', 'blocked')),
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE INDEX IF NOT EXISTS idx_chats_project ON chats(project_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_chat_history_claims_chat ON chat_history_claims(chat_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_agent_accounts_provider ON agent_accounts(provider, id);
 CREATE INDEX IF NOT EXISTS idx_approvals_chat ON approvals(chat_id, status);
 CREATE INDEX IF NOT EXISTS idx_context_snapshots_expiry ON context_snapshots(expires_at);
 CREATE INDEX IF NOT EXISTS idx_delegations_target ON delegations(target_chat_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_push_devices_user ON push_devices(user_id, active);
 CREATE INDEX IF NOT EXISTS idx_mobile_trusted_devices_user ON mobile_trusted_devices(user_id, active);
+CREATE INDEX IF NOT EXISTS idx_one_time_login_codes_expiry ON one_time_login_codes(expires_at);
+
 CREATE INDEX IF NOT EXISTS idx_token_usage_events_occurred ON token_usage_events(occurred_at);
 CREATE INDEX IF NOT EXISTS idx_token_usage_events_project ON token_usage_events(project_id, occurred_at);
 CREATE INDEX IF NOT EXISTS idx_token_usage_events_chat ON token_usage_events(chat_id, occurred_at);
@@ -651,7 +1306,50 @@ CREATE INDEX IF NOT EXISTS idx_experiment_judgments_evaluation ON experiment_jud
 CREATE INDEX IF NOT EXISTS idx_experiment_judgments_run ON experiment_judgments(run_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_agent_presets_project ON agent_presets(project_id, status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_agent_preset_versions_preset ON agent_preset_versions(preset_id, version DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_tasks_chat ON agent_tasks(chat_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_task_events_task ON agent_task_events(task_id, sequence);
+CREATE INDEX IF NOT EXISTS idx_task_routing_recommendations_task ON task_routing_recommendations(task_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_task_queue_priority ON task_queue_entries(state, priority DESC, queued_at);
+CREATE INDEX IF NOT EXISTS idx_task_workbench_artifacts_task ON task_workbench_artifacts(task_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_remote_worker_hosts_status ON remote_worker_hosts(enabled, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_prompt_commands_chat ON prompt_commands(chat_id, received_at DESC);
+CREATE INDEX IF NOT EXISTS idx_prompt_commands_state ON prompt_commands(state, updated_at);
+CREATE INDEX IF NOT EXISTS idx_prompt_delivery_attempts_command ON prompt_delivery_attempts(command_id, attempt);
+CREATE INDEX IF NOT EXISTS idx_provider_capability_snapshots_latest ON provider_capability_snapshots(provider, checked_at DESC);
+CREATE INDEX IF NOT EXISTS idx_provider_event_observations_chat ON provider_event_observations(chat_id, sequence);
+CREATE INDEX IF NOT EXISTS idx_provider_shadow_observations_window ON provider_shadow_observations(provider, observed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_provider_shadow_observations_chat ON provider_shadow_observations(chat_id, observed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_provider_shadow_turn_scans_window ON provider_shadow_turn_scans(provider, observed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_provider_shadow_turn_events_chat ON provider_shadow_turn_events(chat_id, turn_id, observed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_codex_structured_transports_cohort ON codex_structured_transports(cohort, assigned_at);
+CREATE INDEX IF NOT EXISTS idx_codex_structured_delivery_chat ON codex_structured_delivery_receipts(chat_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_provider_canary_runs_provider ON provider_canary_runs(provider, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_provider_canary_steps_run ON provider_canary_steps(run_id, ordinal);
+CREATE INDEX IF NOT EXISTS idx_provider_update_runs_provider ON provider_update_runs(provider, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_provider_update_events_run ON provider_update_events(update_run_id, sequence);
+CREATE INDEX IF NOT EXISTS idx_verification_runs_task ON verification_runs(task_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_verification_steps_run ON verification_steps(run_id, ordinal);
+CREATE INDEX IF NOT EXISTS idx_verification_artifacts_run ON verification_artifacts(run_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_remote_worker_mappings_host ON remote_worker_project_mappings(host_id, project_id);
+CREATE INDEX IF NOT EXISTS idx_remote_worker_dispatches_task ON remote_worker_dispatches(task_id, created_at DESC);
 `;
+
+// 배포 preflight가 DB를 열어 migration을 실행하지 않고도 현재 release가 기대하는 table/column과
+// 운영 DB를 비교할 수 있게 CREATE TABLE 계약만 구조화한다. 제약·index는 startup migration과 전체 QA가
+// 검증하고, preflight는 재시작 전에 schema 적용 필요 여부를 read-only로 드러내는 용도다.
+export function expectedDatabaseShape(): Record<string, string[]> {
+  const result: Record<string, string[]> = {};
+  const tablePattern = /CREATE TABLE IF NOT EXISTS\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([\s\S]*?)\n\);/g;
+  for (const match of schema.matchAll(tablePattern)) {
+    const columns: string[] = [];
+    for (const line of match[2]!.split("\n")) {
+      const token = line.match(/^\s{2}([A-Za-z_][A-Za-z0-9_]*)\s+/)?.[1];
+      if (token && !["PRIMARY", "UNIQUE", "FOREIGN", "CHECK", "CONSTRAINT"].includes(token.toUpperCase())) columns.push(token);
+    }
+    result[match[1]!] = columns;
+  }
+  return result;
+}
 
 // SQLite 연결을 열고 필요한 스키마를 생성한다.
 export function openDatabase(config: AppConfig): AppDatabase {
@@ -666,6 +1364,32 @@ export function openDatabase(config: AppConfig): AppDatabase {
   if (!sessionColumns.some((column) => column.name === "mobile_trusted_device_id")) {
     database.exec("ALTER TABLE web_sessions ADD COLUMN mobile_trusted_device_id TEXT REFERENCES mobile_trusted_devices(id) ON DELETE SET NULL");
   }
+  if (!sessionColumns.some((column) => column.name === "network_access_allowed")) {
+    database.exec("ALTER TABLE web_sessions ADD COLUMN network_access_allowed INTEGER NOT NULL DEFAULT 1 CHECK(network_access_allowed IN (0, 1))");
+  }
+  if (!sessionColumns.some((column) => column.name === "last_seen_at")) {
+    database.exec("ALTER TABLE web_sessions ADD COLUMN last_seen_at TEXT");
+    database.exec("UPDATE web_sessions SET last_seen_at = created_at WHERE last_seen_at IS NULL");
+  }
+  if (!sessionColumns.some((column) => column.name === "reauthenticated_at")) {
+    database.exec("ALTER TABLE web_sessions ADD COLUMN reauthenticated_at TEXT");
+    database.exec("UPDATE web_sessions SET reauthenticated_at = created_at WHERE reauthenticated_at IS NULL");
+  }
+  database.exec("CREATE INDEX IF NOT EXISTS idx_web_sessions_user_last_seen ON web_sessions(user_id, last_seen_at DESC)");
+  const userSecurityColumns = database.prepare("PRAGMA table_info(users)").all() as Array<{ name: string }>;
+  if (!userSecurityColumns.some((column) => column.name === "password_changed_at")) {
+    database.exec("ALTER TABLE users ADD COLUMN password_changed_at TEXT");
+  }
+  const slackColumns = database.prepare("PRAGMA table_info(slack_settings)").all() as Array<{ name: string }>;
+  if (!slackColumns.some((column) => column.name === "bot_token_vault_id")) {
+    database.exec("ALTER TABLE slack_settings ADD COLUMN bot_token_vault_id TEXT REFERENCES credential_vault_entries(id) ON DELETE SET NULL");
+  }
+  const remoteWorkerColumns = database.prepare("PRAGMA table_info(remote_worker_hosts)").all() as Array<{ name: string }>;
+  if (!remoteWorkerColumns.some((column) => column.name === "workspace_root")) {
+    database.exec("ALTER TABLE remote_worker_hosts ADD COLUMN workspace_root TEXT");
+  }
+  database.exec("CREATE INDEX IF NOT EXISTS idx_credential_vault_leases_expiry ON credential_vault_leases(expires_at)");
+  database.exec("CREATE INDEX IF NOT EXISTS idx_credential_vault_mcp_project ON credential_vault_mcp_bindings(project_id, provider)");
   const mobileLoginChallengeColumns = database.prepare("PRAGMA table_info(mobile_trust_login_challenges)").all() as Array<{ name: string }>;
   if (!mobileLoginChallengeColumns.some((column) => column.name === "origin")) {
     database.exec("ALTER TABLE mobile_trust_login_challenges ADD COLUMN origin TEXT NOT NULL DEFAULT ''");
@@ -673,11 +1397,24 @@ export function openDatabase(config: AppConfig): AppDatabase {
   if (!userColumns.some((column) => column.name === "last_project_id")) {
     database.exec("ALTER TABLE users ADD COLUMN last_project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL");
   }
+  if (!userColumns.some((column) => column.name === "access_scope")) {
+    database.exec("ALTER TABLE users ADD COLUMN access_scope TEXT NOT NULL DEFAULT 'standard' CHECK(access_scope IN ('standard', 'test_only'))");
+  }
   if (!userColumns.some((column) => column.name === "last_chat_id")) {
     database.exec("ALTER TABLE users ADD COLUMN last_chat_id INTEGER REFERENCES chats(id) ON DELETE SET NULL");
   }
+  const promptScheduleColumns = database.prepare("PRAGMA table_info(prompt_schedules)").all() as Array<{ name: string }>;
+  if (!promptScheduleColumns.some((column) => column.name === "run_date")) {
+    database.exec("ALTER TABLE prompt_schedules ADD COLUMN run_date TEXT");
+  }
   if (!userColumns.some((column) => column.name === "chat_view_mode")) {
     database.exec("ALTER TABLE users ADD COLUMN chat_view_mode TEXT NOT NULL DEFAULT 'chat' CHECK(chat_view_mode IN ('chat', 'terminal'))");
+  }
+  if (!userColumns.some((column) => column.name === "temporary_expires_at")) {
+    database.exec("ALTER TABLE users ADD COLUMN temporary_expires_at TEXT");
+  }
+  if (!userColumns.some((column) => column.name === "created_by")) {
+    database.exec("ALTER TABLE users ADD COLUMN created_by INTEGER REFERENCES users(id) ON DELETE SET NULL");
   }
   if (!usageColumns.some((column) => column.name === "details_json")) {
     database.exec("ALTER TABLE usage_status ADD COLUMN details_json TEXT");
@@ -704,6 +1441,12 @@ export function openDatabase(config: AppConfig): AppDatabase {
     database.exec("ALTER TABLE experiment_runs ADD COLUMN check_duration_ms INTEGER");
     database.exec("ALTER TABLE experiment_runs ADD COLUMN check_output TEXT");
   }
+  if (!runColumns.some((column) => column.name === "output_status")) {
+    database.exec("ALTER TABLE experiment_runs ADD COLUMN output_status TEXT CHECK(output_status IN ('ok', 'malformed', 'missing', 'not_applicable'))");
+  }
+  if (!runColumns.some((column) => column.name === "observation_json")) {
+    database.exec("ALTER TABLE experiment_runs ADD COLUMN observation_json TEXT NOT NULL DEFAULT '{}'");
+  }
   const experimentColumns = database.prepare("PRAGMA table_info(experiments)").all() as Array<{ name: string }>;
   if (!experimentColumns.some((column) => column.name === "task_kind")) {
     database.exec("ALTER TABLE experiments ADD COLUMN task_kind TEXT CHECK(task_kind IN ('maintenance', 'greenfield', 'feature', 'security'))");
@@ -714,41 +1457,98 @@ export function openDatabase(config: AppConfig): AppDatabase {
   if (!experimentColumns.some((column) => column.name === "fixture_id")) {
     database.exec("ALTER TABLE experiments ADD COLUMN fixture_id TEXT REFERENCES experiment_fixtures(id) ON DELETE SET NULL");
   }
+  if (!experimentColumns.some((column) => column.name === "output_contract")) {
+    database.exec("ALTER TABLE experiments ADD COLUMN output_contract TEXT NOT NULL DEFAULT 'code_change' CHECK(output_contract IN ('code_change', 'finding_report'))");
+  }
+  const fixtureColumns = database.prepare("PRAGMA table_info(experiment_fixtures)").all() as Array<{ name: string }>;
+  if (!fixtureColumns.some((column) => column.name === "review_target_json")) {
+    database.exec("ALTER TABLE experiment_fixtures ADD COLUMN review_target_json TEXT");
+  }
+  if (!fixtureColumns.some((column) => column.name === "finding_taxonomy")) {
+    database.exec("ALTER TABLE experiment_fixtures ADD COLUMN finding_taxonomy TEXT");
+  }
+  if (!fixtureColumns.some((column) => column.name === "ground_truth_json")) {
+    database.exec("ALTER TABLE experiment_fixtures ADD COLUMN ground_truth_json TEXT");
+  }
   const planColumns = database.prepare("PRAGMA table_info(experiment_run_plans)").all() as Array<{ name: string }>;
   if (planColumns.length && !planColumns.some((column) => column.name === "baseline_commit")) {
     database.exec("ALTER TABLE experiment_run_plans ADD COLUMN baseline_commit TEXT");
   }
   const presetChatColumns = database.prepare("PRAGMA table_info(chats)").all() as Array<{ name: string }>;
+  const presetColumns = database.prepare("PRAGMA table_info(agent_presets)").all() as Array<{ name: string }>;
+  if (!presetColumns.some((column) => column.name === "task_kind")) {
+    database.exec("ALTER TABLE agent_presets ADD COLUMN task_kind TEXT NOT NULL DEFAULT 'implementation' CHECK(task_kind IN ('analysis', 'implementation', 'high_risk', 'operations'))");
+  }
+  const verificationRunColumns = database.prepare("PRAGMA table_info(verification_runs)").all() as Array<{ name: string }>;
+  if (!verificationRunColumns.some((column) => column.name === "commit_hash")) {
+    database.exec("ALTER TABLE verification_runs ADD COLUMN commit_hash TEXT");
+  }
+  if (!verificationRunColumns.some((column) => column.name === "approved_by")) {
+    database.exec("ALTER TABLE verification_runs ADD COLUMN approved_by INTEGER REFERENCES users(id) ON DELETE SET NULL");
+    database.exec("ALTER TABLE verification_runs ADD COLUMN approval_idempotency_key TEXT");
+    database.exec("ALTER TABLE verification_runs ADD COLUMN approved_at TEXT");
+  }
+  if (!verificationRunColumns.some((column) => column.name === "source_run_id")) {
+    database.exec("ALTER TABLE verification_runs ADD COLUMN source_run_id TEXT REFERENCES verification_runs(id) ON DELETE SET NULL");
+  }
+  if (!verificationRunColumns.some((column) => column.name === "pull_request_number")) {
+    database.exec("ALTER TABLE verification_runs ADD COLUMN pull_request_number INTEGER CHECK(pull_request_number IS NULL OR pull_request_number > 0)");
+  }
+  if (!verificationRunColumns.some((column) => column.name === "pull_request_head_sha")) {
+    database.exec("ALTER TABLE verification_runs ADD COLUMN pull_request_head_sha TEXT");
+  }
+  if (!verificationRunColumns.some((column) => column.name === "pull_request_checks_json")) {
+    database.exec("ALTER TABLE verification_runs ADD COLUMN pull_request_checks_json TEXT");
+  }
+  const providerUpdateColumns = database.prepare("PRAGMA table_info(provider_update_runs)").all() as Array<{ name: string }>;
+  if (!providerUpdateColumns.some((column) => column.name === "rollback_idempotency_key")) {
+    database.exec("ALTER TABLE provider_update_runs ADD COLUMN rollback_idempotency_key TEXT");
+    database.exec("ALTER TABLE provider_update_runs ADD COLUMN rolled_back_by INTEGER REFERENCES users(id) ON DELETE SET NULL");
+  }
+  if (!providerUpdateColumns.some((column) => column.name === "rollout_run_id")) {
+    database.exec("ALTER TABLE provider_update_runs ADD COLUMN rollout_run_id TEXT");
+  }
+  const providerCanaryColumns = database.prepare("PRAGMA table_info(provider_canary_runs)").all() as Array<{ name: string }>;
+  if (!providerCanaryColumns.some((column) => column.name === "candidate_sha256")) {
+    database.exec("ALTER TABLE provider_canary_runs ADD COLUMN candidate_sha256 TEXT");
+  }
   if (!presetChatColumns.some((column) => column.name === "preset_version_id")) {
     database.exec("ALTER TABLE chats ADD COLUMN preset_version_id TEXT REFERENCES agent_preset_versions(id) ON DELETE SET NULL");
     database.exec("ALTER TABLE chats ADD COLUMN preset_config_json TEXT");
   }
+  const taskColumns = database.prepare("PRAGMA table_info(agent_tasks)").all() as Array<{ name: string }>;
+  if (!taskColumns.some((column) => column.name === "acceptance_criteria_json")) {
+    database.exec("ALTER TABLE agent_tasks ADD COLUMN acceptance_criteria_json TEXT NOT NULL DEFAULT '[]'");
+  }
+  if (!taskColumns.some((column) => column.name === "checkpoints_json")) {
+    database.exec("ALTER TABLE agent_tasks ADD COLUMN checkpoints_json TEXT NOT NULL DEFAULT '[]'");
+  }
+  if (!taskColumns.some((column) => column.name === "next_action")) {
+    database.exec("ALTER TABLE agent_tasks ADD COLUMN next_action TEXT");
+  }
+  if (!taskColumns.some((column) => column.name === "priority")) {
+    database.exec("ALTER TABLE agent_tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 50 CHECK(priority BETWEEN 0 AND 100)");
+  }
+  if (!taskColumns.some((column) => column.name === "last_verified_checkpoint")) {
+    database.exec("ALTER TABLE agent_tasks ADD COLUMN last_verified_checkpoint TEXT");
+  }
+  if (!taskColumns.some((column) => column.name === "selected_provider")) {
+    database.exec("ALTER TABLE agent_tasks ADD COLUMN selected_provider TEXT CHECK(selected_provider IS NULL OR selected_provider IN ('codex', 'claude', 'grok'))");
+  }
+  if (!taskColumns.some((column) => column.name === "selected_account_id")) {
+    database.exec("ALTER TABLE agent_tasks ADD COLUMN selected_account_id INTEGER REFERENCES agent_accounts(id) ON DELETE SET NULL");
+  }
+  migrateWorkbenchArtifactKinds(database);
   database.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_experiment_judgments_idempotency ON experiment_judgments(evaluation_id, idempotency_key) WHERE idempotency_key IS NOT NULL");
-  // 초기 구현은 공급자당 예약 하나만 저장해 Claude 세션과 주간 창을 동시에 추적할 수 없었다.
-  // 기존 행을 보존하면서 provider+window_id 복합 키 테이블로 한 번만 재구성한다.
-  const resetScheduleColumns = database.prepare("PRAGMA table_info(usage_reset_schedules)").all() as Array<{ name: string; pk: number }>;
-  const resetSchedulePrimaryKey = resetScheduleColumns.filter((column) => column.pk > 0).sort((a, b) => a.pk - b.pk).map((column) => column.name);
-  if (resetSchedulePrimaryKey.join(",") !== "provider,window_id") {
-    database.transaction(() => {
-      database.exec("ALTER TABLE usage_reset_schedules RENAME TO usage_reset_schedules_legacy");
-      database.exec(`
-        CREATE TABLE usage_reset_schedules (
-          provider TEXT NOT NULL CHECK(provider IN ('codex', 'claude')),
-          window_id TEXT NOT NULL,
-          scheduled_reset_at TEXT NOT NULL,
-          used_percent REAL,
-          notified_at TEXT,
-          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-          PRIMARY KEY(provider, window_id)
-        )
-      `);
-      database.exec(`
-        INSERT INTO usage_reset_schedules(provider, window_id, scheduled_reset_at, used_percent, notified_at, updated_at)
-        SELECT provider, window_id, scheduled_reset_at, used_percent, notified_at, updated_at
-        FROM usage_reset_schedules_legacy
-      `);
-      database.exec("DROP TABLE usage_reset_schedules_legacy");
-    })();
+  const promptCommandColumns = database.prepare("PRAGMA table_info(prompt_commands)").all() as Array<{ name: string }>;
+  if (promptCommandColumns.length && !promptCommandColumns.some((column) => column.name === "replay_count")) {
+    database.exec("ALTER TABLE prompt_commands ADD COLUMN replay_count INTEGER NOT NULL DEFAULT 0");
+  }
+  if (promptCommandColumns.length && !promptCommandColumns.some((column) => column.name === "last_replayed_at")) {
+    database.exec("ALTER TABLE prompt_commands ADD COLUMN last_replayed_at TEXT");
+  }
+  if (promptCommandColumns.length && !promptCommandColumns.some((column) => column.name === "delivery_content_hash")) {
+    database.exec("ALTER TABLE prompt_commands ADD COLUMN delivery_content_hash TEXT");
   }
   // 초기 구현은 마지막 전송 시각만 저장해 실제 초기화 창보다 늦게 다음 단답을 보낼 수 있었다.
   const keepaliveColumns = database.prepare("PRAGMA table_info(usage_keepalive_prompts)").all() as Array<{ name: string }>;
@@ -763,6 +1563,11 @@ export function openDatabase(config: AppConfig): AppDatabase {
   // 완료로 오판)하지 않도록 서버가 채팅별로 직접 관리해 /chats 목록에 실제 값을 내려준다.
   if (!chatColumns.some((column) => column.name === "busy")) {
     database.exec("ALTER TABLE chats ADD COLUMN busy INTEGER NOT NULL DEFAULT 0");
+  }
+  // CLI가 실제 user turn을 기록하기 전에도 웹에서 보낸 질문은 사용자 활동이다. updated_at은 서버
+  // 재부착·상태 변경에도 갱신되므로 유휴 종료 기준과 분리해 사람의 전송 시각만 따로 보존한다.
+  if (!chatColumns.some((column) => column.name === "last_user_activity_at")) {
+    database.exec("ALTER TABLE chats ADD COLUMN last_user_activity_at TEXT");
   }
   // Claude 하단 상태줄에서 감지한 현재 권한 모드 문구("auto mode on" 등)를 그대로 저장한다.
   if (!chatColumns.some((column) => column.name === "permission_mode")) {
@@ -780,6 +1585,16 @@ export function openDatabase(config: AppConfig): AppDatabase {
   }
   if (!chatColumns.some((column) => column.name === "worktree_path")) {
     database.exec("ALTER TABLE chats ADD COLUMN worktree_path TEXT");
+  }
+  if (!chatColumns.some((column) => column.name === "workspace_validation_status")) {
+    database.exec("ALTER TABLE chats ADD COLUMN workspace_validation_status TEXT CHECK(workspace_validation_status IN ('valid', 'needs_review'))");
+  }
+  if (!chatColumns.some((column) => column.name === "workspace_validation_json")) {
+    database.exec("ALTER TABLE chats ADD COLUMN workspace_validation_json TEXT");
+  }
+  // 위임으로 자동 생성된 채팅만 목록에서 숨긴다. 기존 행은 전부 사용자가 만든 것으로 본다.
+  if (!chatColumns.some((column) => column.name === "origin")) {
+    database.exec("ALTER TABLE chats ADD COLUMN origin TEXT NOT NULL DEFAULT 'user' CHECK(origin IN ('user', 'delegation'))");
   }
   const waitColumns = database.prepare("PRAGMA table_info(rate_limit_waits)").all() as Array<{ name: string }>;
   if (!waitColumns.some((column) => column.name === "resume_after")) {
@@ -835,17 +1650,89 @@ export function openDatabase(config: AppConfig): AppDatabase {
   }
   migrateProviderCheckConstraint(database);
   migrateAgentAccounts(database);
+  migrateUsageResetSchedules(database);
   database.prepare("DELETE FROM web_sessions WHERE expires_at <= datetime('now')").run();
+  deleteExpiredTemporaryUsers(database);
+  database.prepare("DELETE FROM one_time_login_codes WHERE created_at <= datetime('now', '-30 days')").run();
+  database.prepare("DELETE FROM mfa_login_challenges WHERE expires_at <= datetime('now')").run();
   database.prepare("DELETE FROM mobile_trust_challenges WHERE expires_at <= datetime('now')").run();
   database.prepare("DELETE FROM mobile_trust_login_challenges WHERE expires_at <= datetime('now')").run();
   return database;
 }
 
+// Phase 8.1의 초기 table은 preview screenshot 한 종류만 허용했다. SQLite CHECK는 ALTER할 수 없어
+// 기존 artifact를 그대로 복사하면서 visual diff 종류를 추가한다.
+function migrateWorkbenchArtifactKinds(database: AppDatabase): void {
+  const row = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'task_workbench_artifacts'").get() as { sql: string } | undefined;
+  if (!row?.sql || row.sql.includes("'visual_diff'")) return;
+  database.pragma("foreign_keys = OFF");
+  database.pragma("legacy_alter_table = ON");
+  try {
+    database.transaction(() => {
+      database.exec("ALTER TABLE task_workbench_artifacts RENAME TO task_workbench_artifacts_legacy");
+      database.exec(`CREATE TABLE task_workbench_artifacts (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES agent_tasks(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL CHECK(kind IN ('preview_screenshot', 'visual_diff')),
+        path TEXT NOT NULL,
+        sha256 TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )`);
+      database.exec(`INSERT INTO task_workbench_artifacts(id, task_id, kind, path, sha256, size_bytes, metadata_json, created_by, created_at)
+        SELECT id, task_id, kind, path, sha256, size_bytes, metadata_json, created_by, created_at FROM task_workbench_artifacts_legacy`);
+      database.exec("DROP TABLE task_workbench_artifacts_legacy");
+      database.exec("CREATE INDEX IF NOT EXISTS idx_task_workbench_artifacts_task ON task_workbench_artifacts(task_id, created_at DESC)");
+    })();
+  } finally {
+    database.pragma("legacy_alter_table = OFF");
+    database.pragma("foreign_keys = ON");
+  }
+}
+
+// 초기 알림 예약은 공급자 하나 또는 공급자+창만 키로 사용했다. 계정마다 사용량 창이 독립적이므로
+// 기본 계정에 기존 행을 귀속시키면서 provider+account_id+window_id 키로 한 번만 재구성한다.
+function migrateUsageResetSchedules(database: AppDatabase): void {
+  const columns = database.prepare("PRAGMA table_info(usage_reset_schedules)").all() as Array<{ name: string; pk: number }>;
+  const primaryKey = columns.filter((column) => column.pk > 0).sort((a, b) => a.pk - b.pk).map((column) => column.name);
+  if (primaryKey.join(",") === "provider,account_id,window_id") return;
+  const hasAccountId = columns.some((column) => column.name === "account_id");
+  database.transaction(() => {
+    database.exec("ALTER TABLE usage_reset_schedules RENAME TO usage_reset_schedules_legacy");
+    database.exec(`
+      CREATE TABLE usage_reset_schedules (
+        provider TEXT NOT NULL CHECK(provider IN ('codex', 'claude', 'grok')),
+        account_id INTEGER NOT NULL REFERENCES agent_accounts(id) ON DELETE CASCADE,
+        window_id TEXT NOT NULL,
+        scheduled_reset_at TEXT NOT NULL,
+        used_percent REAL,
+        notified_at TEXT,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY(provider, account_id, window_id)
+      )
+    `);
+    database.exec(hasAccountId ? `
+      INSERT INTO usage_reset_schedules(provider, account_id, window_id, scheduled_reset_at, used_percent, notified_at, updated_at)
+      SELECT provider, account_id, window_id, scheduled_reset_at, used_percent, notified_at, updated_at
+      FROM usage_reset_schedules_legacy
+      WHERE EXISTS (SELECT 1 FROM agent_accounts a WHERE a.id = usage_reset_schedules_legacy.account_id)
+    ` : `
+      INSERT INTO usage_reset_schedules(provider, account_id, window_id, scheduled_reset_at, used_percent, notified_at, updated_at)
+      SELECT l.provider, a.id, l.window_id, l.scheduled_reset_at, l.used_percent, l.notified_at, l.updated_at
+      FROM usage_reset_schedules_legacy l
+      JOIN agent_accounts a ON a.provider = l.provider AND a.is_default = 1
+    `);
+    database.exec("DROP TABLE usage_reset_schedules_legacy");
+  })();
+}
+
 // 공급자 CHECK 제약에 나중에 추가된 공급자(grok)를 반영한다. SQLite는 제약만 바꾸는 ALTER를 지원하지
 // 않아 테이블을 통째로 다시 만들어야 하는데, 스키마 상수를 그대로 쓰면 그동안 ADD COLUMN으로 늘어난
 // 컬럼이 빠진다 — 그래서 현재 DB에 실제로 저장된 CREATE 문을 읽어 제약 문구만 치환한다.
-// 실험실 테이블(experiment_*)은 아직 grok을 지원하지 않으므로 대상에서 뺀다.
-const PROVIDER_CHECK_TABLES = ["chats", "usage_reset_schedules", "agent_integration_status", "agent_accounts", "usage_keepalive_prompts", "token_usage_events"];
+// 실험실도 grok을 지원하므로 experiment_* 테이블까지 대상에 포함한다.
+const PROVIDER_CHECK_TABLES = ["chats", "usage_reset_schedules", "agent_integration_status", "agent_accounts", "usage_keepalive_prompts", "token_usage_events", "experiment_nodes", "experiment_evaluation_calls", "experiment_judgments"];
 
 function migrateProviderCheckConstraint(database: AppDatabase): void {
   const tableSql = (table: string): string | null => {

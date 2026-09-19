@@ -2,7 +2,16 @@ import type { Provider } from "../../shared/types";
 import type { ExperimentRunRecord } from "../services/experiment-repository";
 import { ExperimentRepository } from "../services/experiment-repository";
 import type { ExperimentProvider, ExperimentTerminationReason } from "../../shared/experiments";
+import type { ExperimentRecord } from "../services/experiment-repository";
 import { classifyFailureReason } from "./failure-classification";
+import { collectGitChangeSnapshot } from "./git-change-snapshot";
+import {
+  composeFindingReportPrompt,
+  extractFindingReport,
+  FINDING_REPORT_CONTRACT_INSTRUCTION,
+  FINDING_REPORT_OUTPUT_SCHEMA,
+} from "./finding-output";
+import { scoreFindingReport } from "./finding-score";
 import { ActiveClock, RuntimeBudgetPolicy, type AgentRuntime, type RuntimeEvent, type RuntimeUsageSnapshot } from "./agent-runtime";
 import {
   ExperimentHookBus,
@@ -144,7 +153,9 @@ export class SingleHarness {
     let nodeId: string | null = null;
     let latestUsage: RuntimeUsageSnapshot | null = null;
     let completedResult: Record<string, unknown> | null = null;
+    let lastAssistant = "";
     let runtimeFailure: Extract<RuntimeEvent, { type: "failed" }> | null = null;
+    let toolCallCount = 0;
 
     // 한 실행 안에서 순서가 안정된 멱등 키로 이벤트를 append한다.
     const append = (type: string, payload: Record<string, unknown> = {}) => {
@@ -175,16 +186,27 @@ export class SingleHarness {
       if (!experiment) throw new Error("실험 정의를 찾을 수 없습니다.");
       const beforeRun = await emitHook("before_run", { prompt: experiment.command, config: initial.configSnapshot });
       const base = typeof beforeRun.payload.prompt === "string" ? beforeRun.payload.prompt : experiment.command;
-      const prompt = this.promptPrefix ? `${this.promptPrefix}\n\n${base}` : base;
-      if (!prompt.trim()) throw new Error("before_run 훅이 빈 실행 명령을 만들었습니다.");
+      const treatmentPrompt = this.promptPrefix ? `${this.promptPrefix}\n\n${base}` : base;
+      if (!treatmentPrompt.trim()) throw new Error("before_run 훅이 빈 실행 명령을 만들었습니다.");
+      // finding_report 계약 문구는 모든 arm에 동일하다. promptPrefix(처리군)와 섞지 않고 과제 뒤에 붙인다.
+      const prompt = experiment.outputContract === "finding_report"
+        ? composeFindingReportPrompt(base, this.promptPrefix)
+        : treatmentPrompt;
       if (execution.controller.signal.aborted) return this.finishStopped(runId, nodeId, execution, append);
 
+      const outputSchema = experiment.outputContract === "finding_report"
+        ? { ...FINDING_REPORT_OUTPUT_SCHEMA } as Record<string, unknown>
+        : undefined;
       const runtimeInput = {
         runId, workingDirectory, prompt, config: initial.configSnapshot,
-        allowedCommands: this.allowedCommands,
+        allowedCommands: this.allowedCommands, outputSchema,
       };
       const snapshot = await execution.runtime.prepare(runtimeInput);
-      this.repository.mergeRunEnvironmentSnapshot(runId, { runtime: snapshot });
+      const environmentSnapshot: Record<string, unknown> = { runtime: snapshot };
+      if (experiment.outputContract === "finding_report") {
+        environmentSnapshot.findingReportContract = { instruction: FINDING_REPORT_CONTRACT_INSTRUCTION };
+      }
+      this.repository.mergeRunEnvironmentSnapshot(runId, environmentSnapshot);
       append("runtime.prepared", { snapshot });
       nodeId = this.repository.createNode({
         runId, role: "worker", provider: initial.configSnapshot.runtime.provider,
@@ -211,6 +233,8 @@ export class SingleHarness {
           for await (const event of stream) {
             append(`runtime.${event.type}`, eventPayload(event));
             if (event.type === "started" && event.providerRunId) this.repository.recordProviderRunId(runId, event.providerRunId);
+            if (event.type === "message" && event.role === "assistant") lastAssistant = event.text;
+            if (event.type === "tool_started") toolCallCount += 1;
             if (event.type === "usage") {
               latestUsage = event.usage;
               this.repository.recordRunUsage(runId, event.usage);
@@ -287,12 +311,58 @@ export class SingleHarness {
       });
       await emitHook("on_checkpoint", { nodeId, eventSequence: completedEvent.sequence });
       await emitHook("after_run", { nodeId, result: completedResult, usage: latestUsage });
+      if (experiment.outputContract === "finding_report") {
+        await this.recordFindingObservation(
+          runId, workingDirectory, experiment, completedResult, lastAssistant, latestUsage?.costUsd ?? null, toolCallCount,
+        );
+      }
       append("run.completed", { nodeId });
       return this.repository.transitionRun({ runId, status: "completed", terminationReason: "success" });
     } catch (error) {
       const reason = execution.terminationReason ?? errorReason(error);
       return this.finishFailed(runId, nodeId, reason, errorMessage(error), append, emitHook);
     }
+  }
+
+  // 형식 실패는 run을 실패시키지 않고 관찰 열에만 남긴다. diff·도구 횟수는 채점하지 않는다.
+  private async recordFindingObservation(
+    runId: string,
+    workingDirectory: string,
+    experiment: ExperimentRecord,
+    completedResult: Record<string, unknown>,
+    lastAssistant: string,
+    costUsd: number | null,
+    toolCallCount: number,
+  ): Promise<void> {
+    const extracted = extractFindingReport(completedResult, lastAssistant);
+    const fixture = experiment.fixtureId ? this.repository.getFixture(experiment.fixtureId) : null;
+    let hadNonEmptyDiff = false;
+    let diffStats: { files: number; additions: number; deletions: number; untrackedFiles: number } | null = null;
+    try {
+      const snapshot = await collectGitChangeSnapshot(workingDirectory, false);
+      diffStats = snapshot.stats;
+      hadNonEmptyDiff = snapshot.stats.files + snapshot.stats.untrackedFiles > 0;
+    } catch {
+      diffStats = null;
+    }
+    const findingScore = extracted.status === "ok" && extracted.report && fixture?.groundTruth
+      ? scoreFindingReport({
+        groundTruth: fixture.groundTruth,
+        report: extracted.report,
+        taxonomy: fixture.findingTaxonomy,
+        costUsd,
+      })
+      : null;
+    this.repository.recordRunObservation(runId, {
+      outputStatus: extracted.status,
+      observation: {
+        hadNonEmptyDiff, diffStats, outputError: extracted.error,
+        report: extracted.report, findingScore,
+        // 비교 가능한 신호는 0 vs >0뿐이다. 3 vs 10은 단위가 다르다(Claude Read 1회 vs Codex 셸 command_execution).
+        // Codex는 allowlist 밖 item type을 버려, file_read 같은 새 타입이 생기면 도구를 썼는데도 0으로 보일 수 있다.
+        toolCallCount,
+      },
+    });
   }
 
   // 취소·예산 초과를 node와 run의 서로 다른 terminal 상태로 투영한다.

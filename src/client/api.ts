@@ -1,5 +1,20 @@
 let csrfToken = "";
 
+// 어느 화면의 요청에서든 세션 만료(401)를 발견하면 App이 즉시 로그인 화면으로 전환한다.
+// 로그인 폼은 api()가 아닌 자체 fetch를 사용하므로 잘못된 비밀번호 401과는 섞이지 않는다.
+export const AUTHENTICATION_REQUIRED_EVENT = "web-agent-manager:authentication-required";
+
+export class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+export function notifyAuthenticationRequired(): void {
+  if (typeof window !== "undefined") window.dispatchEvent(new Event(AUTHENTICATION_REQUIRED_EVENT));
+}
+
 // 후속 쓰기 API 요청에 붙일 CSRF 토큰을 갱신한다.
 export function setCsrfToken(token: string): void {
   csrfToken = token;
@@ -16,7 +31,7 @@ function maskForLog(value: unknown): string {
   try {
     const text = typeof value === "string" ? value : JSON.stringify(value);
     if (!text) return "";
-    const masked = text.replace(/("[^"]*(?:password|token|secret)[^"]*"\s*:\s*)"[^"]*"/gi, '$1"***"');
+    const masked = text.replace(/("[^"]*(?:password|passphrase|token|secret|one.?time.?code)[^"]*"\s*:\s*)"[^"]*"/gi, '$1"***"');
     return masked.length > 1500 ? `${masked.slice(0, 1500)}…` : masked;
   } catch {
     return "[unserializable]";
@@ -44,7 +59,10 @@ export async function api(path: string, options: RequestInit = {}): Promise<any>
   }
   const data = await response.json().catch(() => ({}));
   console.debug("[web-agent-manager:api]", method, path, response.status, { ms: Date.now() - startedAt, in: requestBody, out: maskForLog(data) });
-  if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+  if (!response.ok) {
+    if (response.status === 401) notifyAuthenticationRequired();
+    throw new ApiError(data.error || `HTTP ${response.status}`, response.status);
+  }
   return data;
 }
 
@@ -63,7 +81,10 @@ export function uploadFile(path: string, form: FormData, onProgress?: (fraction:
       let data: any = {};
       try { data = xhr.responseText ? JSON.parse(xhr.responseText) : {}; } catch { /* 빈 응답 등은 무시 */ }
       if (xhr.status >= 200 && xhr.status < 300) resolve(data);
-      else reject(new Error(data.error || `HTTP ${xhr.status}`));
+      else {
+        if (xhr.status === 401) notifyAuthenticationRequired();
+        reject(new ApiError(data.error || `HTTP ${xhr.status}`, xhr.status));
+      }
     };
     xhr.send(form);
   });

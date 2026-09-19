@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { ClaudeAdapter } from "../src/server/providers/claude";
 import { CodexAdapter } from "../src/server/providers/codex";
+import { GrokAdapter } from "../src/server/providers/grok";
 import type { HistoryMessage, HistorySession } from "../src/server/providers/provider";
 
 function session(provider: "codex" | "claude", turnEndedAt: string | null = null): HistorySession {
@@ -63,6 +64,15 @@ describe("히스토리 동기화 완료 판정", () => {
     expect(decision.clearBusy).toBe(true);
   });
 
+  it("Claude는 마지막이 end_turn이면 새 메시지가 없어도 작업중을 푼다", () => {
+    const current = session("claude");
+    const last = { id: "assistant-1", role: "assistant" as const, kind: "turn_end", content: "완료", createdAt: "2026-07-10T00:00:01.000Z" };
+    const decision = new ClaudeAdapter("", {}).evaluateHistorySync({ session: current, last, newMessages: [], isTurnEnd: false });
+
+    expect(decision.notifyCompletion).toBe(false);
+    expect(decision.clearBusy).toBe(true);
+  });
+
   it("Claude 도구 호출 턴은 작업중 유지로 보고 완료 알림을 보내지 않는다", () => {
     const current = session("claude");
     const last = { id: "assistant-tool", role: "assistant" as const, kind: "tool_call", content: "[도구: Task]", createdAt: "2026-07-10T00:00:01.000Z" };
@@ -71,6 +81,18 @@ describe("히스토리 동기화 완료 판정", () => {
     expect(decision.markBusy).toBe(true);
     expect(decision.notifyCompletion).toBe(false);
     expect(decision.clearBusy).toBe(false);
+  });
+
+  it("Grok은 턴이 끝난 뒤 늦게 붙은 도구 결과만으로는 busy를 다시 올리지 않는다", () => {
+    const last = { id: "tool-late", role: "tool" as const, kind: "tool_result", content: "늦은 결과", createdAt: "2026-08-21T05:00:44.000Z" };
+    const decision = new GrokAdapter().evaluateHistorySync({
+      session: { turnEndedAt: "2026-08-21T05:00:43.194Z" } as never,
+      last,
+      newMessages: [last],
+      isTurnEnd: true,
+    });
+    expect(decision.markBusy).toBe(false);
+    expect(decision.clearBusy).toBe(true);
   });
 
   it("공급자 정책은 새 사용자 턴을 작업중 시작으로 판정한다", () => {

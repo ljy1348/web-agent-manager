@@ -12,6 +12,8 @@ import { createInstructionRouter } from "../src/server/routes/instruction-routes
 import { createProjectRouter } from "../src/server/routes/project-routes";
 import { createAgentIntegrationRouter } from "../src/server/routes/agent-integration-routes";
 import { createAgentDelegationRouter } from "../src/server/routes/agent-delegation-routes";
+import { createPromptScheduleRouter } from "../src/server/routes/prompt-schedule-routes";
+import { createOperationsRouter } from "../src/server/routes/operations-routes";
 import { RealtimeHub } from "../src/server/services/realtime";
 
 let closeServer: (() => Promise<void>) | undefined;
@@ -44,6 +46,45 @@ function appForRole(role: "admin" | "user"): express.Express {
 }
 
 describe("RBAC 가드", () => {
+  it("일회용 코드로 만든 임시 세션은 권한 요청을 결정할 수 없다", async () => {
+    const decide = vi.fn();
+    const dismiss = vi.fn();
+    const approvals = { decide, dismiss } as unknown as Parameters<typeof createOperationsRouter>[1];
+    // 임시 세션은 role이 'user'라 기존 역할 가드로는 걸러지지 않는다. authSession.temporary만 다르다.
+    const app = express();
+    app.use(express.json());
+    app.use((request: AuthenticatedRequest, _response, next) => {
+      request.authUser = { id: 2, username: "임시-abcd1234", role: "user" };
+      request.authSession = { id: 9, csrfToken: "csrf", expiresAt: "2999-01-01 00:00:00", temporary: true };
+      next();
+    });
+    app.use(createOperationsRouter({} as AppDatabase, approvals, {} as never, {} as never, {} as never, {} as never, [], {} as never));
+    const baseUrl = await serve(app);
+
+    const decisions = ["accept", "acceptForSession", "decline", "cancel", "dismiss"];
+    const responses = await Promise.all(decisions.map((decision) => fetch(`${baseUrl}/approvals/approval-1/decision`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ decision }),
+    })));
+
+    const listed = await fetch(`${baseUrl}/approvals`);
+    // 실행 중인 CLI에 입력을 보내거나 조회 PTY를 돌리는 변경 작업도 막는다(조회는 허용).
+    const writes = await Promise.all([
+      fetch(`${baseUrl}/models/claude/refresh`, { method: "POST" }),
+      fetch(`${baseUrl}/usage/claude/refresh`, { method: "POST" }),
+      fetch(`${baseUrl}/providers/claude/update`, { method: "POST" }),
+    ]);
+    expect(writes.map((response) => response.status)).toEqual([403, 403, 403]);
+    expect(responses.map((response) => response.status)).toEqual([403, 403, 403, 403, 403]);
+    expect(decide).not.toHaveBeenCalled();
+    expect(dismiss).not.toHaveBeenCalled();
+    // 목록은 403이 아니라 빈 배열이어야 한다. loadCore가 Promise.all로 묶어 부르기 때문이다.
+    expect(listed.status).toBe(200);
+    expect(await listed.json()).toEqual({ approvals: [] });
+  });
+
+
   it("일반 사용자의 관리자 전용 HTTP 변경 작업을 거부한다", async () => {
     const app = appForRole("user");
     app.use(createProjectRouter({} as AppDatabase, { allowedRoots: [] } as never, {} as never, [], {} as never, {} as never));
@@ -52,6 +93,7 @@ describe("RBAC 가드", () => {
     app.use(createFileRouter({} as AppDatabase));
     app.use(createAgentIntegrationRouter({} as AppDatabase, {} as never));
     app.use(createAgentDelegationRouter({} as AppDatabase, {} as never));
+    app.use(createPromptScheduleRouter({} as never));
     const baseUrl = await serve(app);
 
     const requests = [
@@ -60,6 +102,7 @@ describe("RBAC 가드", () => {
       fetch(`${baseUrl}/session-backups/backup-1/restore`, { method: "POST" }),
       fetch(`${baseUrl}/chats`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }),
       fetch(`${baseUrl}/chats/1/model`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }),
+      fetch(`${baseUrl}/chats/1/terminal-snapshots`, { method: "POST" }),
       fetch(`${baseUrl}/chats/1/attachments`, { method: "POST" }),
       fetch(`${baseUrl}/chats/1/start`, { method: "POST" }),
       fetch(`${baseUrl}/chats/1/stop`, { method: "POST" }),
@@ -83,6 +126,8 @@ describe("RBAC 가드", () => {
       fetch(`${baseUrl}/agent-integrations`),
       fetch(`${baseUrl}/projects/1/agent-delegations`),
       fetch(`${baseUrl}/agent-delegations`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }),
+      fetch(`${baseUrl}/prompt-schedules`),
+      fetch(`${baseUrl}/prompt-schedules`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }),
     ];
     const responses = await Promise.all(requests);
 
@@ -111,7 +156,20 @@ describe("RBAC 가드", () => {
     const subscribeHandler = vi.fn();
     const resizeHandler = vi.fn();
     const database = {
-      prepare: () => ({ get: () => ({ id: 2, username: "user", role: "user" }) }),
+      // 실제 WebSocket 세션 재검증 계약의 권한·기기·network 필드를 모두 돌려준다. 누락값을
+      // undefined로 두면 DB row 변경으로 판정되어 RBAC 응답 전에 연결이 끊어진다.
+      prepare: () => ({ get: () => ({
+        id: 2,
+        session_id: 1,
+        username: "user",
+        role: "user",
+        access_scope: "standard",
+        expires_at: "2999-01-01 00:00:00",
+        temporary_expires_at: null,
+        mobile_trusted_device_id: null,
+        mobile_device_active: null,
+        network_access_allowed: 1,
+      }) }),
     } as unknown as AppDatabase;
     const hub = new RealtimeHub(server as Server, database);
     hub.setTerminalHandlers(inputHandler, subscribeHandler, undefined, resizeHandler);

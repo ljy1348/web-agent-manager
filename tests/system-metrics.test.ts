@@ -24,7 +24,10 @@ function runtime(calls: Record<string, number>): SystemMetricsRuntime {
     mem: async () => { hit("memory"); return { total: 100, used: 40, available: 60, swaptotal: 10, swapused: 2 }; },
     fsSize: async () => { hit("disk"); return [{ mount: "/", size: 100, used: 30, use: 30 }]; },
     networkStats: async () => { hit("network"); return [{ rx_bytes: 10, tx_bytes: 20 }]; },
-    processes: async () => { hit("process"); return { list: [{ pid: 10, parentPid: 1, name: "node", cpu: 3, memRss: 1000 }] }; },
+    processes: async () => { hit("process"); return { list: [
+      { pid: 10, parentPid: 1, name: "node", cpu: 3, memRss: 1000 },
+      { pid: 11, parentPid: 10, name: "grok", cpu: 4, memRss: 2000 },
+    ] }; },
     panePids: () => { hit("pane"); return new Map(); },
     uptime: () => { hit("uptime"); return 123; },
   };
@@ -133,7 +136,7 @@ describe("프로세스 묶음 분류", () => {
 });
 
 describe("시스템 지표 수집 주기", () => {
-  it("빠른 지표는 5초, 프로세스는 15초, 디스크는 60초마다 갱신한다", async () => {
+  it("빠른 지표는 5초, 네트워크는 30초, 프로세스·디스크는 60초마다 갱신한다", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(0));
     const calls: Record<string, number> = {};
@@ -148,16 +151,20 @@ describe("시스템 지표 수집 주기", () => {
     expect(calls).toMatchObject({ load: 1, memory: 1, network: 1, process: 1, pane: 1, disk: 1 });
 
     await vi.advanceTimersByTimeAsync(10_000);
-    expect(calls).toMatchObject({ load: 3, memory: 3, network: 3, process: 1, pane: 1, disk: 1 });
+    expect(calls).toMatchObject({ load: 3, memory: 3, network: 1, process: 1, pane: 1, disk: 1 });
 
     await vi.advanceTimersByTimeAsync(5_000);
-    expect(calls).toMatchObject({ load: 4, process: 2, pane: 2, disk: 1 });
+    expect(calls).toMatchObject({ load: 4, network: 1, process: 1, pane: 1, disk: 1 });
 
     await vi.advanceTimersByTimeAsync(45_000);
-    expect(calls).toMatchObject({ load: 13, memory: 13, network: 13, process: 5, pane: 5, disk: 2, uptime: 13 });
+    expect(calls).toMatchObject({ load: 13, memory: 13, network: 3, process: 2, pane: 2, disk: 2, uptime: 13 });
     expect(broadcasts).toHaveLength(13);
     // memRss는 KiB라 화면이 바이트로 포맷해도 실제 크기가 나오도록 여기서 바이트로 변환해 내보낸다.
-    expect(service.snapshot().latest).toMatchObject({ disks: [{ mount: "/" }], processes: [{ pid: 10, memory: 1000 * 1024 }] });
+    expect(service.snapshot().latest).toMatchObject({ disks: [{ mount: "/" }] });
+    expect(service.snapshot().latest?.processes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ pid: 10, memory: 1000 * 1024 }),
+      expect.objectContaining({ pid: 11, name: "grok", memory: 2000 * 1024 }),
+    ]));
     service.stop();
   });
 });

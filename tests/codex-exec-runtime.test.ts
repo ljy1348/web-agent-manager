@@ -1,8 +1,10 @@
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { buildCodexExecArgs, normalizeCodexExecEvent } from "../src/server/experiments/codex-exec-runtime";
+import { buildCodexExecArgs, CodexExecRuntime, normalizeCodexExecEvent } from "../src/server/experiments/codex-exec-runtime";
+import { detectOsSandboxSupport } from "../src/server/experiments/os-sandbox";
 import type { RuntimeRunInput } from "../src/server/experiments/agent-runtime";
 import { JsonlProcessExitError, JsonlProcessRunner } from "../src/server/experiments/jsonl-process";
 import { parseExperimentVariantConfig } from "../src/shared/experiments";
@@ -15,7 +17,7 @@ function runInput(): RuntimeRunInput {
     prompt: "기능을 구현해",
     config: parseExperimentVariantConfig({
       schemaVersion: 1,
-      runtime: { provider: "codex", model: "gpt-test", reasoningEffort: "high", sandbox: "workspace-write", maxTurns: 7 },
+      runtime: { provider: "codex", model: "gpt-test", reasoningEffort: "high", sandbox: "workspace-write" },
       skills: { mode: "selected", enabled: ["review"], disabled: [] },
       harness: { type: "single", maxIterations: 1, maxNoImprovement: 1 },
       budget: { maxSeconds: 600, maxTokens: 10_000 },
@@ -44,6 +46,7 @@ describe("Codex exec 런타임", () => {
     expect(fresh).toContain("--color");
     expect(fresh).not.toContain("기능을 구현해");
     expect(fresh.at(-1)).toBe("-");
+    expect(fresh).not.toContain("--max-turns");
 
     const resumed = buildCodexExecArgs(runInput(), "thread-1");
     expect(resumed.slice(0, 4)).toEqual(["exec", "--strict-config", "resume", "thread-1"]);
@@ -107,6 +110,67 @@ describe("Codex exec 런타임", () => {
   it("미보고 usage와 알 수 없는 이벤트를 0으로 만들거나 실패로 오판하지 않는다", () => {
     expect(normalizeCodexExecEvent({ type: "turn.completed" })[0]).toMatchObject({ type: "completed" });
     expect(normalizeCodexExecEvent({ type: "future.event", payload: 1 })).toEqual([]);
+  });
+
+  it("OS 샌드박스를 쓸 수 없으면 요청한 read-only를 걸지 않는다", () => {
+    const input = runInput();
+    input.config.runtime.sandbox = "read-only";
+    input.snapshot.toolProfile.supportsSandbox = false;
+    const args = buildCodexExecArgs(input);
+    expect(args).toContain("danger-full-access");
+    expect(args).not.toContain("read-only");
+    const resumed = buildCodexExecArgs(input, "thread-1");
+    expect(resumed.join(" ")).toContain('sandbox_mode="danger-full-access"');
+  });
+
+  it("이 환경의 기본 감지는 유저 네임스페이스를 쓸 수 없으면 불가로 판정한다", async () => {
+    let namespaceOk = false;
+    try {
+      execFileSync("unshare", ["--user", "--", "/bin/true"], { timeout: 3_000, stdio: "ignore" });
+      namespaceOk = true;
+    } catch {
+      namespaceOk = false;
+    }
+    const supported = await detectOsSandboxSupport();
+    if (process.platform === "linux") expect(supported).toBe(namespaceOk);
+    const runtime = new CodexExecRuntime({
+      readVersion: async () => "codex-cli test",
+      skillManifest: async () => [],
+    });
+    const snapshot = await runtime.prepare(runInput());
+    expect(snapshot.toolProfile.supportsSandbox).toBe(supported);
+    expect(snapshot.permissionProfile.enforcement).toBe(supported ? "codex-os-sandbox" : "none-os-sandbox-unavailable");
+    if (!supported) expect(snapshot.permissionProfile.enforced).toBe("danger-full-access");
+  });
+
+  it("구조화 스키마를 준비 단계에서 파일로 고정하고 argv에 경로를 넣는다", async () => {
+    const runtime = new CodexExecRuntime({
+      readVersion: async () => "codex-cli test",
+      skillManifest: async () => [],
+    });
+    const input = runInput();
+    const schema = { type: "object", properties: { findings: { type: "array" } } };
+    const snapshot = await runtime.prepare({ ...input, outputSchema: schema });
+    const schemaPath = snapshot.toolProfile.outputSchemaPath;
+    expect(typeof schemaPath).toBe("string");
+    expect(JSON.parse(fs.readFileSync(String(schemaPath), "utf8"))).toEqual(schema);
+    const args = buildCodexExecArgs({ ...input, snapshot, outputSchema: schema });
+    expect(args).toContain("--output-schema");
+    expect(args).toContain(schemaPath);
+  });
+
+  it("Codex maxTurns는 CLI에 옵션이 없어 저장과 argv 구성에서 거부한다", () => {
+    expect(() => parseExperimentVariantConfig({
+      schemaVersion: 1,
+      runtime: { provider: "codex", model: "gpt-test", reasoningEffort: "high", sandbox: "workspace-write", maxTurns: 7 },
+      skills: { mode: "all" },
+      harness: { type: "single" },
+      budget: { maxSeconds: 600 },
+    })).toThrow("maxTurns");
+
+    const input = runInput();
+    input.config.runtime.maxTurns = 7;
+    expect(() => buildCodexExecArgs(input)).toThrow("maxTurns");
   });
 });
 

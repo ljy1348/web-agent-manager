@@ -2,7 +2,7 @@ import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "re
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Bot } from "lucide-react";
 import { api, uploadFile } from "../../api";
-import { SubagentManager } from "../../components/SubagentManager";
+import { CHAT_SUBAGENT_BADGE_POLL_MS, SubagentManager, workingSubagentCountsBySourceChat } from "../../components/SubagentManager";
 import { GitBranchControl } from "../../components/GitBranchControl";
 import { TerminalPanel } from "../terminal/TerminalPanel";
 import { splitMessageContent } from "../../message-display";
@@ -15,6 +15,9 @@ import type { Json } from "../../types";
 import { LONG_PROMPT_CHARACTER_THRESHOLD, promptCharacterCount } from "../../../shared/chat-prompt";
 import { CHAT_ATTACHMENT_MAX_FILES, CHAT_ATTACHMENT_MAX_FILE_BYTES, CHAT_ATTACHMENT_MAX_TOTAL_BYTES } from "../../../shared/chat-attachments";
 import { tokenUsageLabel } from "../../lib/token-usage";
+import { effectiveChatViewMode } from "../../lib/chat-view-mode";
+import { deleteChatsSequentially } from "../../lib/chat-bulk-delete";
+import { VerificationPanel } from "./VerificationPanel";
 
 // 맨 위에서 이 픽셀 이내로 스크롤하면 이전 대화를 더 불러온다.
 const TOP_LOAD_THRESHOLD_PX = 200;
@@ -73,7 +76,7 @@ function MessageCard({ message, showDetails, project, chat, onOpenProjectFile, o
   if (!display.primary && !display.details.length) return null;
   if (!display.primary && !showDetails) return null;
   return <article className={`message ${message.role} ${display.primary ? "" : "message-detail-only"}`}>
-    <small>{message.role}</small>
+    <small>{message.role}{message.deliveryState && <span className={`delivery-state ${message.deliveryState}`}>{message.deliveryState === "delivery_unknown" ? " · 전달 확인 필요" : message.deliveryState === "queued" ? " · 대기열" : message.deliveryState === "dispatching" ? " · 전달 중" : " · 접수됨"}</span>}</small>
     {display.primary && <MessageBody content={display.primary} projectId={project?.id} projectPath={project?.path} workspacePath={chat?.worktree_path} chatId={chat?.id} onOpenProjectFile={onOpenProjectFile} onOpenChat={onOpenChat} />}
     {/* 체크박스는 "이 상세들이 존재한다는 걸 보여줄지"만 결정한다. 전부 강제로 펼치면(open 고정)
         diff가 많은 대화에서 스크롤이 감당 안 돼서, 각 항목은 기본 접힘 상태로 두고 클릭해서
@@ -84,16 +87,26 @@ function MessageCard({ message, showDetails, project, chat, onOpenProjectFile, o
 }
 
 // 채팅 내역, 입력창, 실제 터미널, 종료·승인 동작을 제공한다.
-export function ChatView({ user, chatViewMode, changeChatViewMode, providers, accounts, project, projects, setProject, addProject, deleteProject, chats, selectedChat, setSelectedChat, refreshChats, createChat, send, stop, interrupt, cycleMode, startChat, messages, hasMoreMessages, loadMoreMessages, usage, busy, socket, approvals, decide, scrollState, sessionBackups, backupChat, deleteChat, restoreBackup, deleteBackup, onOpenProjectFile, onOpenChat, composerPrefill }: Json): React.ReactElement {
-  const [text, setText] = useState("");
+export function ChatView({ user, chatViewMode, changeChatViewMode, providers, accounts, project, projects, setProject, addProject, deleteProject, chats, activeChats, selectedChat, setSelectedChat, refreshChats, createChat, send, stop, interrupt, cycleMode, startChat, messages, hasMoreMessages, loadMoreMessages, usage, busy, socket, approvals, decide, scrollState, sessionBackups, backupChat, deleteChat, restoreBackup, deleteBackup, onOpenProjectFile, onOpenChat, composerPrefill, clearComposerPrefill, composerDrafts, setComposerDraft }: Json): React.ReactElement {
+  const testOnly = user?.access_scope === "test_only";
+  const text = selectedChat?.id ? String(composerDrafts?.[selectedChat.id] ?? "") : "";
+  const setText = (value: string | ((current: string) => string)): void => {
+    if (selectedChat?.id) setComposerDraft(selectedChat.id, value);
+  };
   // 업로드한 이미지 첨부를 전송 전 입력창 위에 썸네일로 미리 보여준다.
   const [attachmentPreviews, setAttachmentPreviews] = useState<Array<{ path: string; name: string }>>([]);
   const [viewModeSaving, setViewModeSaving] = useState(false);
+  const [terminalSnapshotSaving, setTerminalSnapshotSaving] = useState(false);
+  const [terminalSnapshotFilename, setTerminalSnapshotFilename] = useState("");
   const [subagentOpen, setSubagentOpen] = useState(false);
+  const [subagentDelegations, setSubagentDelegations] = useState<Json[]>([]);
   const [menuOpen, setMenuOpen] = useState(false);
   const [attachmentStatus, setAttachmentStatus] = useState("");
   const [sendError, setSendError] = useState("");
   const [sessionActionStatus, setSessionActionStatus] = useState("");
+  const [selectingChats, setSelectingChats] = useState(false);
+  const [selectedChatIds, setSelectedChatIds] = useState<number[]>([]);
+  const [bulkDeleting, setBulkDeleting] = useState(false);
   // 백업 목록은 평소엔 숨겨두고, 사용자가 "백업 목록" 버튼을 눌렀을 때만 펼쳐서 보여준다(항상
   // 보이면 목록이 길어질수록 정작 자주 쓰는 채팅 목록·전송창을 가린다).
   const [showBackups, setShowBackups] = useState(false);
@@ -134,9 +147,16 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
   useEffect(() => { localStorage.setItem("web_agent_manager_show_tool_details", showToolDetails ? "1" : "0"); }, [showToolDetails]);
   // 작업중 상태가 풀리면(응답 완료 또는 중단 확인) 중지 버튼의 진행 표시도 함께 정리한다.
   useEffect(() => { if (!busy) setInterrupting(false); }, [busy]);
-  // 채팅을 전환하면 이전 채팅에서 입력하던 글·오류바·첨부 상태가 새 채팅에 그대로 남아 보이던 문제를
-  // 막기 위해, 선택된 채팅이 바뀔 때마다 composer의 임시 상태를 초기화한다.
-  useEffect(() => { setText(""); setAttachmentPreviews([]); setAttachmentStatus(""); setSendError(""); setSessionActionStatus(""); setShowBackups(false); setMention(null); }, [selectedChat?.id]);
+  // 글 초안은 App의 chat별 메모리에 보존한다. 첨부 미리보기·오류·열린 메뉴처럼 다른 채팅에
+  // 이어지면 안 되는 일시 UI만 선택 전환 때 초기화한다.
+  useEffect(() => { setAttachmentPreviews([]); setAttachmentStatus(""); setSendError(""); setSessionActionStatus(""); setShowBackups(false); setMention(null); setTerminalSnapshotFilename(""); }, [selectedChat?.id]);
+  // 프로젝트 전환 시 이전 프로젝트의 ID가 새 목록에서 선택된 것처럼 남지 않게 선택 모드를 닫는다.
+  useEffect(() => { setSelectingChats(false); setSelectedChatIds([]); }, [project?.id]);
+  // 다른 탭/웹소켓에서 채팅이 사라져도 일괄 작업 대상에는 현재 목록에 있는 ID만 남긴다.
+  useEffect(() => {
+    const existing = new Set((chats as Json[]).map((item: Json) => Number(item.id)));
+    setSelectedChatIds((current) => current.filter((id) => existing.has(id)));
+  }, [chats]);
   // 파일 미리보기의 줄 링크로 걸어둔 참조("[경로:줄](...)")를 이 채팅 입력창에 한 번만 채워 넣는다.
   // 위 초기화 effect보다 아래에 있어야, 채팅 전환과 동시에 온 요청이 초기화에 덮이지 않고 반영된다.
   const appliedPrefillRequestRef = useRef<number | null>(null);
@@ -144,8 +164,9 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
     if (!composerPrefill || appliedPrefillRequestRef.current === composerPrefill.requestId) return;
     appliedPrefillRequestRef.current = composerPrefill.requestId;
     setText((current) => `${current}${current.trim() ? "\n" : ""}${composerPrefill.text} `);
+    clearComposerPrefill();
     requestAnimationFrame(() => textarea.current?.focus());
-  }, [composerPrefill]);
+  }, [composerPrefill, clearComposerPrefill]);
   useEffect(() => {
     let active = true;
     const params = project?.id ? `?projectId=${project.id}` : "";
@@ -216,6 +237,23 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
   // 프로젝트의 실제 worktree 목록. 채팅 목록만으로 그룹을 만들면 아직 채팅이 없는 worktree는
   // 화면에서 아예 사라져, 워크트리가 지워진 것인지 채팅만 없는 것인지 구분할 수 없었다.
   const [projectWorktrees, setProjectWorktrees] = useState<Json[]>([]);
+  // 채팅 목록 배지는 기존 위임 API만 재사용하고, 목록 자체를 다시 부르지 않는다.
+  useEffect(() => {
+    if (!project?.id || user?.role !== "admin") {
+      setSubagentDelegations([]);
+      return;
+    }
+    let active = true;
+    const poll = (): void => {
+      void api(`/projects/${project.id}/agent-delegations`).then((data) => {
+        if (active) setSubagentDelegations(data.delegations || []);
+      }).catch(() => { if (active) setSubagentDelegations([]); });
+    };
+    poll();
+    const timer = window.setInterval(poll, CHAT_SUBAGENT_BADGE_POLL_MS);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [project?.id, user?.role]);
+  const workingSubagentCounts = useMemo(() => workingSubagentCountsBySourceChat(subagentDelegations), [subagentDelegations]);
   useEffect(() => {
     if (!project?.id) { setProjectWorktrees([]); return; }
     let active = true;
@@ -311,7 +349,7 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
   const otherPendingApprovals = pendingApprovals.filter((item: Json) => item.chat_id !== selectedChat?.id);
   const selectedActivity = selectedChat ? chatActivity(selectedChat, pendingApprovals) : null;
   const providerList = Array.isArray(providers) ? providers : [];
-  const providerMeta = (provider: string | null | undefined): Json => providerList.find((item: Json) => item.id === provider) || { id: provider, label: provider, usageWindowId: "session", supportsPermissionMode: false };
+  const providerMeta = (provider: string | null | undefined): Json => providerList.find((item: Json) => item.id === provider) || { id: provider, label: provider, usageWindowId: "session", usageWindowLabels: {}, supportsPermissionMode: false };
   // 새 채팅 만들기 선택지. 인증 계정이 하나뿐인 공급자는 지금까지처럼 버튼 하나("+ Claude")로 두고,
   // 계정이 여럿이면 계정별로 나눠 어떤 인증으로 시작할지 고를 수 있게 한다.
   const accountList: Json[] = Array.isArray(accounts) ? accounts : [];
@@ -326,9 +364,16 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
     return account && !account.is_default ? account.label : "";
   };
   const selectedProvider = providerMeta(selectedChat?.provider);
-  // 선택된 채팅 공급자의 대표 사용량 구간은 서버가 내려준 공급자 메타 기준으로 찾는다.
+  // 선호 창이 일시적으로 사라지면(특히 Codex 5시간 창은 제품 정책에 따라 다시 없어질 수 있음)
+  // 주간 창, 그마저 없으면 첫 창으로 내려가 상태바를 비우지 않는다.
   const usageRecord = usage.find((item: Json) => item.provider === selectedChat?.provider);
-  const primaryUsageWindow = usageRecord && usageWindows(usageRecord).find((window: Json) => window.id === selectedProvider.usageWindowId);
+  const selectedUsageWindows = usageRecord ? usageWindows(usageRecord) : [];
+  const primaryUsageWindow = selectedUsageWindows.find((window: Json) => window.id === selectedProvider.usageWindowId)
+    ?? selectedUsageWindows.find((window: Json) => window.id === "weekly" || window.id.startsWith("weekly_"))
+    ?? selectedUsageWindows[0];
+  const primaryUsageLabel = primaryUsageWindow
+    ? selectedProvider.usageWindowLabels?.[primaryUsageWindow.id] || primaryUsageWindow.label || "사용량"
+    : null;
   useEffect(() => {
     let active = true;
     if (!selectedChat?.provider) {
@@ -459,6 +504,55 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
       setSessionActionStatus(result?.workspace?.worktreeRemoved ? "세션과 작업공간을 삭제했습니다." : "세션을 삭제했습니다.");
     } catch (error: any) {
       setSessionActionStatus(error?.message || "삭제에 실패했습니다.");
+    }
+  }
+  function toggleChatSelection(chatId: number): void {
+    if (bulkDeleting) return;
+    setSelectedChatIds((current) => current.includes(chatId) ? current.filter((id) => id !== chatId) : [...current, chatId]);
+  }
+  function closeChatSelection(): void {
+    if (bulkDeleting) return;
+    setSelectingChats(false);
+    setSelectedChatIds([]);
+  }
+  function toggleAllChats(): void {
+    if (bulkDeleting) return;
+    const ids = (chats as Json[]).map((item: Json) => Number(item.id));
+    setSelectedChatIds(selectedChatIds.length === ids.length ? [] : ids);
+  }
+  // 선택한 채팅들이 특정 worktree의 마지막 사용자들이면 단건 삭제를 순서대로 수행하는 마지막 단계에서
+  // 그 폴더도 정리된다. 확인창에 예상 폴더 수를 알려 단건 삭제와 같은 안전 정보를 유지한다.
+  function bulkDeleteConfirmMessage(backup: boolean, selected: Json[]): string {
+    const selectedIds = new Set(selected.map((item: Json) => Number(item.id)));
+    const selectedWorktrees = new Set(selected.map((item: Json) => item.worktree_path).filter(Boolean));
+    const removableWorktrees = [...selectedWorktrees].filter((worktreePath) => {
+      const sharing = (chats as Json[]).filter((item: Json) => item.worktree_path === worktreePath);
+      return sharing.length > 0 && sharing.every((item: Json) => selectedIds.has(Number(item.id)));
+    });
+    const base = backup
+      ? `선택한 채팅 ${selected.length}개를 각각 백업한 뒤 삭제할까요? 실행 중인 채팅은 먼저 종료됩니다.`
+      : `선택한 채팅 ${selected.length}개를 백업 없이 삭제할까요? 실행 중인 채팅은 먼저 종료됩니다.`;
+    if (!removableWorktrees.length) return base;
+    return `${base}\n\n선택 결과 마지막 채팅이 없어지는 작업공간 ${removableWorktrees.length}개도 함께 정리됩니다. 커밋하지 않은 변경이 있는 작업공간의 채팅은 삭제가 취소되고 실패 목록에 남습니다.`;
+  }
+  async function handleBulkDelete(backup: boolean): Promise<void> {
+    const selected = (chats as Json[]).filter((item: Json) => selectedChatIds.includes(Number(item.id)));
+    if (!selected.length || !window.confirm(bulkDeleteConfirmMessage(backup, selected))) return;
+    setBulkDeleting(true);
+    setSessionActionStatus(backup ? `${selected.length}개 백업 후 삭제 중…` : `${selected.length}개 삭제 중…`);
+    try {
+      const result = await deleteChatsSequentially(selected.map((item: Json) => Number(item.id)), backup, deleteChat);
+      setSelectedChatIds(result.failures.map((failure) => failure.id));
+      if (!result.failures.length) {
+        setSelectingChats(false);
+        setSessionActionStatus(`${result.deletedIds.length}개 채팅을 ${backup ? "백업 후 " : ""}삭제했습니다.`);
+        return;
+      }
+      const failureSummary = result.failures.slice(0, 3).map((failure) => `#${failure.id} ${failure.message}`).join(" · ");
+      const omitted = result.failures.length > 3 ? ` 외 ${result.failures.length - 3}개` : "";
+      setSessionActionStatus(`${result.deletedIds.length}개 삭제, ${result.failures.length}개 실패: ${failureSummary}${omitted}`);
+    } finally {
+      setBulkDeleting(false);
     }
   }
   // 백업된 JSONL을 원래 공급자 기록 저장소에 되돌리고 채팅을 복원한다.
@@ -851,9 +945,74 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
   // 그걸 안 쓰고 있었음).
   const currentModelOption = modelOptions ? preferredModelOption(modelOptions, selectedChat) : null;
   const currentEffortOption = modelOptions ? preferredEffortOption(modelOptions, selectedChat) : null;
-  const terminalMode = chatViewMode === "terminal";
+  const structuredChat = selectedChat?.interactive_transport === "app_server";
+  // app-server 후보는 PTY를 만들지 않는다. 계정 기본값이 터미널이어도 이 채팅만 history 기반
+  // 채팅 화면으로 고정해 빈 터미널과 원시 입력 경로를 노출하지 않는다.
+  const terminalMode = !structuredChat && effectiveChatViewMode(user?.role, chatViewMode) === "terminal";
+  const allChatsSelected = !!(chats as Json[]).length && selectedChatIds.length === (chats as Json[]).length;
+  // 프로젝트와 상관없이 실행 중인 채팅 패널(#100). 프로젝트 채팅 카드와 섞여 보이지 않게 프로젝트별 한 줄 행으로
+  // 촘촘히 보여준다. 다른 프로젝트 채팅은 onOpenChat이 프로젝트 전환까지 하고, 상태는 현재 프로젝트로 걸러진
+  // pendingApprovals가 아니라 전역 승인 목록으로 계산한다.
+  function renderActiveChatsGroup(mobile = false): React.ReactElement | null {
+    const items = (activeChats || []) as Json[];
+    if (!items.length || selectingChats) return null;
+    const key = "active-all-projects";
+    const collapsed = !!collapsedGroups[key];
+    const pending = (approvals || []).filter((item: Json) => item.status === "pending");
+    const attentionClasses = ["needs-approval", "rate-limited", "error"];
+    const byProject: { id: string; name: string; chats: Json[] }[] = [];
+    for (const chat of items) {
+      let entry = byProject.find((item) => item.id === String(chat.project_id));
+      if (!entry) { entry = { id: String(chat.project_id), name: chat.project_name || "프로젝트", chats: [] }; byProject.push(entry); }
+      entry.chats.push(chat);
+    }
+    const attention = items.filter((chat) => attentionClasses.includes(chatActivity(chat, pending).className)).length;
+    return <div className="active-chats-group">
+      <button type="button" className="active-chats-head" aria-expanded={!collapsed} onClick={() => setCollapsedGroups((current) => ({ ...current, [key]: !current[key] }))}>
+        <span className="chat-group-caret">{collapsed ? "▸" : "▾"}</span>
+        <b>실행 중</b>
+        <small>전체 프로젝트</small>
+        {collapsed && attention > 0 && <span className="activity-chip needs-approval">확인 {attention}</span>}
+        <span className="active-chats-count">{items.length}</span>
+      </button>
+      {!collapsed && byProject.map((group) => <div className="active-chats-project" key={group.id}>
+        <span className="active-chats-project-name">{group.name}</span>
+        {group.chats.map((chat: Json) => {
+          const activity = chatActivity(chat, pending);
+          const provider = providerMeta(chat.provider).label;
+          return <button type="button" className={`active-chat-row${selectedChat?.id === chat.id ? " active" : ""}`} key={chat.id}
+            aria-label={`${chat.title} · ${group.name} · ${provider} · ${activity.label}`} title={`#${chat.id} ${chat.title} · ${activity.label}`}
+            onClick={() => { void onOpenChat(Number(chat.id)); if (mobile) setMenuOpen(false); }}>
+            <span className={`active-chat-dot ${activity.className}`} aria-hidden="true" />
+            <span className="active-chat-title">{chat.title}</span>
+            {/* 좁은 사이드바에서 제목이 너무 잘리지 않게, 확인이 필요한 칩이 붙는 행은 제공자 표시를 뺀다. */}
+            {attentionClasses.includes(activity.className)
+              ? <span className={`activity-chip ${activity.className}`}>{activity.label}</span>
+              : <span className="active-chat-provider">{provider}</span>}
+          </button>;
+        })}
+      </div>)}
+    </div>;
+  }
+  function renderChatItem(chat: Json, mobile = false): React.ReactElement {
+    const activity = chatActivity(chat, pendingApprovals);
+    const workingSubagents = workingSubagentCounts[chat.id] ?? 0;
+    const selectedForBulk = selectedChatIds.includes(Number(chat.id));
+    const content = <>
+      <span className={`provider ${chat.provider}`}>{providerMeta(chat.provider).label}</span>
+      <strong>{chat.title}</strong>
+      <span className="chat-item-id"><span className="chat-id">#{chat.id}</span>{workingSubagents > 0 && <span className="chat-subagent-badge" title="진행 중 서브에이전트" aria-label={`진행 중 서브에이전트 ${workingSubagents}개`}>{workingSubagents}</span>}</span>
+      <small><span className={`activity-chip ${activity.className}`}>{activity.label}</span><span className="chat-branch">{chat.git_branch || "프로젝트 공유"}</span></small>
+    </>;
+    if (selectingChats) return <div className={`chat-select-row${selectedForBulk ? " selected" : ""}`} key={chat.id}>
+      <input className="chat-select-checkbox" type="checkbox" aria-label={`채팅 #${chat.id} 선택`} checked={selectedForBulk} disabled={bulkDeleting} onChange={() => toggleChatSelection(Number(chat.id))} />
+      <button type="button" className={`chat-item${selectedForBulk ? " bulk-selected" : ""}`} aria-pressed={selectedForBulk} disabled={bulkDeleting} onClick={() => toggleChatSelection(Number(chat.id))}>{content}</button>
+    </div>;
+    return <button type="button" className={`chat-item ${selectedChat?.id === chat.id ? "active" : ""}`} key={chat.id} onClick={() => { setSelectedChat(chat); if (mobile) setMenuOpen(false); }}>{content}</button>;
+  }
   // 대화/터미널 전환을 계정 기본값으로 저장하되 실패하면 현재 화면을 원래 모드로 되돌린다.
   async function selectViewMode(mode: "chat" | "terminal"): Promise<void> {
+    if (mode === "terminal" && user?.role !== "admin") return;
     if (mode === chatViewMode || viewModeSaving) return;
     setViewModeSaving(true);
     try {
@@ -864,9 +1023,36 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
       setViewModeSaving(false);
     }
   }
+  // 서버가 상태 판정에 실제 사용한 터미널 화면과 DB·승인 판정을 한 JSON으로 저장하고, 같은 파일을
+  // 브라우저에도 내려받는다. 생성 응답에는 화면 원문을 넣지 않아 공용 API 디버그 로그에 노출되지 않는다.
+  async function saveTerminalSnapshot(): Promise<void> {
+    if (!selectedChat || terminalSnapshotSaving) return;
+    setTerminalSnapshotSaving(true);
+    try {
+      const result = await api(`/chats/${selectedChat.id}/terminal-snapshots`, { method: "POST" });
+      const snapshot = result.snapshot as Json;
+      const link = document.createElement("a");
+      link.href = `/api${snapshot.downloadUrl}`;
+      link.download = String(snapshot.filename);
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTerminalSnapshotFilename(String(snapshot.filename));
+    } catch (error: any) {
+      window.alert(error?.message || "터미널 스냅샷을 저장하지 못했습니다.");
+    } finally {
+      setTerminalSnapshotSaving(false);
+    }
+  }
   return <>
     <section className={`chat-layout${pendingApprovals.length ? " has-approvals" : ""}`}>
-    <aside className="chat-list"><div className="list-title"><h3>채팅</h3><div>{createTargets.map((target) => <button key={target.key} onClick={() => createChat(target.provider, target.accountId)}>+ {target.label}</button>)}</div></div>
+    <aside className="chat-list"><div className="list-title"><h3>채팅</h3><div>{!selectingChats && createTargets.map((target) => <button key={target.key} onClick={() => createChat(target.provider, target.accountId)}>+ {target.label}</button>)}{!!(chats as Json[]).length && <button type="button" aria-pressed={selectingChats} disabled={bulkDeleting} onClick={() => selectingChats ? closeChatSelection() : setSelectingChats(true)}>{selectingChats ? "취소" : "다중 선택"}</button>}</div></div>
+      {selectingChats && <div className="chat-bulk-actions">
+        <div><strong>{selectedChatIds.length}개 선택</strong><button type="button" disabled={bulkDeleting} onClick={toggleAllChats}>{allChatsSelected ? "전체 해제" : "전체 선택"}</button></div>
+        <button type="button" className="danger" disabled={!selectedChatIds.length || bulkDeleting} onClick={() => void handleBulkDelete(false)}>{bulkDeleting ? "처리 중…" : "선택 삭제"}</button>
+        <button type="button" className="danger" disabled={!selectedChatIds.length || bulkDeleting} onClick={() => void handleBulkDelete(true)}>{bulkDeleting ? "처리 중…" : "선택 백업 후 삭제"}</button>
+      </div>}
+      {renderActiveChatsGroup()}
       {!project && <p className="muted">프로젝트를 먼저 선택하세요.</p>}
       {chatGroups.map((group) => <div className="chat-group" key={group.key}>
         <button type="button" className="chat-group-head" aria-expanded={!collapsedGroups[group.key]} onClick={() => setCollapsedGroups((current) => ({ ...current, [group.key]: !current[group.key] }))}>
@@ -879,12 +1065,10 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
             <button key={target.key} disabled={groupBusy === `${target.provider}:${group.worktreePath}`} onClick={() => void createChatInGroup(group, target.provider, target.accountId)}>+ {target.label}</button>
           ))}</div>
           {!group.chats.length && <p className="chat-group-empty" title={group.worktreePath || ""}>채팅 없는 작업공간입니다.</p>}
-          {group.chats.map((chat: Json) => { const activity = chatActivity(chat, pendingApprovals); return <button className={`chat-item ${selectedChat?.id === chat.id ? "active" : ""}`} key={chat.id} onClick={() => setSelectedChat(chat)}>
-            <span className={`provider ${chat.provider}`}>{providerMeta(chat.provider).label}</span><strong>{chat.title}</strong><span className="chat-id">#{chat.id}</span><small><span className={`activity-chip ${activity.className}`}>{activity.label}</span><span className="chat-branch">{chat.git_branch || "프로젝트 공유"}</span></small>
-          </button>; })}
+          {group.chats.map((chat: Json) => renderChatItem(chat))}
         </>}
       </div>)}
-      {selectedChat && <div className="session-actions"><button onClick={() => void handleBackup()}>세션 백업</button><button className="danger" onClick={() => void handleDeleteOnly()}>삭제</button><button className="danger" onClick={() => void handleDelete()}>백업 후 삭제</button></div>}
+      {selectedChat && !selectingChats && <div className="session-actions"><button onClick={() => void handleBackup()}>세션 백업</button><button className="danger" onClick={() => void handleDeleteOnly()}>삭제</button><button className="danger" onClick={() => void handleDelete()}>백업 후 삭제</button></div>}
       {!!sessionBackups?.length && <button className="backup-toggle" aria-pressed={showBackups} onClick={() => setShowBackups((open) => !open)}>백업 목록 {showBackups ? "숨기기" : `보기 (${sessionBackups.length})`}</button>}
       {sessionActionStatus && <span className="session-action-status">{sessionActionStatus}</span>}
       {showBackups && !!sessionBackups?.length && <div className="backup-list"><h4>백업</h4>{sessionBackups.map((backup: Json) => <article className="backup-item" key={backup.id}><b>{backup.title}</b><span>{providerMeta(backup.provider).label} · {formatBackupTime(backup.backedUpAt)}</span><div className="backup-item-actions"><button disabled={backup.chatExists} onClick={() => void handleRestore(backup.id)}>{backup.chatExists ? "복원됨" : "복원"}</button><button className="danger" onClick={() => void handleDeleteBackup(backup.id)}>삭제</button></div></article>)}</div>}
@@ -896,47 +1080,54 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
             <button type="submit" disabled={renaming || !renameValue.trim()}>{renaming ? "저장 중…" : "저장"}</button>
             <button type="button" onClick={() => setEditingTitle(false)}>취소</button>
           </form>
-        : <h2><span className="title-text">{selectedChat?.title || "에이전트 채팅"}</span>{selectedChat && <button type="button" className="title-edit-button" aria-label="채팅 이름 변경" title="이름 변경 (CLI /rename)" onClick={() => { setRenameValue(selectedChat.title || ""); setEditingTitle(true); }}>✎</button>}</h2>}
+        : <h2><span className="title-text">{selectedChat?.title || "에이전트 채팅"}</span>{selectedChat && !structuredChat && selectedProvider.supportsSessionRename && <button type="button" className="title-edit-button" aria-label="채팅 이름 변경" title="이름 변경 (CLI /rename)" onClick={() => { setRenameValue(selectedChat.title || ""); setEditingTitle(true); }}>✎</button>}</h2>}
       <div className="workspace-meta"><span>{selectedChat ? `${selectedProvider.label}${accountLabel(selectedChat) ? ` · ${accountLabel(selectedChat)}` : ""} · ${selectedActivity?.label ?? selectedChat.status}` : ""}</span>
-      {selectedChat && user?.role === "admin" && accountList.filter((account: Json) => account.provider === selectedChat.provider).length > 1 && ["stopped", "error"].includes(selectedChat.status)
+      {structuredChat && <span className="transport-badge" title={`limited cohort: ${selectedChat.transport_cohort || "미상"}`}>app-server 후보</span>}
+      {selectedChat && !structuredChat && user?.role === "admin" && accountList.filter((account: Json) => account.provider === selectedChat.provider).length > 1 && ["stopped", "error"].includes(selectedChat.status)
         && <select className="chat-account-select" aria-label="이 채팅의 인증 계정" value={selectedChat.account_id ?? ""} onChange={(event) => void changeAccount(Number(event.target.value))}>
           {accountList.filter((account: Json) => account.provider === selectedChat.provider).map((account: Json) => <option key={account.id} value={account.id}>{account.label}</option>)}
         </select>}
-      {selectedChat && project && <GitBranchControl projectId={project.id} chat={selectedChat} canManage={user?.role === "admin"} variant="inline" onChanged={refreshChats} />}</div></div>{selectedChat && <div className="workspace-head-actions">
-        {user?.role === "admin" && <button type="button" className="icon-button" aria-label="서브 에이전트 관리" title="서브 에이전트 관리" aria-expanded={subagentOpen} onClick={() => setSubagentOpen(true)}><Bot size={17} aria-hidden="true" /></button>}
+      {selectedChat && project && <GitBranchControl projectId={project.id} chat={selectedChat} canManage={user?.role === "admin"} variant="inline" onChanged={refreshChats} />}</div></div>{selectedChat && user?.role === "admin" && <div className="workspace-head-actions">
+        <button type="button" className="icon-button" aria-label="서브 에이전트 관리" title="서브 에이전트 관리" aria-expanded={subagentOpen} onClick={() => setSubagentOpen(true)}><Bot size={17} aria-hidden="true" /></button>
         {["stopped", "error"].includes(selectedChat.status)
-          ? <button className="primary" onClick={() => startChat(selectedChat.id)}>터미널 시작</button>
-          : <button className="danger" onClick={() => stop(selectedChat.id)}>터미널 종료</button>}
+          ? <button className="primary" onClick={() => startChat(selectedChat.id)}>{structuredChat ? "세션 시작" : "터미널 시작"}</button>
+          : <button className="danger" onClick={() => stop(selectedChat.id)}>{structuredChat ? "세션 종료" : "터미널 종료"}</button>}
       </div>}</div>
-      <nav className="chat-view-tabs" aria-label="채팅 화면 모드">
+      {user?.role === "admin" && <nav className="chat-view-tabs" aria-label="채팅 화면 모드">
         <button type="button" aria-pressed={!terminalMode} disabled={viewModeSaving} onClick={() => void selectViewMode("chat")}>채팅 모드</button>
-        <button type="button" aria-pressed={terminalMode} disabled={viewModeSaving} onClick={() => void selectViewMode("terminal")}>터미널 모드</button>
-      </nav>
+        <button type="button" aria-pressed={terminalMode} disabled={viewModeSaving || structuredChat} title={structuredChat ? "app-server 후보 채팅은 PTY 터미널을 만들지 않습니다." : undefined} onClick={() => void selectViewMode("terminal")}>터미널 모드</button>
+        {terminalMode && selectedChat && <button type="button" aria-label="현재 터미널 스냅샷 저장" title={terminalSnapshotFilename ? `서버 저장 및 다운로드 완료: ${terminalSnapshotFilename}` : "현재 터미널 화면과 상태 판정을 서버에 저장하고 JSON으로 내려받습니다"} disabled={terminalSnapshotSaving} onClick={() => void saveTerminalSnapshot()}>{terminalSnapshotSaving ? "저장 중…" : terminalSnapshotFilename ? "저장됨 ✓" : "스냅샷"}</button>}
+      </nav>}
       {selectedChat && <div className="model-bar-summary">
         <b>{selectedChat.model || "감지 중…"}</b>
         {selectedActivity && <b className={`activity-text ${selectedActivity.className}`}>{selectedActivity.label}</b>}
-        {primaryUsageWindow && <span className="summary-usage">사용량 {primaryUsageWindow.usedPercent}%{primaryUsageWindow.resetAt && <span className="summary-reset"> · 초기화 {primaryUsageWindow.resetAt}</span>}</span>}
+        {primaryUsageWindow && <span className="summary-usage">{primaryUsageLabel} 사용량 {primaryUsageWindow.usedPercent}%{primaryUsageWindow.resetAt && <span className="summary-reset"> · 초기화 {primaryUsageWindow.resetAt}</span>}</span>}
         <button type="button" aria-expanded={modelBarExpanded} onClick={() => setModelBarExpanded((value) => !value)}>{modelBarExpanded ? "접기 ▴" : "자세히 ▾"}</button>
       </div>}
       {selectedChat && <div className={`model-bar${modelBarExpanded ? " expanded" : ""}`}>
         <span>모델 <b>{selectedChat.model || "감지 중…"}</b></span>
         {selectedActivity && <span>상태 <b className={`activity-text ${selectedActivity.className}`}>{selectedActivity.label}</b></span>}
-        {primaryUsageWindow && <span>주요 사용량 <b>{primaryUsageWindow.usedPercent}%</b>{primaryUsageWindow.resetAt && ` · 초기화 ${primaryUsageWindow.resetAt}`}</span>}
+        {primaryUsageWindow && <span>{primaryUsageLabel} 사용량 <b>{primaryUsageWindow.usedPercent}%</b>{primaryUsageWindow.resetAt && ` · 초기화 ${primaryUsageWindow.resetAt}`}</span>}
         <label className="tool-details-toggle"><input type="checkbox" checked={showToolDetails} onChange={(event) => setShowToolDetails(event.target.checked)} />도구·diff 상세 보기</label>
-        {!!modelOptions?.models?.length && <select aria-label="모델 선택" value={selectedModelIndex} onChange={(event) => setSelectedModelIndex(event.target.value)}>
+        {!structuredChat && !!modelOptions?.models?.length && <select aria-label="모델 선택" value={selectedModelIndex} onChange={(event) => setSelectedModelIndex(event.target.value)}>
           {modelOptions.models.map((item: Json) => <option key={item.index} value={item.index}>{item.label}{item.index === currentModelOption?.index ? " (현재)" : ""}</option>)}
         </select>}
-        {!!modelOptions?.efforts?.length && <select aria-label="추론 강도 선택" value={selectedEffortId} onChange={(event) => setSelectedEffortId(event.target.value)}>
+        {!structuredChat && !!modelOptions?.efforts?.length && <select aria-label="추론 강도 선택" value={selectedEffortId} onChange={(event) => setSelectedEffortId(event.target.value)}>
           {modelOptions.efforts.map((item: Json) => <option key={item.id} value={item.id}>{item.label}{item.id === currentEffortOption?.id ? " (현재)" : ""}</option>)}
         </select>}
-        <button type="button" disabled={modelLoading || modelApplying || !selectedModelIndex} onClick={() => void applyModelSelection()}>{modelApplying ? "적용 중…" : modelLoading ? "모델 확인 중…" : "모델 적용"}</button>
+        {!structuredChat && <button type="button" disabled={modelLoading || modelApplying || !selectedModelIndex} onClick={() => void applyModelSelection()}>{modelApplying ? "적용 중…" : modelLoading ? "모델 확인 중…" : "모델 적용"}</button>}
         <button type="button" disabled={modelRefreshing} title="상태 조회용 CLI에 다시 물어 모델·추론 강도 목록을 새로고침합니다" onClick={() => void refreshModelOptions()}>{modelRefreshing ? "새로고침 중…" : "모델 목록 새로고침"}</button>
         {selectedProvider.supportsPermissionMode && selectedChat.permission_mode && <span>권한 모드 <b>{selectedChat.permission_mode}</b></span>}
-        {selectedProvider.supportsPermissionMode && selectedChat.status === "running" && <button type="button" disabled={cyclingMode} title="기본(권한 요청)·auto-accept edits·plan mode 순으로 전환합니다" onClick={() => {
+        {!structuredChat && selectedProvider.supportsPermissionMode && selectedChat.status === "running" && <button type="button" disabled={cyclingMode} title="기본(권한 요청)·auto-accept edits·plan mode 순으로 전환합니다" onClick={() => {
           setCyclingMode(true);
           void cycleMode(selectedChat.id).catch((error: any) => window.alert(error?.message || "모드 전환에 실패했습니다.")).finally(() => setCyclingMode(false));
         }}>{cyclingMode ? "전환 중…" : "모드 전환"}</button>}
       </div>}
+      {selectedChat?.worktree_path && selectedChat.workspace_validation_status && <div className={`workspace-validation ${selectedChat.workspace_validation_status === "valid" ? "valid" : "needs-review"}`} role="status">
+        <strong>Worktree profile·지침 {selectedChat.workspace_validation_status === "valid" ? "검증됨" : "검토 필요"}</strong>
+        <span>{selectedChat.workspace_validation_status === "valid" ? "고정 profile과 로컬 지침이 생성 시점에 일치했습니다." : "profile 미고정 또는 지침 누락·변경이 있습니다. 터미널 실행 전 확인하세요."}</span>
+      </div>}
+      {selectedChat && !terminalMode && <VerificationPanel chatId={selectedChat.id} isAdmin={user?.role === "admin"} canRunTests={user?.role === "admin" || testOnly} refreshKey={busy} />}
       {selectedApprovals.length > 0 && <div className="inline-approvals">{selectedApprovals.map((item: Json) => <ApprovalCard key={item.id} item={item} decide={decide} />)}</div>}
       {terminalMode
         ? <section className="terminal-panel terminal-panel-full" aria-label="채팅 터미널"><div className="terminal-panel-head"><span>채팅 터미널</span><small>현재 CLI 세션에 직접 입력합니다</small></div>{selectedChat ? <TerminalPanel chat={selectedChat} socket={socket} /> : <div className="terminal-empty">채팅을 선택하세요.</div>}</section>
@@ -949,7 +1140,8 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
           </div>
         </div>
         {busy && <div className="busy-indicator"><span className="busy-dots"><i /><i /><i /></span>작업중…</div>}
-        {selectedChat && <form className="composer" onDragOver={(event) => event.preventDefault()} onDrop={handleDrop} onSubmit={(event) => {
+        {selectedChat && testOnly && <div className="composer test-only-notice" role="note">테스트 전용 계정에서는 채팅 입력과 운영 제어를 사용할 수 없습니다.</div>}
+        {selectedChat && !testOnly && <form className="composer" onDragOver={(event) => event.preventDefault()} onDrop={handleDrop} onSubmit={(event) => {
           event.preventDefault();
           if (!text.trim()) return;
           const outgoing = text;
@@ -960,7 +1152,11 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
           // 이미 작업 중일 때 보낸 후속 입력은 TUI 큐로 들어간다. 중지 시 입력창에 복구할 대상은
           // 현재 실행을 시작한 원래 질문이어야 하므로 후속 입력으로 덮어쓰지 않는다.
           if (!busy) setLastSentByChatId((current) => ({ ...current, [selectedChat.id]: outgoing }));
-          void send(outgoing).catch((error: any) => { setSendError(error?.message || "메시지 전송에 실패했습니다."); setText(outgoing); setAttachmentPreviews(outgoingPreviews); });
+          void send(outgoing).then((result: Json) => {
+            if (result?.command?.state === "delivery_unknown") {
+              setSendError("메시지 입력은 시도했지만 제출 여부를 확인하지 못했습니다. 자동 재전송하지 않았습니다. 터미널 또는 기록을 확인해주세요.");
+            }
+          }).catch((error: any) => { setSendError(error?.message || "메시지 전송에 실패했습니다."); setText(outgoing); setAttachmentPreviews(outgoingPreviews); });
         }}>
           {attachmentStatus && <span className="attachment-status">{attachmentStatus}</span>}
           {sendError && <span className="attachment-status send-error">{sendError}</span>}
@@ -1042,10 +1238,16 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
       <div className="mobile-new-chat">
         {createTargets.map((target, index: number) => <button key={target.key} className={index === 0 ? "primary" : ""} onClick={() => { void createChat(target.provider, target.accountId); setMenuOpen(false); }}>새 {target.label} 채팅</button>)}
       </div>
-      {selectedChat && <div className="session-actions"><button onClick={() => void handleBackup()}>세션 백업</button><button className="danger" onClick={() => void handleDeleteOnly()}>삭제</button><button className="danger" onClick={() => void handleDelete()}>백업 후 삭제</button></div>}
+      {selectedChat && !selectingChats && <div className="session-actions"><button onClick={() => void handleBackup()}>세션 백업</button><button className="danger" onClick={() => void handleDeleteOnly()}>삭제</button><button className="danger" onClick={() => void handleDelete()}>백업 후 삭제</button></div>}
       {!!sessionBackups?.length && <button className="backup-toggle" aria-pressed={showBackups} onClick={() => setShowBackups((open) => !open)}>백업 목록 {showBackups ? "숨기기" : `보기 (${sessionBackups.length})`}</button>}
       {sessionActionStatus && <span className="session-action-status">{sessionActionStatus}</span>}
-      <h4>채팅 목록</h4>
+      <div className="mobile-chat-list-head"><h4>채팅 목록</h4>{!!(chats as Json[]).length && <button type="button" aria-pressed={selectingChats} disabled={bulkDeleting} onClick={() => selectingChats ? closeChatSelection() : setSelectingChats(true)}>{selectingChats ? "취소" : "다중 선택"}</button>}</div>
+      {selectingChats && <div className="chat-bulk-actions">
+        <div><strong>{selectedChatIds.length}개 선택</strong><button type="button" disabled={bulkDeleting} onClick={toggleAllChats}>{allChatsSelected ? "전체 해제" : "전체 선택"}</button></div>
+        <button type="button" className="danger" disabled={!selectedChatIds.length || bulkDeleting} onClick={() => void handleBulkDelete(false)}>{bulkDeleting ? "처리 중…" : "선택 삭제"}</button>
+        <button type="button" className="danger" disabled={!selectedChatIds.length || bulkDeleting} onClick={() => void handleBulkDelete(true)}>{bulkDeleting ? "처리 중…" : "선택 백업 후 삭제"}</button>
+      </div>}
+      {renderActiveChatsGroup(true)}
       {chatGroups.map((group) => <div className="chat-group" key={group.key}>
         <button type="button" className="chat-group-head" aria-expanded={!collapsedGroups[group.key]} onClick={() => setCollapsedGroups((current) => ({ ...current, [group.key]: !current[group.key] }))}>
           <span className="chat-group-caret">{collapsedGroups[group.key] ? "▸" : "▾"}</span>
@@ -1057,9 +1259,7 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
             <button key={target.key} disabled={groupBusy === `${target.provider}:${group.worktreePath}`} onClick={() => { void createChatInGroup(group, target.provider, target.accountId).then(() => setMenuOpen(false)); }}>+ {target.label}</button>
           ))}</div>
           {!group.chats.length && <p className="chat-group-empty" title={group.worktreePath || ""}>채팅 없는 작업공간입니다.</p>}
-          {group.chats.map((chat: Json) => { const activity = chatActivity(chat, pendingApprovals); return <button className={`chat-item ${selectedChat?.id === chat.id ? "active" : ""}`} key={chat.id} onClick={() => { setSelectedChat(chat); setMenuOpen(false); }}>
-            <span className={`provider ${chat.provider}`}>{providerMeta(chat.provider).label}</span><strong>{chat.title}</strong><span className="chat-id">#{chat.id}</span><small><span className={`activity-chip ${activity.className}`}>{activity.label}</span><span className="chat-branch">{chat.git_branch || "프로젝트 공유"}</span></small>
-          </button>; })}
+          {group.chats.map((chat: Json) => renderChatItem(chat, true))}
         </>}
       </div>)}
       {showBackups && !!sessionBackups?.length && <h4>백업</h4>}

@@ -35,7 +35,7 @@ function createHarness(): { database: AppDatabase; repoPath: string; baseUrl: st
 echo "$@" >> ${JSON.stringify(logPath)}
 case "$1 $2" in
   "issue view") echo '{"number":7,"title":"이슈","state":"OPEN","comments":[]}' ;;
-  "pr view") echo '{"number":9,"title":"PR","state":"OPEN","comments":[],"reviews":[]}' ;;
+  "pr view") echo '{"number":9,"title":"PR","state":"OPEN","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","isDraft":false,"mergeable":"MERGEABLE","comments":[],"reviews":[],"statusCheckRollup":[]}' ;;
   "repo view") echo '{"nameWithOwner":"tester/repo","url":"https://example.com"}' ;;
   "run list") echo '[{"databaseId":1,"name":"CI","status":"completed"}]' ;;
   *) echo '[]' ;;

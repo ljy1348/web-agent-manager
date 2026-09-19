@@ -1,4 +1,4 @@
-web-agent-manager v0.2.0 설치
+web-agent-manager 설치
 ====================
 
 Linux

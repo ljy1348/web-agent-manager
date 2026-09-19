@@ -108,6 +108,25 @@ describe("GitWorkspaceService", () => {
     expect(fs.readFileSync(path.join(workspace.path, "AGENTS.md"), "utf8")).toBe("커밋된 지침");
   });
 
+  it("worktree의 고정 profile과 지침 hash·Claude import 정합성을 증거로 남긴다", async () => {
+    const { repo, database, service, projectId, chatIds } = createHarness();
+    fs.writeFileSync(path.join(repo, "AGENTS.md"), "shared rules\n");
+    fs.writeFileSync(path.join(repo, "CLAUDE.md"), "@AGENTS.md\n");
+    execFileSync("git", ["add", "AGENTS.md", "CLAUDE.md"], { cwd: repo });
+    execFileSync("git", ["commit", "-q", "-m", "instructions"], { cwd: repo });
+    const config = JSON.stringify({ runtime: { provider: "claude" }, instructions: { files: ["AGENTS.md", "CLAUDE.md"] } });
+    database.prepare("INSERT INTO agent_presets(id,project_id,name,task_kind,status,active_version) VALUES ('p',?,'profile','implementation','active',1)").run(projectId);
+    database.prepare("INSERT INTO agent_preset_versions(id,preset_id,version,config_snapshot_json) VALUES ('pv','p',1,?)").run(config);
+    database.prepare("UPDATE chats SET provider='claude',preset_version_id='pv',preset_config_json=? WHERE id=?").run(config, chatIds[0]);
+    const workspace = await service.switchBranch(projectId, { chatId: chatIds[0], branch: "feature/validated", create: true, mode: "worktree" });
+    expect(service.validateChatWorkspace(projectId, chatIds[0])).toMatchObject({ status: "valid", profileVersionId: "pv", profilePinned: true, claudeImportsAgents: true, issues: [] });
+    fs.writeFileSync(path.join(workspace.path, "CLAUDE.md"), "different rules\n");
+    const mismatch = service.validateChatWorkspace(projectId, chatIds[0]);
+    expect(mismatch.status).toBe("needs_review");
+    expect(mismatch.issues).toEqual(expect.arrayContaining(["instruction_mismatch:CLAUDE.md", "claude_agents_import_mismatch"]));
+    expect(database.prepare("SELECT workspace_validation_status FROM chats WHERE id=?").get(chatIds[0])).toEqual({ workspace_validation_status: "needs_review" });
+  });
+
   it("같은 브랜치를 고른 채팅들은 한 worktree 폴더를 공유한다", async () => {
     const { service, projectId, chatIds } = createHarness();
 

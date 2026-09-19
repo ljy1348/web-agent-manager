@@ -35,8 +35,9 @@ describe("Android 모바일 API 데이터", () => {
     const database = createDatabase();
     const account = database.prepare("SELECT id FROM agent_accounts WHERE provider = 'claude' AND is_default = 1").get() as { id: number };
     const usage = [{ provider: "claude", account_id: account.id, monitor_status: "ready", data_status: "fresh", error_code: null, summary: null, used_percent: 37, remaining_percent: 63, reset_at: "18:00", details_json: null, last_checked_at: null, last_success_at: null, keepalive_sent_at: null, keepalive_reason: null }] satisfies UsageRecord[];
-    const snapshot = buildMobileWidgetSnapshot(database, usage, { latest: { timestamp: "2026-08-10T00:00:00.000Z", cpuPercent: 25, memory: { total: 1000, used: 420, available: 580, swapTotal: 0, swapUsed: 0 } } as never, recent: [] });
-    expect(snapshot.usage[0]).toMatchObject({ provider: "claude", usedPercent: 37, remainingPercent: 63 });
+    const adapters = [{ id: "claude" as const, usageWindowId: "session", usageWindowLabels: { session: "5시간" } }];
+    const snapshot = buildMobileWidgetSnapshot(database, usage, { latest: { timestamp: "2026-08-10T00:00:00.000Z", cpuPercent: 25, memory: { total: 1000, used: 420, available: 580, swapTotal: 0, swapUsed: 0 } } as never, recent: [] }, adapters);
+    expect(snapshot.usage[0]).toMatchObject({ provider: "claude", windowLabel: "5시간", usedPercent: 37, remainingPercent: 63 });
     expect(snapshot.system).toMatchObject({ cpuPercent: 25, memoryUsedPercent: 42 });
   });
 
@@ -57,6 +58,23 @@ describe("Android 모바일 API 데이터", () => {
     expect(fcm.status()).toEqual({ enabled: true, projectConfigured: false, registeredDevices: 1 });
   });
 
+  it("FCM 초기화 알림 제목에 5시간·주간 창 구분을 유지한다", async () => {
+    const database = createDatabase();
+    const userId = seedUser(database);
+    const config = loadConfig();
+    config.fcm = { enabled: true };
+    const sent: Array<{ title: string; body: string }> = [];
+    const fcm = new FcmNotifier(config, database, async (_tokens, title, body) => {
+      sent.push({ title, body });
+      return [{ success: true }];
+    });
+    fcm.registerDevice(userId, "test-fcm-registration-token-window-title");
+
+    await fcm.notify("event-weekly", "usage_session_reset", "Codex 주간 사용량 초기화가 확인되었습니다.", { title: "Codex 주간 사용량 초기화" });
+
+    expect(sent).toEqual([{ title: "Codex 주간 사용량 초기화", body: "Codex 주간 사용량 초기화가 확인되었습니다." }]);
+  });
+
   it("Firebase가 폐기한 토큰은 자동 비활성화한다", async () => {
     const database = createDatabase();
     const userId = seedUser(database);
@@ -67,5 +85,6 @@ describe("Android 모바일 API 데이터", () => {
     await fcm.notify("event-2", "terminal_exited", "터미널이 종료되었습니다.");
     expect(fcm.status().registeredDevices).toBe(0);
     expect(fcmTitle("approval_requested")).toBe("권한 요청");
+    expect(fcmTitle("usage_keepalive_exhausted")).toBe("세션 유지 실패");
   });
 });

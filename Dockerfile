@@ -14,11 +14,12 @@ FROM node:22-bookworm-slim AS runtime
 
 ARG CODEX_VERSION=0.146.0
 ARG CLAUDE_CODE_VERSION=2.1.220
+ARG GROK_VERSION=1.0.5
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates curl git gh gosu openssh-client procps ripgrep tmux \
   && rm -rf /var/lib/apt/lists/* \
-  && npm install --global "@openai/codex@${CODEX_VERSION}" "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+  && npm install --global "@openai/codex@${CODEX_VERSION}" "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" "@xai-official/grok@${GROK_VERSION}" \
   && npm cache clean --force \
   && groupadd --gid 10001 wam \
   && useradd --uid 10001 --gid wam --create-home --shell /bin/bash wam

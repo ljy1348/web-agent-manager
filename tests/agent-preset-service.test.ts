@@ -11,7 +11,7 @@ const roots: string[] = [];
 afterEach(() => { while (roots.length) fs.rmSync(roots.pop()!, { recursive: true, force: true }); });
 
 // 승격 테스트용 사용자·프로젝트·완료 run을 만든다.
-function createCompletedRun() {
+function createCompletedRun(config: Record<string, unknown> = { schemaVersion: 1, runtime: { provider: "codex" }, harness: { type: "single" } }) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wam-preset-service-"));
   roots.push(root);
   const database = openDatabase({ rootDir: root, dataDir: root, homeDir: root, host: "127.0.0.1", port: 0, publicUrl: "", allowedRoots: [root], sessionTtlHours: 1, runtimeEnabled: false, slack: {}, ntfy: { serverUrl: "https://ntfy.sh" } } as AppConfig);
@@ -19,7 +19,7 @@ function createCompletedRun() {
   const projectId = Number(database.prepare("INSERT INTO projects(name, path) VALUES ('프리셋', ?)").run(root).lastInsertRowid);
   const repository = new ExperimentRepository(database);
   const experiment = repository.createExperiment({ projectId, name: "승격", command: "구현" });
-  const variant = repository.createVariant({ experimentId: experiment.id, name: "우승", config: { schemaVersion: 1, runtime: { provider: "codex" }, harness: { type: "single" } } });
+  const variant = repository.createVariant({ experimentId: experiment.id, name: "우승", config });
   const run = repository.createRun({ variantId: variant.id });
   repository.transitionRun({ runId: run.id, status: "preparing" });
   repository.transitionRun({ runId: run.id, status: "running" });
@@ -63,6 +63,19 @@ describe("AgentPresetService", () => {
 
     expect(preset).toMatchObject({ status: "active", activeVersion: 1 });
     expect(preset.versions.map((version) => version.version)).toEqual([2, 1]);
+    database.close();
+  });
+
+  it("안전 경계를 넘는 실험 snapshot은 profile 승격 전에 거부한다", () => {
+    const { database, run } = createCompletedRun({
+      schemaVersion: 1,
+      runtime: { provider: "codex", sandbox: "danger-full-access" },
+      harness: { type: "single" },
+    });
+    expect(() => new AgentPresetService(database).promote({ runId: run.id, userId: 1, name: "unsafe" }))
+      .toThrow("danger-full-access");
+    expect(database.prepare("SELECT COUNT(*) AS count FROM agent_presets").get()).toEqual({ count: 0 });
+    expect(database.prepare("SELECT COUNT(*) AS count FROM experiment_human_verdicts").get()).toEqual({ count: 0 });
     database.close();
   });
 });

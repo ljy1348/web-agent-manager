@@ -59,7 +59,7 @@ GOOGLE_APPLICATION_CREDENTIALS=/보안/경로/service-account.json
 
 ## 위젯
 
-홈 화면 위젯은 WebView와 같은 로그인 쿠키로 `GET /api/mobile/widget`을 호출한다. 먼저 앱을 열어 로그인해야 한다. 런처 크기에 따라 1×1 StackView(Claude/Codex 스와이프), 2×1 좌우 사용량, 1×2 상하 사용량, 2×2 두 모델+CPU+RAM으로 전환한다.
+홈 화면 위젯은 WebView와 같은 로그인 쿠키로 `GET /api/mobile/widget`을 호출한다. 먼저 앱을 열어 로그인해야 한다. 런처 크기에 따라 1×1 StackView(서버가 준 공급자 스와이프), 2×1 좌우 사용량, 1×2 상하 사용량, 2×2 Claude·Codex·Grok+CPU+RAM으로 전환한다.
 
 Android 위젯의 시스템 주기 제한에 맞춰 30분마다 갱신하며, 위젯의 `↻` 또는 앱 페이지 로드 때 즉시 새로고침한다. 서버가 닿지 않으면 마지막 정상 값은 유지하고 짧은 오류 상태만 표시한다.
 

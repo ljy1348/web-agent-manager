@@ -17,7 +17,7 @@ function buildManager(chat?: Record<string, unknown>): SessionManager {
   const notifications: Notifier = { notify: async () => undefined };
   const realtime = { setTerminalHandlers: () => undefined } as any;
   const approvals = { setTerminalDecisionHandler: () => undefined, setTerminalLiveCheckHandler: () => undefined } as any;
-  const adapter = { id: "codex", displayLabel: "Codex" } as unknown as ProviderAdapter;
+  const adapter = { id: "codex", displayLabel: "Codex", supportsSessionRename: true } as unknown as ProviderAdapter;
   return new SessionManager(stubDatabase(chat), [adapter], realtime, approvals, notifications, { resolveForChat: () => ({ id: 1, config_dir: null }), environment: () => ({}) } as never);
 }
 
@@ -30,6 +30,17 @@ describe("채팅 이름 변경 입력 검증", () => {
   it("200자를 넘는 이름은 거부한다", async () => {
     const manager = buildManager();
     await expect((manager as any).renameSession(1, "a".repeat(201), { id: 1 })).rejects.toThrow("1자 이상 200자 이하");
+  });
+
+  it("CLI가 지원하지 않는 공급자는 공통 rename 경로로 명령을 보내지 않는다", async () => {
+    const notifications: Notifier = { notify: async () => undefined };
+    const realtime = { setTerminalHandlers: () => undefined } as any;
+    const approvals = { setTerminalDecisionHandler: () => undefined, setTerminalLiveCheckHandler: () => undefined } as any;
+    const grok = { id: "grok", displayLabel: "Grok", supportsSessionRename: false } as unknown as ProviderAdapter;
+    const chat = { id: 1, provider: "grok", tmux_name: "web_agent_manager_1", project_path: "/tmp", busy: 0 };
+    const manager = new SessionManager(stubDatabase(chat), [grok], realtime, approvals, notifications, { resolveForChat: () => ({ id: 1, config_dir: null }), environment: () => ({}) } as never);
+
+    await expect((manager as any).renameSession(1, "새 이름", { id: 1 })).rejects.toThrow("지원하지 않습니다");
   });
 });
 

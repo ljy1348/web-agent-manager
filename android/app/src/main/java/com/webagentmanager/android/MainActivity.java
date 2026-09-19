@@ -38,10 +38,14 @@ public final class MainActivity extends Activity {
     private static final int FILE_CHOOSER_REQUEST = 3001;
     private static final int NOTIFICATION_PERMISSION_REQUEST = 3002;
     private static final int STORAGE_PERMISSION_REQUEST = 3003;
+    // visibilitychange가 안 떠도 웹의 복귀 훅을 직접 부르기 위한 스크립트. 훅이 아직 없어도 예외를 던지지 않는다.
+    private static final String FOREGROUND_RESUME_SCRIPT =
+            "(function(){try{var r=window.__webAgentManagerResume__;if(typeof r==='function')r();}catch(e){}})();";
     private WebView webView;
     private ValueCallback<Uri[]> fileChooserCallback;
     private FloatingSettingsController settingsController;
     private PendingDownload pendingDownload;
+    private boolean passedInitialResume;
 
     // WebView와 서버 설정 버튼을 만들고 저장된 서버를 연다.
     @Override
@@ -337,14 +341,42 @@ public final class MainActivity extends Activity {
 
     // 웹 기록이 있으면 먼저 이동하고 없을 때만 Activity를 닫는다.
     private void handleBack() {
-        if (webView.canGoBack()) webView.goBack();
+        if (webView != null && webView.canGoBack()) webView.goBack();
         else finish();
+    }
+
+    // 백그라운드에서 WebView 렌더와 JS 타이머를 멈춰 좀비 소켓·불필요 타이머를 줄인다.
+    @Override
+    protected void onPause() {
+        if (webView != null) {
+            webView.onPause();
+            webView.pauseTimers();
+        }
+        super.onPause();
+    }
+
+    // 복귀 시 WebView를 재개하고, visibilitychange가 없어도 웹 복귀 훅을 직접 호출한다.
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (webView == null) return;
+        webView.resumeTimers();
+        webView.onResume();
+        // 첫 onResume은 최초 표시라 훅이 아직 없거나 방금 연 소켓을 즉시 교체할 수 있어 건너뛴다.
+        if (!passedInitialResume) {
+            passedInitialResume = true;
+            return;
+        }
+        webView.evaluateJavascript(FOREGROUND_RESUME_SCRIPT, null);
     }
 
     // WebView 자원을 Activity 종료 시 해제한다.
     @Override
     protected void onDestroy() {
-        if (webView != null) webView.destroy();
+        if (webView != null) {
+            webView.destroy();
+            webView = null;
+        }
         super.onDestroy();
     }
 

@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import { promisify } from "node:util";
 import { Router, type Request } from "express";
@@ -6,9 +7,11 @@ import type { AppDatabase } from "../core/database";
 import { requireAdmin, type AuthenticatedRequest } from "../core/auth";
 import { requireTrustedNetwork } from "../core/network";
 import { writeAudit } from "../core/audit";
-import { getProjectPath, resolveProjectPath } from "./helpers";
+import { assertNonSensitiveRelativePath, getProjectPath, resolveNonSensitiveProjectPath, resolveProjectPath } from "./helpers";
 import { assertGitBranch, type GitWorkspaceService } from "../services/git-workspaces";
 import { GitDataCache } from "../services/git-cache";
+import { GitHunkReviewService, type HunkDecision } from "../services/git-hunk-review";
+import { GithubAutoMergeService } from "../services/github-auto-merge";
 
 const runFile = promisify(execFile);
 
@@ -51,6 +54,21 @@ async function runNoIndexDiff(args: string[], cwd: string): Promise<string> {
 function queryFiles(value: unknown): string[] {
   const values = Array.isArray(value) ? value : typeof value === "string" ? value.split(",") : [];
   return values.map((item) => String(item).trim()).filter(Boolean);
+}
+
+// 파일 API와 같이 내부망에서만 숨김·민감 경로 조회를 허용한다.
+function gitFileAccess(request: Request): { allowHidden: boolean } {
+  return { allowHidden: (request as AuthenticatedRequest).trustedNetwork === true };
+}
+
+// Git status가 나열한 개별 경로가 파일 API 민감 경로 정책을 통과하는지 확인한다.
+function allowGitFilePath(relativePath: string, request: Request): boolean {
+  try {
+    assertNonSensitiveRelativePath(relativePath, gitFileAccess(request));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // porcelain status -z 출력을 변경 파일 카드에 필요한 구조로 변환한다.
@@ -149,7 +167,7 @@ async function requestWorkspacePath(database: AppDatabase, workspaces: GitWorksp
 }
 
 // 로컬 Git과 gh CLI 기반 GitHub 관리 API를 구성한다.
-export function createGitRouter(database: AppDatabase, workspaces?: GitWorkspaceService, cache = new GitDataCache()): Router {
+export function createGitRouter(database: AppDatabase, workspaces?: GitWorkspaceService, cache = new GitDataCache(), hunkReviews = new GitHunkReviewService(), autoMerges = new GithubAutoMergeService(run)): Router {
   const router = Router();
   // 저장소 상태를 바꾸는 요청이 성공하면 그 프로젝트의 캐시를 버린다. 개별 핸들러마다 무효화를 넣는
   // 대신 여기서 한 번에 처리해야 새 쓰기 API가 늘어나도 옛 상태가 남는 실수를 하지 않는다.
@@ -204,24 +222,31 @@ export function createGitRouter(database: AppDatabase, workspaces?: GitWorkspace
   router.get("/projects/:id/git/diff", async (request, response, next) => {
     try {
       const cwd = await requestWorkspacePath(database, workspaces, request, Number(request.params.id));
+      const access = gitFileAccess(request);
       const files = queryFiles(request.query.file);
-      // 삭제된 파일도 정상적인 Git pathspec이므로 존재는 요구하지 않고 프로젝트 경계만 검증한다.
-      for (const file of files) resolveProjectPath(cwd, file, false);
+      // 삭제된 파일도 정상적인 Git pathspec이므로 존재는 요구하지 않고 프로젝트 경계와 민감 경로를 검증한다.
+      for (const file of files) resolveNonSensitiveProjectPath(cwd, file, false, access);
       // untracked(??) 파일은 HEAD와 비교할 대상 자체가 없어 `git diff HEAD`로는 절대 안 잡힌다 — 파일
       // 목록(상태 조회)에는 뜨는데 diff만 항상 비어 보이는 원인이었다. 상태를 다시 조회해 untracked만
       // 골라 파일별로 --no-index(전부 추가된 것으로) diff를 만들어 tracked 변경분 뒤에 이어 붙인다.
       const statusOutput = await run("git", ["status", "--porcelain=v1", "-z", "--", ...files], cwd);
-      const untrackedFiles = parseStatus(statusOutput)
+      const statusChanges = parseStatus(statusOutput);
+      const untrackedFiles = statusChanges
         .filter((change) => change.indexStatus === "?" && change.worktreeStatus === "?")
-        .map((change) => change.path);
-      const trackedFiles = files.length ? files.filter((file) => !untrackedFiles.includes(file)) : [];
+        .map((change) => change.path)
+        .filter((file) => allowGitFilePath(file, request));
+      // 디렉터리 pathspec이나 전체 diff가 민감 파일을 끌어오지 않도록, 상태 목록의 개별 경로만 넘긴다.
+      const trackedFiles = statusChanges
+        .filter((change) => !(change.indexStatus === "?" && change.worktreeStatus === "?"))
+        .map((change) => change.path)
+        .filter((file) => allowGitFilePath(file, request));
       // "--"만 있고 그 뒤에 경로가 하나도 없으면 git은 "아무 경로도 없음"이 아니라 "제한 없음(전체)"으로
       // 해석한다 — 선택한 파일이 전부 untracked라 trackedFiles가 우연히 비어도, 원래 files가 비어있던
       // 게(=전체 diff 의도) 아니라면 관련 없는 다른 tracked 변경사항까지 섞여 나오면 안 된다.
       // core.quotePath 기본값(true)은 파일명에 한글 등 비ASCII 문자가 있으면 8진 이스케이프한 뒤
       // 큰따옴표로 감싸(예: "새파일.md" → "\354\203\210...") 클라이언트의 diff 헤더 경로 파싱(splitDiffSections)이
       // 깨진다 — 꺼서 경로를 원문 그대로 받는다.
-      const trackedDiff = files.length && !trackedFiles.length ? "" : await run("git", ["-c", "core.quotePath=false", "diff", "--no-ext-diff", "HEAD", "--", ...trackedFiles], cwd);
+      const trackedDiff = trackedFiles.length ? await run("git", ["-c", "core.quotePath=false", "diff", "--no-ext-diff", "HEAD", "--", ...trackedFiles], cwd) : "";
       const untrackedDiffs = await Promise.all(
         untrackedFiles.map((file) => runNoIndexDiff(["-c", "core.quotePath=false", "diff", "--no-ext-diff", "--no-index", "--", "/dev/null", file], cwd)),
       );
@@ -229,6 +254,29 @@ export function createGitRouter(database: AppDatabase, workspaces?: GitWorkspace
     } catch (error) {
       next(error);
     }
+  });
+  router.get("/projects/:id/git/review", async (request, response, next) => {
+    try {
+      const projectId = Number(request.params.id);
+      const cwd = await requestWorkspacePath(database, workspaces, request, projectId);
+      const files = queryFiles(request.query.file);
+      if (!files.length || files.length > 50) throw new Error("검토할 파일은 1~50개를 선택해주세요.");
+      for (const file of files) resolveNonSensitiveProjectPath(cwd, file, false, gitFileAccess(request));
+      response.json(await hunkReviews.snapshot(cwd, files));
+    } catch (error) { next(error); }
+  });
+  router.post("/projects/:id/git/hunks/decision", requireAdmin, requireTrustedNetwork, async (request: AuthenticatedRequest, response, next) => {
+    try {
+      const projectId = Number(request.params.id);
+      const cwd = await requestWorkspacePath(database, workspaces, request, projectId);
+      const relativePath = String(request.body?.path ?? "");
+      const decision = request.body?.decision as HunkDecision;
+      if (!relativePath || !["accept", "reject"].includes(decision)) throw new Error("파일과 accept/reject 결정이 필요합니다.");
+      resolveNonSensitiveProjectPath(cwd, relativePath, false, gitFileAccess(request));
+      const result = await hunkReviews.decide(cwd, { path: relativePath, fileHash: String(request.body?.fileHash ?? ""), hunkId: String(request.body?.hunkId ?? ""), decision });
+      writeAudit(database, request.authUser!.id, `git.hunk_${decision}`, "project", projectId, { path: relativePath, fileHash: request.body.fileHash, hunkId: request.body.hunkId });
+      response.json(result);
+    } catch (error) { next(error); }
   });
   router.get("/projects/:id/git/commit/:revision", async (request, response, next) => {
     try {
@@ -257,14 +305,17 @@ export function createGitRouter(database: AppDatabase, workspaces?: GitWorkspace
       const cwd = await requestWorkspacePath(database, workspaces, request, Number(request.params.id));
       const relativePath = String(request.query.path ?? "");
       if (!relativePath) throw new Error("파일 경로가 필요합니다.");
+      const access = gitFileAccess(request);
       const revision = typeof request.query.rev === "string" && request.query.rev ? request.query.rev : null;
       let content: string;
       if (revision) {
         assertRevision(revision);
+        // 커밋 객체도 파일 API와 같은 민감 경로 기준을 적용한다. 작업 트리에 없을 수 있어 존재는 요구하지 않는다.
+        resolveNonSensitiveProjectPath(cwd, relativePath, false, access);
         content = await run("git", ["show", "--no-ext-diff", `${revision}:${relativePath}`], cwd);
       } else {
-        // 작업 트리 파일은 경로 검증을 거쳐 프로젝트 밖을 읽지 못하게 한다.
-        content = fs.readFileSync(resolveProjectPath(cwd, relativePath), "utf8");
+        // 작업 트리 파일은 경로 검증을 거쳐 프로젝트 밖과 민감 경로를 읽지 못하게 한다.
+        content = fs.readFileSync(resolveNonSensitiveProjectPath(cwd, relativePath, true, access), "utf8");
       }
       if (content.length > 2 * 1024 * 1024) throw new Error("파일이 너무 커서 펼칠 수 없습니다.");
       response.json({ path: relativePath, lines: content.replace(/\n$/, "").split("\n") });
@@ -566,10 +617,10 @@ export function createGitRouter(database: AppDatabase, workspaces?: GitWorkspace
       const projectId = Number(request.params.id);
       const cwd = await requestWorkspacePath(database, workspaces, request, projectId);
       const number = issueNumber(request.params.number);
-      // 이슈 상세와 같은 이유로 캐시를 태운다.
-      // 목록과 같은 이유로 statusCheckRollup은 빼 조회 속도를 개선한다(화면에서 안 씀).
+      // 선택한 PR 상세만 check/review/auto-merge 상태를 함께 읽고 짧게 polling한다. 목록 조회에는
+      // 이 무거운 rollup을 넣지 않아 PR 수에 비례한 GraphQL 지연을 만들지 않는다.
       const cached = await cache.read(`github-pr:${number}`, projectId, cwd, async () => ({
-        pullRequest: parseGhJson(await run("gh", ["pr", "view", String(number), "--comments", "--json", "number,title,state,url,body,author,comments,reviews,headRefName,baseRefName,isDraft,mergeable,mergedAt,createdAt,updatedAt,closedAt"], cwd)),
+        pullRequest: await autoMerges.read(cwd, number),
       }), forceRefresh(request));
       response.json({ ...cached.value, cachedAt: new Date(cached.cachedAt).toISOString() });
     } catch (error) {
@@ -641,7 +692,7 @@ export function createGitRouter(database: AppDatabase, workspaces?: GitWorkspace
       next(error);
     }
   });
-  router.post("/projects/:id/github/pr/:number/merge", requireAdmin, async (request: AuthenticatedRequest, response, next) => {
+  router.post("/projects/:id/github/pr/:number/merge", requireAdmin, requireTrustedNetwork, async (request: AuthenticatedRequest, response, next) => {
     try {
       if (request.body?.confirm !== true) throw new Error("PR 병합 확인이 필요합니다.");
       const projectId = Number(request.params.id);
@@ -656,6 +707,36 @@ export function createGitRouter(database: AppDatabase, workspaces?: GitWorkspace
     } catch (error) {
       next(error);
     }
+  });
+  router.post("/projects/:id/github/pr/:number/auto-merge", requireAdmin, requireTrustedNetwork, async (request: AuthenticatedRequest, response, next) => {
+    try {
+      if (request.body?.confirm !== true) throw new Error("조건부 자동 merge 확인이 필요합니다.");
+      const projectId = Number(request.params.id);
+      const number = issueNumber(request.params.number);
+      const enabled = request.body?.enabled;
+      if (typeof enabled !== "boolean") throw new Error("enabled는 boolean이어야 합니다.");
+      const cwd = await requestWorkspacePath(database, workspaces, request, projectId);
+      const pullRequest = await autoMerges.set(cwd, number, {
+        enabled,
+        expectedHeadSha: String(request.body?.expectedHeadSha ?? ""),
+        method: request.body?.method,
+        deleteBranch: request.body?.deleteBranch,
+      });
+      writeAudit(database, request.authUser!.id, enabled ? "github.pr.auto_merge_enable" : "github.pr.auto_merge_disable", "project", projectId, {
+        number, headSha: pullRequest.headRefOid, checkState: pullRequest.checkSummary.state,
+        totalChecks: pullRequest.checkSummary.totalCount, method: enabled ? String(request.body?.method ?? "squash") : undefined,
+      });
+      const chatId = Number(request.body?.chatId);
+      if (Number.isInteger(chatId) && chatId > 0) {
+        const task = database.prepare("SELECT id FROM agent_tasks WHERE project_id = ? AND chat_id = ? ORDER BY updated_at DESC LIMIT 1").get(projectId, chatId) as { id: string } | undefined;
+        if (task) database.transaction(() => {
+          const sequence = (database.prepare("SELECT COALESCE(MAX(sequence), 0) + 1 AS value FROM agent_task_events WHERE task_id = ?").get(task.id) as { value: number }).value;
+          database.prepare("INSERT INTO agent_task_events(id, task_id, sequence, idempotency_key, type, payload_json) VALUES (?, ?, ?, ?, ?, ?)")
+            .run(crypto.randomUUID(), task.id, sequence, `github-pr-auto-merge:${number}:${pullRequest.headRefOid}:${enabled}:${crypto.randomUUID()}`, enabled ? "github.pr_auto_merge_enabled" : "github.pr_auto_merge_disabled", JSON.stringify({ number, headSha: pullRequest.headRefOid, checkState: pullRequest.checkSummary.state, totalChecks: pullRequest.checkSummary.totalCount }));
+        })();
+      }
+      response.json({ pullRequest });
+    } catch (error) { next(error); }
   });
   router.post("/projects/:id/github/run/:runId/rerun", requireAdmin, async (request: AuthenticatedRequest, response, next) => {
     try {

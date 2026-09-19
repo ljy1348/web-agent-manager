@@ -99,6 +99,50 @@ describe("Agent Lab API", () => {
     app.database.close();
   });
 
+  it("실험 생성이 산출물 계약·과제 유형·fixture를 통과시킨다", async () => {
+    const app = await createApp();
+    const fixture = app.repository.createFixture({
+      name: "http-fixture", url: "https://github.com/example/repo", pinnedCommit: "b".repeat(40),
+      sizeClass: "small", setupCommand: [], testCommand: [],
+    });
+    const created = await fetch(`${app.baseUrl}/projects/1/experiments`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        name: "보안 감사", command: "취약점을 찾아라",
+        taskKind: "security", fixtureId: fixture.id, outputContract: "finding_report",
+      }),
+    });
+    const body = await created.json() as { experiment: { id: string; outputContract: string; taskKind: string; fixtureId: string } };
+    expect(created.status).toBe(201);
+    expect(body.experiment).toMatchObject({
+      outputContract: "finding_report", taskKind: "security", fixtureId: fixture.id,
+    });
+    const variant = await fetch(`${app.baseUrl}/experiments/${body.experiment.id}/variants`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        name: "기본", config: { schemaVersion: 1, runtime: { provider: "claude" }, harness: { type: "single" } },
+      }),
+    });
+    const variantBody = await variant.json() as { variant: { config: { runtime: { sandbox: string } } } };
+    expect(variant.status).toBe(201);
+    expect(variantBody.variant.config.runtime.sandbox).toBe("read-only");
+    const graph = await fetch(`${app.baseUrl}/experiments/${body.experiment.id}/variants`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        name: "graph",
+        config: {
+          schemaVersion: 1,
+          runtime: { provider: "claude", model: "claude-test", reasoningEffort: "high" },
+          harness: { type: "orchestrator_worker", secondaryRuntime: { provider: "codex", model: "gpt-test", reasoningEffort: "high" } },
+        },
+      }),
+    });
+    expect(graph.status).toBe(400);
+    expect(await graph.json()).toMatchObject({ error: expect.stringContaining("single 하네스") });
+    await new Promise<void>((resolve, reject) => app.server.close((error) => error ? reject(error) : resolve()));
+    app.database.close();
+  });
+
   it("run 시작·상세·취소를 service에 위임하고 감사 로그를 남긴다", async () => {
     const app = await createApp();
     const fakeRun = { id: "run-1", variantId: "variant-1", status: "running" };

@@ -1,0 +1,18 @@
+{
+  "protocol": "wam-worker/v1",
+  "workspaceRoot": "/srv/wam/projects",
+  "stateDir": "/var/lib/web-agent-manager-worker",
+  "maxConcurrent": 2,
+  "recipes": {
+    "test": {
+      "executable": "/usr/bin/npm",
+      "args": ["test"],
+      "timeoutMs": 900000
+    },
+    "verify": {
+      "executable": "/usr/bin/npm",
+      "args": ["run", "verify"],
+      "timeoutMs": 1800000
+    }
+  }
+}

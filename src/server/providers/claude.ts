@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { ApprovalHint, HistoryMessage, HistorySyncContext, HistorySyncDecision, HistorySession, HistoryTokenUsage, ModelChoice, ModelOptions, ProviderAdapter, ProviderLaunch, TmuxIO } from "./provider";
+import type { ApprovalHint, HistoryMessage, HistorySyncContext, HistorySyncDecision, HistorySession, HistoryTokenUsage, ModelChoice, ModelOptions, ProviderAdapter, ProviderLaunch, ProviderLaunchProfile, TmuxIO } from "./provider";
 import type { UsageRecord, UsageWindow } from "../../shared/types";
 import { extractContent, fallbackId } from "./history-utils";
 import { stripAnsi } from "../core/security";
@@ -410,6 +410,51 @@ function readClaudePromptDraft(output: string): string | null {
   return null;
 }
 
+// 대기열 기록은 전송 직후 파일 끝에 붙으므로 끝부분만 읽는다.
+const QUEUE_RECORD_TAIL_BYTES = 256 * 1024;
+// 전송 시각과 CLI 기록 시각의 미세한 차이를 허용한다.
+const QUEUE_RECORD_CLOCK_SKEW_MS = 2_000;
+
+// Claude는 작업 중 입력을 JSONL에 `queue-operation enqueue` 레코드로 즉시 남긴다(실측 #1095: 전송 0.3초 뒤,
+// 이후 `remove reason=absorbed_mid_turn`으로 진행 중인 턴에 흡수). 이 입력은 UserPromptSubmit 훅이 오지 않아
+// 제출 확인의 증거로 쓴다(#103). 보낸 시각 이후의 레코드 중 공백을 정규화한 내용이 같은 것만 인정한다.
+export function claudeQueuedPromptRecorded(historyFile: string, expectedPrompt: string, sinceMs: number): boolean {
+  let text: string;
+  try {
+    const descriptor = fs.openSync(historyFile, "r");
+    try {
+      const size = fs.fstatSync(descriptor).size;
+      const length = Math.min(size, QUEUE_RECORD_TAIL_BYTES);
+      const buffer = Buffer.alloc(length);
+      fs.readSync(descriptor, buffer, 0, length, size - length);
+      text = buffer.toString("utf8");
+    } finally {
+      fs.closeSync(descriptor);
+    }
+  } catch {
+    return false;
+  }
+  const normalize = (value: string) => value.replace(/\s+/g, " ").trim();
+  const expected = normalize(expectedPrompt);
+  for (const line of text.split("\n").reverse()) {
+    if (!line.includes("\"queue-operation\"")) continue;
+    try {
+      const record = JSON.parse(line) as { type?: string; operation?: string; timestamp?: string; content?: unknown };
+      if (record.type !== "queue-operation" || record.operation !== "enqueue" || typeof record.content !== "string") continue;
+      const recordedAt = Date.parse(record.timestamp ?? "");
+      if (!Number.isFinite(recordedAt) || recordedAt < sinceMs - QUEUE_RECORD_CLOCK_SKEW_MS) continue;
+      if (normalize(record.content) === expected) return true;
+    } catch {
+      // 끝부분을 자르며 생긴 첫 줄 조각 등은 건너뛴다.
+    }
+  }
+  return false;
+}
+
+// 응답 생성 중에만 뜨는 진행 스피너 줄(예: "* Cogitating…", "✽ Synthesizing… (2m 29s · ↓ 9.7k tokens)").
+// 끝난 턴의 요약 줄은 "✻ Crunched for 8m 1s · done 10:35 AM"처럼 "…"가 없어 이 패턴에 걸리지 않는다.
+const CLAUDE_SPINNER_PATTERN = /^\s*[*✻✽✢✳✶✷✸✹·]\s+[A-Za-z][A-Za-z'-]*…/m;
+
 // Claude 화면의 응답 생성 중 상태 표시를 감지한다.
 // isClaudeReady와 같은 이유로 끝의 빈 줄을 먼저 제거하고, 프롬프트 줄 아래쪽 상태줄도 놓치지 않게
 // 화면 끝까지 본다(위 isClaudeReady 주석 참고).
@@ -420,16 +465,43 @@ function isClaudeBusy(output: string): boolean {
     if (isClaudePromptLine(lines[index])) { promptIndex = index; break; }
   }
   const activeArea = stripAnsi(lines.slice(Math.max(0, promptIndex >= 0 ? promptIndex - 3 : lines.length - 6)).join("\n"));
-  return /esc to interrupt/i.test(activeArea);
+  // 상태줄("esc to interrupt")은 화면 맨 아래에 있어, 서버 화면 버퍼 행 수와 실제 tmux pane 행 수가
+  // 어긋나면 tmux 상태바에 밀려 잘려나간다(실측: 버퍼 36행 · pane 31행에서 상태줄 소실, busy 오판정).
+  // 스피너 줄은 프롬프트 바로 위라 그 상황에서도 남으므로 두 신호를 함께 본다.
+  return /esc to interrupt/i.test(activeArea) || CLAUDE_SPINNER_PATTERN.test(activeArea);
 }
 
-// 지정 레이블 다음 줄에서 Claude 사용률과 초기화 시각을 추출한다.
+export type ClaudeUsageFallbackCode = Exclude<UsageRecord["error_code"], "auth_required" | "timeout" | "parse_failed" | "cli_exited" | "rate_limited" | null>;
+
+// Claude 2.1.251의 /usage는 endpoint 응답이 없을 때도 최근 모델 응답 헤더나 디스크 캐시의
+// 퍼센트를 정상 막대와 똑같이 그린다. 숫자를 먼저 파싱하면 오래된 1%를 fresh로 오인하므로,
+// 설치본이 표시하는 fallback·로딩 문구를 먼저 분류한다. 여기서 throttled는 사용자의 5시간
+// quota 소진이 아니라 usage 상세 endpoint 요청 제한이라는 의미다.
+export function claudeUsageFallbackCode(text: string): ClaudeUsageFallbackCode | null {
+  if (/per-model breakdown unavailable/i.test(text)) return "usage_seeded_headers_throttled";
+  if (/showing last-known usage[\s\S]{0,160}\(rate limited/i.test(text)) return "usage_seeded_persisted_throttled";
+  if (/showing last-known usage[\s\S]{0,160}\(could not refresh\)/i.test(text)) return "usage_seeded_persisted_refresh_failed";
+  if (/showing last-known usage/i.test(text)) return "usage_seeded_persisted_refresh_failed";
+  if (/could not refresh usage data/i.test(text)) return "usage_seeded_headers_refresh_failed";
+  if (/usage endpoint is rate limited/i.test(text)) return "usage_endpoint_throttled";
+  if (/loading usage data|refreshing(?:…|\.\.\.)/i.test(text)) return "usage_refreshing";
+  return null;
+}
+
+// 지정 레이블 다음 줄에서 Claude 사용률과 초기화 시각을 추출한다. Resets가 없으면 resetAt만 비운다.
 function parseClaudeWindow(text: string, id: string, label: string): UsageWindow | null {
   const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const match = text.match(new RegExp(`${escaped}\\s*\\n[^\\n]*?(\\d+(?:\\.\\d+)?)%[^\\n]*used\\s*\\n\\s*Resets\\s+([^\\n]+)`, "i"));
+  const match = text.match(new RegExp(`${escaped}\\s*\\n[^\\n]*?(\\d+(?:\\.\\d+)?)%[^\\n]*used(?:\\s*\\n\\s*Resets\\s+([^\\n]+))?`, "i"));
   if (!match) return null;
   const usedPercent = Number(match[1]);
-  return { id, label, usedPercent, remainingPercent: 100 - usedPercent, resetAt: match[2].trim() };
+  return { id, label, usedPercent, remainingPercent: 100 - usedPercent, resetAt: match[2]?.trim() ?? null };
+}
+
+// Claude 대표 창은 session이다. 제목만 있고 Resets가 없는 0% 블록은 주간 숫자로 세션을 덮으면 안 된다.
+export function isClaudeUsageSnapshotComplete(text: string, windows: UsageWindow[]): boolean {
+  const session = windows.find((window) => window.id === "session");
+  if (/^current session$/im.test(text)) return !!session?.resetAt;
+  return false;
 }
 
 // Claude 화면의 고정 구간과 현재 모델별 주간 구간을 모두 추출한다.
@@ -447,12 +519,52 @@ function parseClaudeWindows(text: string): UsageWindow[] {
 }
 
 // Claude 실행·기록·승인 동작을 공급자 공통 인터페이스로 제공한다.
+// 온보딩(테마 선택 등) 완료 여부가 인증과 별개인 hasCompletedOnboarding 플래그로 관리돼, OAuth
+// 로그인만 끝내도(claude auth login/status는 정상 인증됨을 보여줌) 대화형으로 실행할 때마다 "Let's
+// get started" 마법사가 다시 뜬다(실사용 보고로 재현·확인, Claude Code 커뮤니티에도 알려진 동작 —
+// https://github.com/anthropics/claude-code/issues/4714). 실행 전에 이 플래그를 직접 채워 마법사를
+// 건너뛴다. 계정 슬롯별 CLAUDE_CONFIG_DIR을 쓰는 경우는 아직 대상이 아니다(기본 계정만 확인됨).
+export function ensureClaudeOnboardingComplete(homeDir: string): void {
+  const filePath = path.join(homeDir, ".claude.json");
+  let existing: Record<string, unknown> = {};
+  try {
+    existing = JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch {
+    // 파일이 없거나 손상됐으면 새로 만든다.
+  }
+  if (existing.hasCompletedOnboarding === true) return;
+  fs.writeFileSync(filePath, `${JSON.stringify({ ...existing, hasCompletedOnboarding: true }, null, 2)}\n`, { mode: 0o600 });
+}
+
+// 온보딩을 건너뛴 뒤에도 처음 여는 작업공간마다 "이 폴더를 신뢰합니까?" 확인이 한 번씩 더 뜬다
+// (projects[경로].hasTrustDialogAccepted로 저장됨, 실측 확인). 사용자가 고르는 임의의 프로젝트
+// 디렉터리(실제 채팅)는 이 보안 확인을 그대로 유지해야 하지만, 사용량 조회 전용 PTY는 앱 자신의
+// 고정 설치 경로만 열기 때문에 미리 신뢰 처리해도 안전하다 — createMonitorLaunch에서만 쓴다.
+export function ensureClaudeWorkspaceTrusted(homeDir: string, workspacePath: string): void {
+  const filePath = path.join(homeDir, ".claude.json");
+  let existing: Record<string, unknown> = {};
+  try {
+    existing = JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch {
+    // 파일이 없거나 손상됐으면 새로 만든다.
+  }
+  const projects = { ...(existing.projects as Record<string, Record<string, unknown>> | undefined) };
+  if (projects[workspacePath]?.hasTrustDialogAccepted === true) return;
+  projects[workspacePath] = { ...projects[workspacePath], hasTrustDialogAccepted: true };
+  fs.writeFileSync(filePath, `${JSON.stringify({ ...existing, projects }, null, 2)}\n`, { mode: 0o600 });
+}
+
 export class ClaudeAdapter implements ProviderAdapter {
   readonly id = "claude" as const;
   readonly displayLabel = "Claude";
   readonly usageWindowId = "session";
   readonly usageResetWindowIds = ["session", "weekly_all"];
+  readonly usageWindowLabels = { session: "5시간", weekly_all: "주간" };
+  // Claude는 세션 초기화 뒤 첫 채팅 전까지 Current session 블록을 숨길 수 있다. 이전 양수
+  // 예약 경계 뒤의 누락 자체를 새 세션 0%와 같은 초기화 증거로 처리한다.
+  readonly transientUsageResetWindowIds = ["session"];
   readonly cliVersionCommand = { command: "claude", args: ["--version"] };
+  readonly cliUpdateCommand = { command: "claude", args: ["update"] };
   readonly historyRoot = path.join(os.homedir(), ".claude", "projects");
 
   // CLAUDE_CONFIG_DIR를 지정하면 Claude가 그 폴더 아래에 projects/를 새로 만들어 기록을 남긴다.
@@ -478,17 +590,34 @@ export class ClaudeAdapter implements ProviderAdapter {
   // 지워질 수 없으므로 영구히 false로 확정하고, 숨김 파일만 mtime이 바뀌었을 때 다시 검사한다.
   private readonly hiddenHistoryVerdicts = new Map<string, { mtimeMs: number; hidden: boolean }>();
 
+  readonly supportsNewSessionId = true;
+  readonly supportsSessionRename = true;
+
   constructor(private readonly settingsFile: string, private readonly hookEnvironment: Record<string, string>) {}
 
   // 새 Claude TUI 또는 저장된 세션 resume 명령을 구성한다.
-  createLaunch(_cwd: string, resumeSessionId?: string): ProviderLaunch {
+  createLaunch(_cwd: string, resumeSessionId?: string, newSessionId?: string, profile?: ProviderLaunchProfile): ProviderLaunch {
+    ensureClaudeOnboardingComplete(os.homedir());
     const args = ["--settings", this.settingsFile];
+    if (profile) {
+      if (profile.sandbox === "danger-full-access") throw new Error("Claude TUI에는 danger-full-access project profile을 적용하지 않습니다.");
+      if (profile.sandbox === "read-only") args.push("--restricted");
+      args.push("--permission-mode", profile.sandbox === "read-only" ? "plan" : profile.approvalMode === "never" ? "dontAsk" : "manual");
+      if (profile.model) args.push("--model", profile.model);
+      if (profile.reasoningEffort) args.push("--effort", profile.reasoningEffort);
+      for (const directory of profile.additionalWritePaths) args.push("--add-dir", directory);
+      if (profile.allowedTools.length) args.push("--allowedTools", profile.allowedTools.join(","));
+      if (profile.disallowedTools.length) args.push("--disallowedTools", profile.disallowedTools.join(","));
+    }
     if (resumeSessionId) args.push("--resume", resumeSessionId);
+    else if (newSessionId) args.push("--session-id", newSessionId);
     return { command: "claude", args, env: this.hookEnvironment };
   }
 
   // 상태 조회는 인증·내장 명령만 유지하고 훅·MCP·플러그인과 장식 렌더링을 생략한다.
-  createMonitorLaunch(_cwd: string): ProviderLaunch {
+  createMonitorLaunch(cwd: string): ProviderLaunch {
+    ensureClaudeOnboardingComplete(os.homedir());
+    ensureClaudeWorkspaceTrusted(os.homedir(), cwd);
     return { command: "claude", args: ["--safe-mode", "--ax-screen-reader"] };
   }
 
@@ -507,7 +636,8 @@ export class ClaudeAdapter implements ProviderAdapter {
     const markBusy = context.newMessages.some((message) => message.role === "user" && message.kind !== "tool_result")
       || context.newMessages.some((message) => message.role === "assistant" && message.kind === "tool_call");
     const notifyCompletion = context.newMessages.some((message) => message.role === "assistant" && message.kind === "turn_end");
-    return { markBusy, clearBusy: notifyCompletion || context.isTurnEnd, notifyCompletion };
+    const lastTurnEnded = context.last?.role === "assistant" && context.last.kind === "turn_end";
+    return { markBusy, clearBusy: notifyCompletion || lastTurnEnded || context.isTurnEnd, notifyCompletion };
   }
 
   // 실제 사용자 대화가 없는 Claude 내부 기록인지 판정한다.
@@ -541,23 +671,41 @@ export class ClaudeAdapter implements ProviderAdapter {
     return readClaudePromptDraft(output);
   }
 
+  // 작업 중 입력이 JSONL 대기열 기록으로 남았는지 본다(#103).
+  hasQueuedPrompt(historyFile: string, expectedPrompt: string, sinceMs: number): boolean {
+    return claudeQueuedPromptRecorded(historyFile, expectedPrompt, sinceMs);
+  }
+
   // Claude /usage 화면에서 사용량 상태를 구조화한다.
   parseUsage(output: string, now: Date = new Date()): Partial<UsageRecord> {
     const text = stripAnsi(output);
     const authRequired = /(sign in|login required|not authenticated|로그인)/i.test(text);
+    const fallbackCode = claudeUsageFallbackCode(text);
     const windows = parseClaudeWindows(text);
-    const primary = windows[0];
-    const success = windows.length > 0 && !authRequired;
-    const stale = success && windows.some((window) => !!window.resetAt && isExpiredResetTime(window.resetAt, now));
+    const snapshotComplete = isClaudeUsageSnapshotComplete(text, windows);
+    const primary = windows.find((window) => window.id === "session") ?? windows[0];
+    const success = snapshotComplete && !authRequired && !fallbackCode;
+    const stale = success && windows.some((window) => !!window.resetAt && isExpiredResetTime(
+      window.resetAt,
+      now,
+      // Claude의 Current session은 5시간 롤링 창이다. 날짜 없는 자정 전후 시각은 다음 날일 수 있다.
+      window.id === "session" ? 5 * 60 * 60_000 : 0,
+    ));
+    const session = windows.find((window) => window.id === "session");
+    const hasSessionTitle = /^current session$/im.test(text);
+    // 숫자는 채택하지 않지만, 세션 블록 누락이나 0%·Resets 없음은 초기화 고정 재료로 남긴다.
+    const keepaliveSnapshot = !authRequired && !fallbackCode && windows.length > 0 && (
+      !hasSessionTitle || (!!session && session.usedPercent === 0 && !session.resetAt)
+    );
     return {
       provider: "claude",
       summary: success ? windows.map((window) => `${window.label}: ${window.usedPercent}% used`).join("\n") : null,
-      used_percent: primary?.usedPercent ?? null,
-      remaining_percent: primary?.remainingPercent ?? null,
-      reset_at: primary?.resetAt ?? null,
-      details_json: success ? JSON.stringify({ windows, activity: [] }) : null,
-      data_status: !success ? "unavailable" : stale ? "stale" : "fresh",
-      error_code: authRequired ? "auth_required" : success ? null : "parse_failed",
+      used_percent: success ? primary?.usedPercent ?? null : null,
+      remaining_percent: success ? primary?.remainingPercent ?? null : null,
+      reset_at: success ? primary?.resetAt ?? null : null,
+      details_json: success || keepaliveSnapshot ? JSON.stringify({ windows, activity: [] }) : null,
+      data_status: fallbackCode ? "stale" : !windows.length && !success ? "unavailable" : success ? (stale ? "stale" : "fresh") : "stale",
+      error_code: authRequired ? "auth_required" : fallbackCode ?? (success || keepaliveSnapshot || hasSessionTitle ? null : "parse_failed"),
     };
   }
 

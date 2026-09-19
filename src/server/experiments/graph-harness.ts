@@ -18,6 +18,8 @@ interface GraphExecution {
   stopReason: ExperimentTerminationReason | null;
   // 한도 대기 구간을 예산·시간 지표에서 빼기 위해 run 전체에서 하나만 쓴다.
   clock: ActiveClock;
+  // 벽시계가 아니라 실작업 남은 시간에 맞춘 시간 예산 타이머. 대기 전후 재설정한다.
+  timeout: ReturnType<typeof setTimeout> | null;
 }
 
 interface NodeResult {
@@ -30,10 +32,13 @@ export interface GraphHarnessOptions {
   primaryRuntime: AgentRuntime;
   secondaryRuntime: AgentRuntime;
   hookBus?: ExperimentHookBus;
+  // fixture가 선언한 검증 명령. Runtime에 도구 허용 목록으로 전달한다.
+  allowedCommands?: string[][];
   // 실패가 공급자 사용량 한도 때문인지 계정 상태로 확인한다. 주입하지 않으면 분류하지 않는다.
   isProviderLimited?: (provider: ExperimentProvider, accountId: number | null) => Promise<boolean>;
   // 한도가 풀릴 때까지 기다린다. true면 같은 node의 공급자 세션을 이어서 재개한다.
   waitForProviderLimit?: (runId: string, provider: ExperimentProvider, accountId: number | null, signal: AbortSignal) => Promise<boolean>;
+  outputSchema?: Record<string, unknown>;
 }
 
 class GraphStopError extends Error {
@@ -64,8 +69,10 @@ export class GraphHarness {
   private readonly primaryRuntime: AgentRuntime;
   private readonly secondaryRuntime: AgentRuntime;
   private readonly hookBus: ExperimentHookBus;
+  private readonly allowedCommands: string[][];
   private readonly isProviderLimited?: (provider: ExperimentProvider, accountId: number | null) => Promise<boolean>;
   private readonly waitForProviderLimit?: (runId: string, provider: ExperimentProvider, accountId: number | null, signal: AbortSignal) => Promise<boolean>;
+  private readonly outputSchema?: Record<string, unknown>;
   private readonly active = new Map<string, GraphExecution>();
 
   constructor(options: GraphHarnessOptions) {
@@ -73,27 +80,50 @@ export class GraphHarness {
     this.primaryRuntime = options.primaryRuntime;
     this.secondaryRuntime = options.secondaryRuntime;
     this.hookBus = options.hookBus ?? new ExperimentHookBus();
+    this.allowedCommands = options.allowedCommands ?? [];
     this.isProviderLimited = options.isProviderLimited;
     this.waitForProviderLimit = options.waitForProviderLimit;
+    this.outputSchema = options.outputSchema;
   }
 
   // 일반 실행 오류를 구조화된 종료 이유로 좁힌다. 컨텍스트 초과는 오류 문구로, 공급자 한도는 계정
   // 사용량 상태로 판단하며 컨텍스트 쪽을 먼저 본다(한도와 무관하게 확정적인 신호이기 때문).
+  // 한도 조회는 실패한 node의 provider·accountId를 쓰고, 없으면 run primary로 떨어진다.
   private async narrowFailureReason(
     reason: ExperimentTerminationReason,
     run: ExperimentRunRecord | null,
     evidence: unknown = null,
+    runtime?: { provider: ExperimentProvider; accountId: number | null },
   ): Promise<ExperimentTerminationReason> {
     if (reason !== "runtime_error") return reason;
     const classified = classifyFailureReason(reason, evidence);
     if (classified !== reason) return classified;
     if (!this.isProviderLimited || !run) return reason;
     try {
-      const { provider, accountId } = run.configSnapshot.runtime;
+      const { provider, accountId } = runtime ?? run.configSnapshot.runtime;
       return await this.isProviderLimited(provider, accountId) ? "provider_limit" : reason;
     } catch {
       return reason;
     }
+  }
+
+  // 한도 대기 중 벽시계 타이머가 울리지 않도록 지운다.
+  private clearTimeBudget(execution: GraphExecution): void {
+    if (execution.timeout) {
+      clearTimeout(execution.timeout);
+      execution.timeout = null;
+    }
+  }
+
+  // 남은 실작업 시간으로 시간 예산 타이머를 다시 건다.
+  private armTimeBudget(execution: GraphExecution, budget: RuntimeBudgetPolicy): void {
+    this.clearTimeBudget(execution);
+    execution.timeout = setTimeout(() => {
+      execution.stopReason ??= "time_budget";
+      execution.controller.abort();
+      if (execution.runtime && execution.runtimeRunId) void execution.runtime.cancel(execution.runtimeRunId);
+    }, budget.remainingActiveMs());
+    execution.timeout.unref();
   }
 
   // queued 그래프 run을 선택한 하네스 방식으로 실행하고 terminal 상태를 반환한다.
@@ -102,7 +132,7 @@ export class GraphHarness {
     const initial = this.repository.getRun(runId);
     if (!initial || initial.status !== "queued" || !initial.workingDirectory) throw new Error("queued 상태와 격리 작업공간이 있는 run이 필요합니다.");
     if (initial.configSnapshot.harness.type === "single") throw new Error("GraphHarness는 single 변형을 실행하지 않습니다.");
-    const execution: GraphExecution = { controller: new AbortController(), runtime: null, runtimeRunId: null, cancelled: false, stopReason: null, clock: new ActiveClock() };
+    const execution: GraphExecution = { controller: new AbortController(), runtime: null, runtimeRunId: null, cancelled: false, stopReason: null, clock: new ActiveClock(), timeout: null };
     this.active.set(runId, execution);
     let ordinal = 0;
     const append = (type: string, payload: Record<string, unknown> = {}) => {
@@ -115,12 +145,7 @@ export class GraphHarness {
       return emission.payload;
     };
     const budget = new RuntimeBudgetPolicy(initial.configSnapshot.budget, execution.clock);
-    const timeout = setTimeout(() => {
-      execution.stopReason ??= "time_budget";
-      execution.controller.abort();
-      if (execution.runtime && execution.runtimeRunId) void execution.runtime.cancel(execution.runtimeRunId);
-    }, budget.remainingActiveMs());
-    timeout.unref();
+    this.armTimeBudget(execution, budget);
     try {
       this.repository.transitionRun({ runId, status: "preparing" });
       const experiment = this.repository.getExperiment(initial.experimentId);
@@ -154,7 +179,7 @@ export class GraphHarness {
       }
       return this.repository.transitionRun({ runId, status: "failed", terminationReason: reason, error: message });
     } finally {
-      clearTimeout(timeout);
+      this.clearTimeBudget(execution);
       this.active.delete(runId);
     }
   }
@@ -247,7 +272,10 @@ export class GraphHarness {
       const runtimeRunId = `${run.id}:${node.ordinal}:${role}`;
       execution.runtime = runtime;
       execution.runtimeRunId = runtimeRunId;
-      const input = { runId: runtimeRunId, workingDirectory: run.workingDirectory!, prompt: selectedPrompt, config };
+      const input = {
+        runId: runtimeRunId, workingDirectory: run.workingDirectory!, prompt: selectedPrompt, config,
+        allowedCommands: this.allowedCommands, outputSchema: this.outputSchema,
+      };
       const snapshot = await runtime.prepare(input);
       this.repository.transitionNode({ nodeId: node.id, status: "running" });
       append("node.started", { nodeId: node.id, role, snapshot });
@@ -284,12 +312,16 @@ export class GraphHarness {
         else if (event.type === "failed") failure = event;
         }
         if (execution.stopReason || completed || !failure) break;
-        const failureReason = await this.narrowFailureReason(failure.reason ?? "runtime_error", this.repository.getRun(run.id), failure.error);
+        const failureReason = await this.narrowFailureReason(
+          failure.reason ?? "runtime_error", this.repository.getRun(run.id), failure.error,
+          { provider: config.runtime.provider, accountId: config.runtime.accountId },
+        );
         // 한도는 실패가 아니라 대기로 처리한다. 이어붙일 세션이 없거나 정책이 없으면 그대로 끝낸다.
         if (failureReason !== "provider_limit" || !this.waitForProviderLimit || attempt >= MAX_LIMIT_WAITS || !providerRunId) {
           failure = { ...failure, reason: failureReason };
           break;
         }
+        this.clearTimeBudget(execution);
         const waitedFrom = Date.now();
         execution.clock.pause(waitedFrom);
         append("node.waiting", { nodeId: node.id, role, reason: failureReason, attempt });
@@ -305,6 +337,7 @@ export class GraphHarness {
           break;
         }
         append("node.resumed", { nodeId: node.id, role, waitedSeconds: (waitedUntil - waitedFrom) / 1_000, attempt });
+        this.armTimeBudget(execution, budget);
       }
       execution.runtime = null;
       execution.runtimeRunId = null;

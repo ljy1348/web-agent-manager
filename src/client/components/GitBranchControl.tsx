@@ -11,6 +11,11 @@ interface GitBranchControlProps {
   onChanged?: () => void | Promise<void>;
 }
 
+// 폴링마다 이전 값을 지우면 위젯이 사라졌다 나타나므로, 성공 응답으로만 교체한다.
+export function shouldClearWorkspaceBeforeLoad(): boolean {
+  return false;
+}
+
 // 선택 채팅의 브랜치·worktree 상태 조회와 전환 UI를 제공한다.
 export function GitBranchControl({ projectId, chat, canManage, variant = "bar", onChanged }: GitBranchControlProps): React.ReactElement | null {
   const [workspace, setWorkspace] = useState<Json | null>(null);
@@ -25,14 +30,12 @@ export function GitBranchControl({ projectId, chat, canManage, variant = "bar", 
   const query = chat?.id ? `?chatId=${chat.id}` : "";
   const unassignedWorktrees = useMemo(() => (workspace?.worktrees || []).filter((item: Json) => !item.main && !item.assignedChatId), [workspace]);
 
-  // 서버에서 실제 checkout 상태를 다시 읽어 선택 컨트롤과 맞춘다.
+  // 서버에서 실제 checkout 상태를 다시 읽는다. 시작마다 비우지 않아 20초 폴링 때 위젯이 깜빡이지 않는다.
   async function load(): Promise<void> {
-    setWorkspace(null);
     try {
       const data = await api(`/projects/${projectId}/git/workspace${query}`);
       if (!data || typeof data.path !== "string" || !Array.isArray(data.branches)) {
-        setWorkspace(null);
-        setError("");
+        setError("Git 작업공간을 조회하지 못했습니다.");
         return;
       }
       setWorkspace(data);
@@ -40,12 +43,11 @@ export function GitBranchControl({ projectId, chat, canManage, variant = "bar", 
       setMode(data.mode || "shared");
       setError("");
     } catch (loadError: any) {
-      setWorkspace(null);
       setError(loadError?.message || "Git 작업공간을 조회하지 못했습니다.");
     }
   }
 
-  useEffect(() => { setEditing(false); void load(); }, [projectId, chat?.id]);
+  useEffect(() => { setEditing(false); setWorkspace(null); setError(""); void load(); }, [projectId, chat?.id]);
   // 채팅 터미널 안에서 AI가 직접 git checkout -b 등으로 브랜치를 바꾸면 이 앱의 브랜치 전환 API를
   // 거치지 않아 이 위젯은 그 사실을 알 방법이 없다(실사용 보고: 채팅에서 새 브랜치로 전환해도 GitHub
   // 탭 배지·diff가 예전 브랜치에 계속 머묾). 짧은 주기로 다시 읽어 자연히 따라잡되, 지금 메뉴를
@@ -103,7 +105,12 @@ export function GitBranchControl({ projectId, chat, canManage, variant = "bar", 
     }
   }
 
-  if (!workspace) return null;
+  if (!workspace) {
+    if (!error) return null;
+    return <section className={`git-branch-control ${variant}`} aria-label="Git 브랜치 작업공간">
+      <span className="git-branch-error">{error}</span>
+    </section>;
+  }
   const summary = <>
       <GitBranch size={16} aria-hidden="true" />
       <code>{workspace.branch || "detached HEAD"}</code>
@@ -114,6 +121,7 @@ export function GitBranchControl({ projectId, chat, canManage, variant = "bar", 
     {canManage
       ? <button type="button" className="git-branch-trigger" title={workspace.path} aria-label="Git 작업공간 변경" aria-expanded={editing} onClick={() => setEditing((value) => !value)}>{summary}</button>
       : <div className="git-branch-trigger readonly" title={workspace.path}>{summary}</div>}
+    {error && !editing && <span className="git-branch-error">{error}</span>}
     {canManage && editing && <div className="git-branch-editor">
       <div className="git-branch-editor-head"><strong>Git 작업공간</strong><code>{workspace.path}</code><button type="button" className="icon-button" title="작업공간 메뉴 닫기" aria-label="작업공간 메뉴 닫기" onClick={() => setEditing(false)}><X size={14} /></button></div>
       <div className="git-branch-switch">

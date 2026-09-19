@@ -65,19 +65,34 @@ export class ExperimentSkillManifestService {
     this.rootDir = options.rootDir ? path.resolve(options.rootDir) : null;
   }
 
+  // 공급자 기본 설정 디렉터리 이름. 계정 슬롯이 지정되면 그 경로가 우선한다.
+  private static readonly CONFIG_DIRECTORIES: Record<Provider, string> = { codex: ".codex", claude: ".claude", grok: ".grok" };
+
   // 공급자가 기본 발견하는 project/user/system 스킬 루트를 반환한다.
   private installedRoots(provider: Provider, workingDirectory: string, accountConfigDir?: string | null) {
-    const configDir = path.resolve(accountConfigDir || path.join(this.homeDir, provider === "codex" ? ".codex" : ".claude"));
-    return provider === "codex"
-      ? [
+    const configDir = path.resolve(accountConfigDir || path.join(this.homeDir, ExperimentSkillManifestService.CONFIG_DIRECTORIES[provider]));
+    if (provider === "codex") {
+      return [
         { scope: "project" as const, path: path.join(workingDirectory, ".agents", "skills") },
         { scope: "user" as const, path: path.join(configDir, "skills") },
         { scope: "system" as const, path: this.codexSystemDir },
-      ]
-      : [
+      ];
+    }
+    if (provider === "grok") {
+      // Grok은 네이티브 `.grok/skills` 외에 Claude Code 호환 경로도 실제로 스킬로 읽어들인다(실측:
+      // `grok inspect`가 `.claude/skills`의 항목을 project 스킬로 표시). 실행 시 실제로 보이는 집합을
+      // 그대로 스냅샷에 남겨야 비교가 정확하므로 호환 경로까지 포함한다.
+      return [
+        { scope: "project" as const, path: path.join(workingDirectory, ".grok", "skills") },
         { scope: "project" as const, path: path.join(workingDirectory, ".claude", "skills") },
         { scope: "user" as const, path: path.join(configDir, "skills") },
+        { scope: "user" as const, path: path.join(this.homeDir, ".claude", "skills") },
       ];
+    }
+    return [
+      { scope: "project" as const, path: path.join(workingDirectory, ".claude", "skills") },
+      { scope: "user" as const, path: path.join(configDir, "skills") },
+    ];
   }
 
   // worktree 기준 project 스킬과 실제 계정 config의 사용자·시스템 스킬 ID·경로·해시를 반환한다.

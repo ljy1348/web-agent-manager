@@ -95,6 +95,25 @@ describe("history-sync 프로젝트 귀속", () => {
     expect(database.prepare("SELECT COUNT(*) AS n FROM projects").get()).toEqual({ n: 1 });
   });
 
+  // 이 INSERT 경로에 오는 건 MyAgent가 만든 적 없는 외부 CLI 세션뿐이다. 일반 목록에 쌓이면 실제
+  // 채팅이 묻히므로(실측 #61: 목록 100건 중 77건) 목록에서 빠지는 origin으로 등록해야 한다.
+  it("웹에서 만들지 않은 세션은 목록에서 빠지는 origin으로 등록한다", () => {
+    const projectDir = makeDir("wam-project-");
+    const historyRoot = makeDir("wam-history-");
+    const dataDir = makeDir("wam-data-");
+    const config = { dataDir, allowedRoots: [projectDir] } as unknown as AppConfig;
+    const { database, sync } = buildSynchronizer(config, historyRoot);
+
+    writeSession(historyRoot, "outside-session", projectDir, "2026-08-22T00:00:00.000Z");
+    sync.syncAll(false);
+
+    const chat = database.prepare("SELECT origin, tmux_name FROM chats WHERE provider_session_id = ?")
+      .get("outside-session") as { origin: string; tmux_name: string };
+    expect(chat.origin).toBe("delegation");
+    // 웹에서 만든 채팅과 tmux 이름 규칙이 달라, 생성 경로를 사후에도 구분할 수 있어야 한다.
+    expect(chat.tmux_name.startsWith("web_agent_manager_chat_")).toBe(false);
+  });
+
   it("정리한 프로젝트의 세션은 새 기록이 쌓여도 다시 채팅으로 등록되지 않는다", () => {
     const projectDir = makeDir("wam-project-");
     const historyRoot = makeDir("wam-history-");

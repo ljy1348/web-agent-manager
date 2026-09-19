@@ -16,7 +16,11 @@ afterEach(() => {
 });
 
 // 테스트별 완료 전 queued 그래프 run과 독립 DB를 만든다.
-function createRun(type: ExperimentHarnessType, harness: Partial<ExperimentVariantConfig["harness"]> = {}) {
+function createRun(
+  type: ExperimentHarnessType,
+  harness: Partial<ExperimentVariantConfig["harness"]> = {},
+  extras: { budget?: Partial<ExperimentVariantConfig["budget"]>; runtime?: Partial<ExperimentVariantConfig["runtime"]> } = {},
+) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wam-graph-harness-"));
   const database = openDatabase({
     rootDir: root, dataDir: root, homeDir: root, host: "127.0.0.1", port: 0,
@@ -28,14 +32,17 @@ function createRun(type: ExperimentHarnessType, harness: Partial<ExperimentVaria
   const repository = new ExperimentRepository(database);
   const config: ExperimentVariantConfig = {
     schemaVersion: 1,
-    runtime: { provider: "codex", accountId: null, model: "primary", reasoningEffort: "high", sandbox: "workspace-write", maxTurns: null },
+    runtime: {
+      provider: "codex", accountId: null, model: "primary", reasoningEffort: "high", sandbox: "workspace-write", maxTurns: null,
+      ...extras.runtime,
+    },
     skills: { mode: "none", enabled: [], disabled: [], profile: "native", baseline: "clean", additions: [], comparisonId: null, activation: "native" },
     harness: {
       type, maxIterations: 3, minimumScore: 0.8, maxNoImprovement: 1, workerCount: 2,
       secondaryRuntime: { provider: "claude", accountId: null, model: "secondary", reasoningEffort: "high" },
       ...harness,
     },
-    hooks: [], budget: { maxSeconds: 60, maxTokens: 10_000, maxCostUsd: null },
+    hooks: [], budget: { maxSeconds: 60, maxTokens: 10_000, maxCostUsd: null, ...extras.budget },
   };
   const experiment = repository.createExperiment({ projectId, name: "그래프", command: "기능을 구현해" });
   const variant = repository.createVariant({ experimentId: experiment.id, name: type, config });
@@ -174,5 +181,92 @@ describe("GraphHarness 한도 대기", () => {
     }).execute(run.id);
 
     expect(result).toMatchObject({ status: "failed", terminationReason: "provider_limit", waitCount: 1 });
+  });
+
+  it("한도 대기 중에는 벽시계 시간 예산 타이머를 멈추고 재개 후 남은 실작업 시간으로 다시 건다", async () => {
+    const { repository, run } = createRun("orchestrator_worker", { workerCount: 1 }, { budget: { maxSeconds: 1 } });
+    let attempt = 0;
+    let abortedDuringWait = false;
+    class LimitedRuntime extends QueueRuntime {
+      async *run(input: RuntimeRunInput): AsyncIterable<RuntimeEvent> {
+        attempt += 1;
+        if (attempt === 1) {
+          yield { type: "started", providerRunId: "thread-budget", occurredAt: "2026-08-13T00:00:00Z" };
+          yield { type: "failed", error: "종료 코드 1", occurredAt: "2026-08-13T00:00:01Z" };
+          return;
+        }
+        yield* super.run(input);
+      }
+    }
+    const primary = new LimitedRuntime("codex", ["계획", "통합"]);
+    primary.onResume = () => undefined;
+    const result = await new GraphHarness({
+      repository, primaryRuntime: primary, secondaryRuntime: new QueueRuntime("claude", ["worker 결과"]),
+      isProviderLimited: async () => true,
+      waitForProviderLimit: async (_runId, _provider, _accountId, signal) => {
+        await new Promise((resolve) => setTimeout(resolve, 1_500));
+        abortedDuringWait = signal.aborted;
+        return true;
+      },
+    }).execute(run.id);
+
+    expect(abortedDuringWait).toBe(false);
+    expect(result).toMatchObject({ status: "completed", terminationReason: "success" });
+  }, 10_000);
+
+  it("node 한도는 그 node의 provider·accountId로 판정하고 같은 계정으로 기다린다", async () => {
+    const { repository, run } = createRun(
+      "orchestrator_worker",
+      { workerCount: 1, secondaryRuntime: { provider: "claude", accountId: 2, model: "secondary", reasoningEffort: "high" } },
+      { runtime: { accountId: 1 } },
+    );
+    const queries: Array<{ provider: string; accountId: number | null }> = [];
+    const waits: Array<{ provider: string; accountId: number | null }> = [];
+    let workerAttempts = 0;
+    class LimitedWorker extends QueueRuntime {
+      async *run(input: RuntimeRunInput): AsyncIterable<RuntimeEvent> {
+        workerAttempts += 1;
+        if (workerAttempts === 1) {
+          yield { type: "started", providerRunId: "thread-worker", occurredAt: "2026-08-13T00:00:00Z" };
+          yield { type: "failed", error: "종료 코드 1", occurredAt: "2026-08-13T00:00:01Z" };
+          return;
+        }
+        yield* super.run(input);
+      }
+    }
+    const secondary = new LimitedWorker("claude", ["worker 결과"]);
+    secondary.onResume = () => undefined;
+
+    const result = await new GraphHarness({
+      repository, primaryRuntime: new QueueRuntime("codex", ["계획", "통합"]), secondaryRuntime: secondary,
+      isProviderLimited: async (provider, accountId) => {
+        queries.push({ provider, accountId });
+        return provider === "claude" && accountId === 2;
+      },
+      waitForProviderLimit: async (_runId, provider, accountId) => {
+        waits.push({ provider, accountId });
+        return true;
+      },
+    }).execute(run.id);
+
+    expect(queries).toEqual([{ provider: "claude", accountId: 2 }]);
+    expect(waits).toEqual([{ provider: "claude", accountId: 2 }]);
+    expect(result).toMatchObject({ status: "completed", terminationReason: "success", waitCount: 1 });
+  });
+});
+
+describe("GraphHarness Runtime 입력", () => {
+  it("fixture 검증 명령을 node Runtime 호출에 allowedCommands로 전달한다", async () => {
+    const { repository, run } = createRun("orchestrator_worker", { workerCount: 1 });
+    const primary = new QueueRuntime("codex", ["계획", "통합"]);
+    const secondary = new QueueRuntime("claude", ["worker 결과"]);
+
+    await new GraphHarness({
+      repository, primaryRuntime: primary, secondaryRuntime: secondary,
+      allowedCommands: [["npm", "test"]],
+    }).execute(run.id);
+
+    expect(primary.calls[0]?.allowedCommands).toEqual([["npm", "test"]]);
+    expect(secondary.calls[0]?.allowedCommands).toEqual([["npm", "test"]]);
   });
 });

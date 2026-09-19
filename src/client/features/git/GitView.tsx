@@ -6,7 +6,7 @@ import { api } from "../../api";
 import { LoadingState } from "../../components/LoadingState";
 import { GithubRepositoryList } from "../../components/GithubRepositoryList";
 import { GitBranchControl } from "../../components/GitBranchControl";
-import { DiffFileCard, DiffModeToggle, DiffView, type DiffMode, type ExpandLines } from "../../lib/diff-view";
+import { DiffFileCard, DiffModeToggle, DiffView, type DiffLineCommentTarget, type DiffMode, type DiffReviewControls, type ExpandLines } from "../../lib/diff-view";
 import { parseDiffFiles, statusLabel } from "../../lib/diff-parse";
 import type { Json } from "../../types";
 
@@ -85,10 +85,42 @@ function shortDate(value: string): string {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString("ko-KR", { dateStyle: "short", timeStyle: "short" });
 }
 
+function prCheckLabel(summary: Json | null | undefined): string {
+  if (!summary) return "check 확인 중";
+  if (summary.state === "passed") return "check 통과";
+  if (summary.state === "failed") return "check 실패";
+  if (summary.state === "pending") return "check 진행 중";
+  return "check 판정 불가";
+}
+
 // GitHub 상태 문자열을 목록용 배지 라벨로 바꾼다.
 function stateLabel(state: string): string {
   const labels: Record<string, string> = { OPEN: "열림", CLOSED: "닫힘", MERGED: "병합됨" };
   return labels[state] || state || "상태 없음";
+}
+
+// 새 worktree 채팅은 어댑터 배열 첫 항목이 아니라 현재 채팅 공급자를 우선한다.
+export function worktreeChatProvider(chat: { provider?: string } | null | undefined, providers?: Array<{ id?: string }> | null): string {
+  const ids = (providers ?? []).map((item) => String(item.id || "")).filter(Boolean);
+  const current = String(chat?.provider || "");
+  if (current && (!ids.length || ids.includes(current))) return current;
+  return ids[0] || "claude";
+}
+
+// 조회 실패를 빈 목록으로 바꾸면 "기록 없음"과 구분되지 않는다.
+export function githubRunsErrorState(error: unknown): { runs: []; hasMore: false; error: string } {
+  return {
+    runs: [],
+    hasMore: false,
+    error: error instanceof Error && error.message ? error.message : "워크플로를 불러오지 못했습니다.",
+  };
+}
+
+// Actions 목록이 실패인지, 정말 비었는지, 항목이 있는지 구분한다.
+export function githubRunsListMessage(runsData: { error?: string; runs?: unknown[] } | null | undefined): { kind: "error" | "empty" | "list"; text: string } {
+  if (runsData?.error) return { kind: "error", text: String(runsData.error) };
+  if (runsData?.runs?.length) return { kind: "list", text: "" };
+  return { kind: "empty", text: "워크플로 실행 기록 없음" };
 }
 
 // GitHub 작성자 이름을 안전하게 꺼낸다.
@@ -221,6 +253,7 @@ function PullRequestDetail({ projectId, chatId, pullRequest, refresh, diffMode, 
 
   return <section className="github-detail" ref={detailRef}>
     <div className="github-detail-head"><div><span className={`state-badge ${pullRequest.state?.toLowerCase?.() || ""}`}>{stateLabel(pullRequest.state)}</span><h3>#{pullRequest.number} {pullRequest.title}</h3><small>{pullRequest.headRefName} → {pullRequest.baseRefName} · {authorName(pullRequest)} · {shortDate(pullRequest.updatedAt || pullRequest.createdAt || "")}</small></div><a href={pullRequest.url} target="_blank" rel="noreferrer">GitHub에서 열기</a></div>
+    <div className="pr-merge-monitor" aria-label="PR check 모니터링"><div><strong>{prCheckLabel(pullRequest.checkSummary)}</strong><span>{pullRequest.checkSummary?.passedCount ?? 0} 통과 · {pullRequest.checkSummary?.pendingCount ?? 0} 대기 · {pullRequest.checkSummary?.failedCount ?? 0} 실패 · {pullRequest.checkSummary?.unavailableCount ?? 0} 판정 불가</span></div><div><strong>{pullRequest.autoMergeEnabled ? "조건부 자동 merge 예약됨" : "자동 merge 미예약"}</strong><span>head {String(pullRequest.headRefOid || "확인 중").slice(0, 12)} · {pullRequest.mergeable || "UNKNOWN"} · review {pullRequest.reviewDecision || "없음"}</span></div><small>이 PR을 보는 동안 15초마다 새 상태를 확인합니다.{pullRequest._monitoredAt ? ` 최근 확인 ${shortDate(pullRequest._monitoredAt)}` : ""}</small></div>
     <GithubBody body={pullRequest.body} />
     {actionStatus && <span className="session-action-status">{actionStatus}</span>}
     <div className="github-action-grid">
@@ -235,6 +268,7 @@ function PullRequestDetail({ projectId, chatId, pullRequest, refresh, diffMode, 
       </form>
       <form onSubmit={(event) => { event.preventDefault(); if (window.confirm("이 PR을 병합할까요?")) void mutate(`/github/pr/${pullRequest.number}/merge`, { method: mergeMethod, deleteBranch, confirm: true }, "병합 중…", "PR을 병합했습니다."); }}>
         <strong>병합</strong><select value={mergeMethod} onChange={(event) => setMergeMethod(event.target.value)}><option value="squash">Squash</option><option value="merge">Merge commit</option><option value="rebase">Rebase</option></select><label className="inline-check"><input type="checkbox" checked={deleteBranch} onChange={(event) => setDeleteBranch(event.target.checked)} />브랜치 삭제</label><button className="primary" disabled={busy}>{busy ? "처리 중…" : "PR 병합"}</button>
+        <button type="button" disabled={busy || !pullRequest.headRefOid || pullRequest.state !== "OPEN"} onClick={() => { const enabling = !pullRequest.autoMergeEnabled; const warning = enabling ? "현재 head와 check를 다시 검증한 뒤 GitHub 조건부 자동 merge를 예약합니다. 요구 조건이 이미 충족됐으면 즉시 병합될 수 있습니다. 계속할까요?" : "GitHub의 조건부 자동 merge 예약을 취소할까요?"; if (window.confirm(warning)) void mutate(`/github/pr/${pullRequest.number}/auto-merge`, { enabled: enabling, expectedHeadSha: pullRequest.headRefOid, method: mergeMethod, deleteBranch, confirm: true }, enabling ? "조건부 자동 merge를 예약하는 중…" : "자동 merge 예약을 취소하는 중…", enabling ? "조건부 자동 merge를 요청했습니다." : "자동 merge 예약을 취소했습니다."); }}>{pullRequest.autoMergeEnabled ? "자동 merge 취소" : "조건부 자동 merge"}</button>
       </form>
     </div>
     <section className="github-pr-diff">
@@ -310,11 +344,27 @@ function GitHubTab({ projectId, chatId, github, runsData, loadRuns, loading, loa
   }
 
   // PR diff는 무거울 수 있어 여기서 같이 안 불러오고, PullRequestDetail 안에서 원할 때만 불러온다.
-  async function openPullRequest(number: number): Promise<void> {
-    const detail = await api(chatPath(`/projects/${projectId}/github/pr/${number}`, chatId));
-    setSelectedPullRequest(detail.pullRequest);
+  async function openPullRequest(number: number, force = false): Promise<void> {
+    const path = withQuery(chatPath(`/projects/${projectId}/github/pr/${number}`, chatId), "refresh", force ? 1 : null);
+    const detail = await api(path);
+    setSelectedPullRequest({ ...detail.pullRequest, _monitoredAt: detail.cachedAt || new Date().toISOString() });
     setPanel("pulls");
   }
+
+  // 선택한 PR을 실제로 보는 동안만 한 번씩 갱신한다. 이전 poll이 끝나기 전에는 다음 gh 조회를
+  // 겹치지 않고, 백그라운드 탭에서는 CLI 프로세스를 띄우지 않는다.
+  useEffect(() => {
+    if (panel !== "pulls" || !selectedPullRequest?.number) return;
+    let disposed = false; let running = false;
+    const poll = async () => {
+      if (disposed || running || document.visibilityState !== "visible") return;
+      running = true;
+      try { await openPullRequest(Number(selectedPullRequest.number), true); } catch { /* 마지막 정상 상태를 유지한다. */ }
+      finally { running = false; }
+    };
+    const timer = window.setInterval(() => void poll(), 15_000);
+    return () => { disposed = true; window.clearInterval(timer); };
+  }, [panel, selectedPullRequest?.number, projectId, chatId]);
 
   async function refreshIssueDetail(): Promise<void> {
     if (selectedIssue?.number) await openIssue(selectedIssue.number);
@@ -333,9 +383,10 @@ function GitHubTab({ projectId, chatId, github, runsData, loadRuns, loading, loa
   const issues: Json[] = github.issues || [];
   const pullRequests: Json[] = github.pullRequests || [];
   const runs: Json[] = runsData?.runs || [];
+  const runsMessage = githubRunsListMessage(runsData);
 
   return <div className="github-tab">
-    <div className="github-repo"><a href={github.repository.url} target="_blank" rel="noreferrer">{github.repository.nameWithOwner}</a><span>{loading && <LoaderCircle className="spin" size={13} aria-label="GitHub 새로고침 중" />}이슈 {issues.length} · PR {pullRequests.length}{runsData ? ` · 워크플로 ${runs.length}` : ""}</span></div>
+    <div className="github-repo"><a href={github.repository.url} target="_blank" rel="noreferrer">{github.repository.nameWithOwner}</a><span>{loading && <LoaderCircle className="spin" size={13} aria-label="GitHub 새로고침 중" />}이슈 {issues.length} · PR {pullRequests.length}{runsData && runsMessage.kind !== "error" ? ` · 워크플로 ${runs.length}` : ""}</span></div>
     {github.errors && Object.values(github.errors).some(Boolean) && <div className="github-errors">{Object.entries(github.errors).filter(([, message]) => message).map(([key, message]) => <p key={key}>{key}: {String(message)}</p>)}</div>}
     {actionStatus && <span className="session-action-status">{actionStatus}</span>}
     <div className="git-subtabs"><button className={panel === "issues" ? "active" : ""} onClick={() => setPanel("issues")}>이슈</button><button className={panel === "pulls" ? "active" : ""} onClick={() => setPanel("pulls")}>PR</button><button className={panel === "actions" ? "active" : ""} onClick={() => setPanel("actions")}>Actions</button></div>
@@ -357,7 +408,7 @@ function GitHubTab({ projectId, chatId, github, runsData, loadRuns, loading, loa
     </div>}
     {panel === "actions" && <div className="github-actions-panel">
       <form className="github-create" onSubmit={(event) => { event.preventDefault(); const id = Number(runId); if (id && window.confirm("이 workflow를 재실행할까요?")) void mutate(`/github/run/${id}/rerun`, { confirm: true }, "재실행 요청 중…", "재실행을 요청했습니다.").then((ok) => { if (ok) setRunId(""); }); }}><strong>Workflow 재실행</strong><input value={runId} onChange={(event) => setRunId(event.target.value)} placeholder="run ID" /><button disabled={busy}>재실행</button></form>
-      <div className="github-run-list">{runs.length ? runs.map((run: Json) => <article key={run.databaseId}><b>{run.name}</b><span>#{run.databaseId} · {run.status} · {run.conclusion || "진행 중"} · {shortDate(run.updatedAt)}</span><a href={run.url} target="_blank" rel="noreferrer">열기</a></article>) : <p className="resource-empty compact">워크플로 실행 기록 없음</p>}{runsData?.hasMore && <button className="list-more" onClick={() => loadMore("runs")} disabled={loading}>{loading ? "불러오는 중…" : "워크플로 더 보기"}</button>}</div>
+      <div className="github-run-list">{runsMessage.kind === "error" ? <p className="error-text" role="alert">{runsMessage.text}</p> : runs.length ? runs.map((run: Json) => <article key={run.databaseId}><b>{run.name}</b><span>#{run.databaseId} · {run.status} · {run.conclusion || "진행 중"} · {shortDate(run.updatedAt)}</span><a href={run.url} target="_blank" rel="noreferrer">열기</a></article>) : <p className="resource-empty compact">{runsMessage.text}</p>}{runsData?.hasMore && <button className="list-more" onClick={() => loadMore("runs")} disabled={loading}>{loading ? "불러오는 중…" : "워크플로 더 보기"}</button>}</div>
     </div>}
   </div>;
 }
@@ -373,6 +424,13 @@ export function GitView({ project, user, chat, providers, refreshChats, onOpenPr
   const [selectedFiles, setSelectedFiles] = useState<string[]>([]);
   const [diff, setDiff] = useState("");
   const [diffError, setDiffError] = useState("");
+  const [review, setReview] = useState<Json | null>(null);
+  const [reviewRevision, setReviewRevision] = useState(0);
+  const [reviewBusy, setReviewBusy] = useState("");
+  const [reviewStatus, setReviewStatus] = useState("");
+  const [commentTarget, setCommentTarget] = useState<(DiffLineCommentTarget & { hunkId: string }) | null>(null);
+  const [commentText, setCommentText] = useState("");
+  const [commentKey, setCommentKey] = useState("");
   const [github, setGithub] = useState<Json | null>(null);
   const [githubLoading, setGithubLoading] = useState(false);
   const [githubLoaded, setGithubLoaded] = useState(false);
@@ -547,7 +605,23 @@ export function GitView({ project, user, chat, providers, refreshChats, onOpenPr
       .then((data) => { if (active) setDiff(data.diff || ""); })
       .catch((error) => { if (active) setDiffError(error instanceof Error ? error.message : "diff를 불러오지 못했습니다."); });
     return () => { active = false; };
+  }, [project?.id, chat?.id, workspacePath, selectedFiles.join("\n"), reviewRevision]);
+
+  // 의사결정 대상은 HEAD 전체가 아니라 index→worktree의 아직 stage되지 않은 text hunk다.
+  // 승인 뒤에도 HEAD diff에는 남을 수 있으므로 별도 snapshot/hash를 받아 stale 결정을 막는다.
+  useEffect(() => {
+    setReviewStatus(""); setCommentTarget(null); setCommentText(""); setCommentKey("");
   }, [project?.id, chat?.id, workspacePath, selectedFiles.join("\n")]);
+  useEffect(() => {
+    setReview(null);
+    if (!project || !selectedFiles.length || user?.role !== "admin") return;
+    let active = true;
+    const query = fileQuery(selectedFiles);
+    void api(chatPath(`/projects/${project.id}/git/review?${query}`, chat?.id, workspacePath))
+      .then((data) => { if (active) setReview(data); })
+      .catch((error) => { if (active) setReviewStatus(error instanceof Error ? error.message : "hunk 검토를 불러오지 못했습니다."); });
+    return () => { active = false; };
+  }, [project?.id, chat?.id, workspacePath, selectedFiles.join("\n"), reviewRevision, user?.role]);
 
   // Actions 탭 전용 워크플로 조회. `gh run list`가 가장 느려서 목록 조회와 분리해 두었다.
   async function loadGithubRuns(force = false): Promise<void> {
@@ -557,8 +631,8 @@ export function GitView({ project, user, chat, providers, refreshChats, onOpenPr
       const path = withQuery(withQuery(`/projects/${project.id}/github/runs`, "refresh", force ? 1 : null), "runs", githubLimits.runs);
       const data = await api(chatPath(path, chat?.id));
       if (githubRunsRequest.current === request) setGithubRuns(data);
-    } catch {
-      if (githubRunsRequest.current === request) setGithubRuns({ runs: [], hasMore: false });
+    } catch (error) {
+      if (githubRunsRequest.current === request) setGithubRuns(githubRunsErrorState(error));
     }
   }
 
@@ -577,6 +651,46 @@ export function GitView({ project, user, chat, providers, refreshChats, onOpenPr
     if (!project) return;
     try { await api(`/projects/${project.id}${path}`, { method: "POST", body: JSON.stringify(chatBody(body, chat?.id)) }); await load(); }
     catch (error) { window.alert(error instanceof Error ? error.message : "작업 실패"); }
+  }
+
+  function reviewHunk(path: string, index: number): { id: string; fileHash: string } | null {
+    const file = review?.files?.find((item: Json) => item.path === path);
+    const hunk = file?.hunks?.[index];
+    return file && hunk ? { id: String(hunk.id), fileHash: String(file.fileHash) } : null;
+  }
+
+  async function decideHunk(file: Json, _hunk: Json, index: number, decision: "accept" | "reject"): Promise<void> {
+    if (!project) return;
+    const selected = reviewHunk(String(file.path), index);
+    if (!selected) { setReviewStatus("hunk snapshot이 바뀌었습니다. 새로고침 후 다시 시도해주세요."); return; }
+    // stage는 worktree를 지우지 않고 이 버튼 자체가 명시 승인이다. 복구 불가능한 reject만 한 번 더 확인한다.
+    if (decision === "reject" && !window.confirm("이 hunk의 worktree 변경만 되돌릴까요?\n\n되돌린 내용은 복구할 수 없습니다.")) return;
+    setReviewBusy(selected.id); setReviewStatus(decision === "accept" ? "선택 hunk를 stage하는 중…" : "선택 hunk를 되돌리는 중…");
+    try {
+      await api(`/projects/${project.id}/git/hunks/decision`, { method: "POST", body: JSON.stringify({ path: file.path, fileHash: selected.fileHash, hunkId: selected.id, decision, chatId: chat?.id ?? null, worktree: workspacePath || null }) });
+      setReviewStatus(decision === "accept" ? "선택 hunk만 stage했습니다." : "선택 hunk만 되돌렸습니다.");
+      setReviewRevision((value) => value + 1);
+      await loadGit(true);
+    } catch (error) { setReviewStatus(error instanceof Error ? error.message : "hunk 결정에 실패했습니다."); }
+    finally { setReviewBusy(""); }
+  }
+
+  function startLineComment(target: DiffLineCommentTarget): void {
+    const selected = reviewHunk(target.path, target.hunkIndex);
+    if (!selected) return;
+    setCommentTarget({ ...target, hunkId: selected.id }); setCommentText(""); setCommentKey(`diff-comment-${crypto.randomUUID()}`);
+  }
+
+  async function resendLineComment(): Promise<void> {
+    if (!chat?.id || !commentTarget || !commentText.trim() || !commentKey) return;
+    setReviewBusy("comment"); setReviewStatus("라인 주석을 현재 채팅에 재전송하는 중…");
+    const text = `[Diff review]\nFile: ${commentTarget.path}\nLine: ${commentTarget.side} ${commentTarget.line}\nHunk: ${commentTarget.hunkId}\n\n${commentText.trim()}`;
+    try {
+      await api(`/chats/${chat.id}/messages`, { method: "POST", headers: { "Idempotency-Key": commentKey }, body: JSON.stringify({ text }) });
+      setReviewStatus("라인 주석을 prompt 원장으로 현재 채팅에 재전송했습니다.");
+      setCommentTarget(null); setCommentText(""); setCommentKey(""); await refreshChats();
+    } catch (error) { setReviewStatus(error instanceof Error ? error.message : "라인 주석 재전송에 실패했습니다."); }
+    finally { setReviewBusy(""); }
   }
 
   // 파일 선택 체크박스 상태를 변경한다.
@@ -719,7 +833,7 @@ export function GitView({ project, user, chat, providers, refreshChats, onOpenPr
   // 현재 채팅이 다른 worktree에 묶여 있어도 새 채팅을 만들기 때문에 영향을 주지 않는다.
   async function startWorktreeWork(options: { branch: string; create: boolean; title: string }): Promise<void> {
     if (!project) return;
-    const provider = String(providers?.[0]?.id ?? "claude");
+    const provider = worktreeChatProvider(chat, providers);
     const branch = window.prompt("새 작업공간에서 사용할 브랜치 이름", options.branch)?.trim();
     if (!branch) return;
     setWorktreeStatus("작업공간을 만드는 중…");
@@ -759,6 +873,12 @@ export function GitView({ project, user, chat, providers, refreshChats, onOpenPr
   // 조회 대상을 기본값이 아닌 작업공간·브랜치로 바꾼 동안에는 쓰기를 막는다. 커밋·push는 채팅 기준
   // 경로로 나가기 때문에, 보고 있는 변경과 실제로 커밋되는 경로가 어긋날 수 있다.
   const viewingOnly = !!workspacePath || !!commitRef;
+  const reviewControls: DiffReviewControls | undefined = user?.role === "admin" && !viewingOnly ? {
+    hunkId: (file, _hunk, index) => reviewHunk(file.path, index)?.id,
+    busyHunkId: reviewBusy,
+    onDecision: (file, hunk, index, decision) => void decideHunk(file as Json, hunk as Json, index, decision),
+    onComment: startLineComment,
+  } : undefined;
 
   return <section className="panel git-page"><div className="section-head"><div><span className="eyebrow">버전 관리</span><h2>GitHub</h2></div>{tab !== "repositories" && <div className="git-refresh-controls">{git.cachedAt && <span className="git-cached-at">{shortDate(git.cachedAt)} 기준 · 1분마다 자동 갱신</span>}<button onClick={() => void refreshCurrent()} disabled={!project || refreshing}>{refreshing ? "갱신 중..." : "새로고침"}</button></div>}</div>
     <div className="git-tabs"><button className={tab === "diff" ? "active" : ""} disabled={!project} onClick={() => setTab("diff")}>로컬</button><button className={tab === "github" ? "active" : ""} disabled={!project} onClick={() => { setTab("github"); void loadGithub(); }}>깃허브</button><button className={tab === "repositories" ? "active" : ""} onClick={() => setTab("repositories")}>저장소</button></div>
@@ -821,6 +941,11 @@ export function GitView({ project, user, chat, providers, refreshChats, onOpenPr
         <section className="git-box"><div className="git-box-head"><h3>{selectedFiles.length ? `선택 파일 diff (${selectedFiles.length})` : "파일 diff"}</h3><div className="git-box-head-actions"><span>{filesToShow.length ? `${filesToShow.length}개 파일` : "파일을 선택하세요"}</span><DiffModeToggle mode={diffMode} onChange={setDiffMode} /></div></div>
           {!selectedFiles.length ? <p className="muted">변경 파일을 선택하면 해당 파일의 diff를 표시합니다.</p> : diffError ? <p className="error-text">{diffError}</p> : diff ? <DiffView diff={diff} mode={diffMode} expandLines={expandLinesFor()} /> : <p className="muted">선택한 파일에 표시할 변경사항이 없습니다.</p>}
         </section>
+        {user?.role === "admin" && selectedFiles.length > 0 && <section className="git-box hunk-review-box"><div className="git-box-head"><div><h3>미결정 hunk 검토</h3><small>승인은 해당 hunk만 stage하고, 거부는 worktree에서 해당 hunk만 되돌립니다.</small></div><span>{review?.files?.reduce((sum: number, file: Json) => sum + (file.hunks?.length || 0), 0) || 0}개 hunk</span></div>
+          {viewingOnly ? <p className="muted">다른 작업공간·브랜치를 보는 중에는 hunk를 변경하거나 주석을 재전송할 수 없습니다.</p> : review?.diff ? <DiffView diff={review.diff} mode={diffMode} reviewControls={reviewControls} /> : <p className="muted">stage되지 않은 text hunk가 없습니다.</p>}
+          {commentTarget && <div className="diff-comment-composer"><strong>{commentTarget.path} · {commentTarget.side} {commentTarget.line}행</strong><textarea aria-label="라인 주석" maxLength={4_000} value={commentText} onChange={(event) => setCommentText(event.target.value)} placeholder="에이전트에게 다시 보낼 수정 의견" /><div><button type="button" onClick={() => { setCommentTarget(null); setCommentText(""); setCommentKey(""); }}>취소</button><button type="button" className="primary" disabled={!chat?.id || !commentText.trim() || reviewBusy === "comment"} onClick={() => void resendLineComment()}>{reviewBusy === "comment" ? "재전송 중…" : "현재 채팅에 재전송"}</button></div>{!chat?.id && <small>주석을 재전송하려면 프로젝트 채팅을 먼저 선택하세요.</small>}</div>}
+          {reviewStatus && <div className="attachment-status" aria-live="polite">{reviewStatus}</div>}
+        </section>}
         {selectedCommit && <section className="git-box commit-detail" ref={commitDetailRef}>
           <div className="git-box-head"><h3>커밋 상세</h3><div className="git-box-head-actions"><DiffModeToggle mode={diffMode} onChange={setDiffMode} /><button onClick={() => { setSelectedCommit(null); setCommitDiff(""); setCommitDetail(null); }}>닫기</button></div></div>
           <div className="commit-meta-card">

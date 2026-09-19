@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isRateLimitRecovered, parseResetTime } from "../src/server/services/rate-limit-resume";
+import { isRateLimitRecovered, parseResetTime, usageRecoveryWindow } from "../src/server/services/rate-limit-resume";
 
 describe("parseResetTime", () => {
   it("타임존 없이 24시간 표기(Codex)를 오늘 남은 시각으로 해석한다", () => {
@@ -88,5 +88,35 @@ describe("isRateLimitRecovered", () => {
     const now = new Date("2026-07-08T09:00:00.000Z");
     expect(isRateLimitRecovered("10:40pm (Asia/Seoul)", 9, now)).toBe(false);
     expect(isRateLimitRecovered("10:40pm (Asia/Seoul)", 10, now)).toBe(true);
+  });
+});
+
+describe("usageRecoveryWindow", () => {
+  it("평탄화된 주간 잔여량이 충분해도 Codex 대표 5시간 창이 소진됐으면 그 창을 고른다", () => {
+    const selected = usageRecoveryWindow({
+      resetAt: "23:14 on 1 Sep",
+      remainingPercent: 96,
+      detailsJson: JSON.stringify({ windows: [
+        { id: "weekly", remainingPercent: 96, resetAt: "23:14 on 1 Sep" },
+        { id: "five_hour", remainingPercent: 0, resetAt: "19:03" },
+      ] }),
+    }, "five_hour");
+
+    expect(selected).toEqual({ resetAt: "19:03", remainingPercent: 0 });
+  });
+
+  it("상세값이 없거나 깨졌으면 기존 평탄화 값으로 안전하게 돌아간다", () => {
+    const row = { resetAt: "23:59", remainingPercent: 80, detailsJson: "{" };
+    expect(usageRecoveryWindow(row, "five_hour")).toBe(row);
+  });
+});
+
+describe("parseResetTime 정각 리셋 문구(#94)", () => {
+  it("\"resets 3am\"의 앞 글자를 날짜로 오인하지 않고 정각 리셋 시각을 읽는다", () => {
+    const now = new Date("2026-09-10T17:00:00.000Z"); // 서울 02:00
+    const expected = "2026-09-10T18:00:00.000Z"; // 서울 03:00
+    expect(parseResetTime("resets 3am (Asia/Seoul)", now)?.toISOString()).toBe(expected);
+    expect(parseResetTime("You've hit your limit · resets 3am (Asia/Seoul)", now)?.toISOString()).toBe(expected);
+    expect(parseResetTime("3am (Asia/Seoul)", now)?.toISOString()).toBe(expected);
   });
 });

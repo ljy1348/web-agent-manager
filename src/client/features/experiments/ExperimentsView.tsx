@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from "react";
 import { AlertTriangle, FlaskConical, Gavel, LoaderCircle, Play, Plus, RefreshCw, Square } from "lucide-react";
 import { api } from "../../api";
 import type { Json } from "../../types";
+import type { ExperimentProvider as ExperimentProviderId } from "../../../shared/experiments";
 
 const ACTIVE_STATUSES = new Set(["queued", "preparing", "running", "paused", "evaluating"]);
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled", "budget_exceeded"]);
@@ -100,6 +101,11 @@ function judgmentReason(judgment: Json): string {
   return String(result.reason || result.rationale || result.summary || "구조화 근거 없음");
 }
 
+// 실행 중인 run 취소는 되돌릴 수 없어 한 번 확인한다.
+export function experimentCancelConfirmMessage(): string {
+  return "실행 중인 실험을 취소할까요?";
+}
+
 // 프로젝트별 실험 생성·조건 비교·실행 상세를 한 화면에서 관리한다.
 export function ExperimentsView({ project }: { project: Json | null }): React.ReactElement {
   const [experiments, setExperiments] = useState<Json[]>([]);
@@ -122,7 +128,7 @@ export function ExperimentsView({ project }: { project: Json | null }): React.Re
   const [fixtureId, setFixtureId] = useState("");
   const [fixtures, setFixtures] = useState<Json[]>([]);
   const [variantName, setVariantName] = useState("");
-  const [provider, setProvider] = useState<"codex" | "claude">("codex");
+  const [provider, setProvider] = useState<ExperimentProviderId>("codex");
   const [model, setModel] = useState("");
   const [reasoning, setReasoning] = useState("high");
   const [sandbox, setSandbox] = useState("workspace-write");
@@ -136,13 +142,15 @@ export function ExperimentsView({ project }: { project: Json | null }): React.Re
   const [maxTokens, setMaxTokens] = useState("");
   const [maxCost, setMaxCost] = useState("");
   const [harnessType, setHarnessType] = useState<"single" | "orchestrator_worker" | "evaluator_optimizer">("single");
-  const [secondaryProvider, setSecondaryProvider] = useState<"codex" | "claude">("claude");
+  const [secondaryProvider, setSecondaryProvider] = useState<ExperimentProviderId>("claude");
   const [secondaryModel, setSecondaryModel] = useState("");
   const [workerCount, setWorkerCount] = useState("2");
   const [maxIterations, setMaxIterations] = useState("3");
   const [minimumScore, setMinimumScore] = useState("0.8");
   const [maxNoImprovement, setMaxNoImprovement] = useState("1");
   const [diffStatsHook, setDiffStatsHook] = useState(false);
+  // graph는 secondary도 같은 skills 설정을 공유하므로 둘 중 하나라도 Grok이면 스킬 격리를 못 쓴다.
+  const usesGrokRuntime = provider === "grok" || (harnessType !== "single" && secondaryProvider === "grok");
   const [diffCheckHook, setDiffCheckHook] = useState(false);
   const [showPromotionForm, setShowPromotionForm] = useState(false);
   const [presetName, setPresetName] = useState("");
@@ -153,6 +161,8 @@ export function ExperimentsView({ project }: { project: Json | null }): React.Re
   const [claudeEvaluator, setClaudeEvaluator] = useState(true);
   const [codexEvaluatorModel, setCodexEvaluatorModel] = useState("");
   const [claudeEvaluatorModel, setClaudeEvaluatorModel] = useState("");
+  const [grokEvaluator, setGrokEvaluator] = useState(false);
+  const [grokEvaluatorModel, setGrokEvaluatorModel] = useState("");
 
   const selectedExperiment = useMemo(
     () => experiments.find((experiment) => experiment.id === selectedExperimentId) || experiments[0] || null,
@@ -309,9 +319,13 @@ export function ExperimentsView({ project }: { project: Json | null }): React.Re
               sandbox, maxTurns: optionalNumber(maxTurns),
             },
             skills: {
-              mode: skillBaseline === "installed" ? "all" : "none",
-              enabled: [], disabled: [], profile: harnessType === "single" ? "isolated_overlay" : "native", baseline: skillBaseline,
-              additions: harnessType === "single" ? additionalSkills : [], comparisonId: harnessType === "single" ? `${provider}-default` : null,
+              // Grok headless는 스킬 overlay 주입도 스킬 끄기도 지원하지 않는다(--plugin-dir는 grok agent 전용).
+              // graph의 secondary도 같은 skills 설정을 그대로 받으므로 둘 중 하나라도 Grok이면 native·all로 둔다.
+              mode: usesGrokRuntime || skillBaseline === "installed" ? "all" : "none",
+              enabled: [], disabled: [], profile: harnessType === "single" && !usesGrokRuntime ? "isolated_overlay" : "native",
+              baseline: usesGrokRuntime ? "installed" : skillBaseline,
+              additions: harnessType === "single" && !usesGrokRuntime ? additionalSkills : [],
+              comparisonId: harnessType === "single" && !usesGrokRuntime ? `${provider}-default` : null,
               activation: harnessType === "single" && provider === "claude" ? skillActivation : "native",
             },
             harness: {
@@ -359,6 +373,7 @@ export function ExperimentsView({ project }: { project: Json | null }): React.Re
 
   // 실행 중인 Runtime에 취소를 전달하고 최종 원장 상태를 다시 읽는다.
   async function cancelRun(runId: string): Promise<void> {
+    if (!window.confirm(experimentCancelConfirmMessage())) return;
     setLoading(true);
     setError("");
     try {
@@ -372,13 +387,14 @@ export function ExperimentsView({ project }: { project: Json | null }): React.Re
     }
   }
 
-  // 완료 run을 선택한 Codex·Claude evaluator에게 블라인드 rubric 평가로 전달한다.
+  // 완료 run을 선택한 Codex·Claude·Grok evaluator에게 블라인드 rubric 평가로 전달한다.
   async function startEvaluation(event: React.FormEvent): Promise<void> {
     event.preventDefault();
     if (!selectedRunId) return;
     const evaluators = [
       codexEvaluator ? { label: "Codex judge", provider: "codex", model: codexEvaluatorModel || null, reasoningEffort: "high", family: "codex" } : null,
       claudeEvaluator ? { label: "Claude judge", provider: "claude", model: claudeEvaluatorModel || null, reasoningEffort: "high", family: "claude" } : null,
+      grokEvaluator ? { label: "Grok judge", provider: "grok", model: grokEvaluatorModel || null, reasoningEffort: "high", family: "grok" } : null,
     ].filter(Boolean);
     if (!evaluators.length) {
       setError("최소 한 명의 evaluator를 선택하세요.");
@@ -490,18 +506,19 @@ export function ExperimentsView({ project }: { project: Json | null }): React.Re
           {showVariantForm && <form className="lab-form card" onSubmit={createVariant}>
             <div className="card-top">Agent Variant</div>
             <label>이름<input required value={variantName} onChange={(event) => setVariantName(event.target.value)} placeholder="Codex High + Skills" /></label>
-            <label>Provider<select value={provider} onChange={(event) => { const next = event.target.value as "codex" | "claude"; setProvider(next); if (next === "claude") setMaxTurns(""); else setSkillActivation("native"); }}><option value="codex">Codex</option><option value="claude">Claude</option></select></label>
+            <label>Provider<select value={provider} onChange={(event) => { const next = event.target.value as ExperimentProviderId; setProvider(next); if (next === "claude") setMaxTurns(""); else setSkillActivation("native"); }}><option value="codex">Codex</option><option value="claude">Claude</option><option value="grok">Grok</option></select></label>
             <label>Model<input required value={model} onChange={(event) => setModel(event.target.value)} placeholder="비교에 사용할 명시 모델" /></label>
             <label>Reasoning<input required value={reasoning} onChange={(event) => setReasoning(event.target.value)} placeholder="high" /></label>
             <label>Sandbox<select value={sandbox} onChange={(event) => setSandbox(event.target.value)}><option value="read-only">read-only</option><option value="workspace-write">workspace-write</option></select></label>
-            <label>스킬 기준선<select value={skillBaseline} onChange={(event) => changeSkillBaseline(event.target.value as "installed" | "clean")}><option value="installed">현재 설치 스킬셋</option><option value="clean">깨끗한 기본 스킬셋</option></select></label>
+            <label>스킬 기준선<select value={usesGrokRuntime ? "installed" : skillBaseline} disabled={usesGrokRuntime} onChange={(event) => changeSkillBaseline(event.target.value as "installed" | "clean")}><option value="installed">현재 설치 스킬셋</option><option value="clean">깨끗한 기본 스킬셋</option></select></label>
+            {usesGrokRuntime && <p className="muted">Grok headless는 스킬 격리(clean 기준선·추가 스킬 고정)를 지원하지 않아 현재 설치 스킬셋 그대로 실행합니다{provider === "grok" ? "" : " (보조 런타임이 Grok이면 primary도 같은 스킬 설정을 씁니다)"}.</p>}
             {harnessType === "single" && provider === "claude" && <label>추가 스킬 활성화<select value={skillActivation} onChange={(event) => setSkillActivation(event.target.value as "native" | "session_start")}><option value="native">Claude 자동 발견</option><option value="session_start">SessionStart 강제 주입</option></select></label>}
             {harnessType === "single" ? <fieldset className="lab-skill-picker span-2"><legend>선택 추가 스킬</legend>{skillCandidateError && <small className="error">{skillCandidateError}</small>}{!skillCandidates.length && !skillCandidateError && <small>`.agent-lab/skills` 또는 현재 provider에서 발견된 후보가 없습니다.</small>}{skillCandidates.map((candidate) => {
               const nativeDuplicate = skillBaseline === "installed" && candidate.includedByDefault;
               return <label key={candidate.id} title={nativeDuplicate ? "현재 설치 baseline에 이미 포함되어 있습니다." : candidate.source}><input type="checkbox" checked={additionalSkills.includes(candidate.id)} disabled={nativeDuplicate} onChange={() => toggleAdditionalSkill(candidate.id)} /><span>{candidate.name}<small>{candidate.scope} · {nativeDuplicate ? "현재 포함" : candidate.source}</small></span></label>;
             })}</fieldset> : <span className="lab-form-hint span-2">graph/loop는 현재 공급자별 native skills all/none만 비교합니다. 선택 추가 overlay는 Single에서 사용하세요.</span>}
             <label>Harness<select value={harnessType} onChange={(event) => { const next = event.target.value as typeof harnessType; setHarnessType(next); if (next !== "single") setAdditionalSkills([]); }}><option value="single">Single</option><option value="orchestrator_worker">Orchestrator → Workers</option><option value="evaluator_optimizer">Evaluator → Optimizer loop</option></select></label>
-            {harnessType !== "single" && <><label>Secondary provider<select value={secondaryProvider} onChange={(event) => setSecondaryProvider(event.target.value as "codex" | "claude")}><option value="codex">Codex</option><option value="claude">Claude</option></select></label><label>Secondary model<input required value={secondaryModel} onChange={(event) => setSecondaryModel(event.target.value)} placeholder="비교에 사용할 명시 모델" /></label></>}
+            {harnessType !== "single" && <><label>Secondary provider<select value={secondaryProvider} onChange={(event) => setSecondaryProvider(event.target.value as ExperimentProviderId)}><option value="codex">Codex</option><option value="claude">Claude</option><option value="grok">Grok</option></select></label><label>Secondary model<input required value={secondaryModel} onChange={(event) => setSecondaryModel(event.target.value)} placeholder="비교에 사용할 명시 모델" /></label></>}
             {harnessType === "orchestrator_worker" && <label>Worker 수<input type="number" min="1" max="8" value={workerCount} onChange={(event) => setWorkerCount(event.target.value)} /></label>}
             {harnessType === "evaluator_optimizer" && <><label>최대 반복<input type="number" min="1" max="100" value={maxIterations} onChange={(event) => setMaxIterations(event.target.value)} /></label><label>최소 점수<input type="number" min="0" max="1" step="0.05" value={minimumScore} onChange={(event) => setMinimumScore(event.target.value)} /></label><label>무개선 허용<input type="number" min="0" max="100" value={maxNoImprovement} onChange={(event) => setMaxNoImprovement(event.target.value)} /></label></>}
             <label>Provider max turns<input type="number" min="1" value={maxTurns} onChange={(event) => setMaxTurns(event.target.value)} placeholder={provider === "claude" ? "현재 Claude CLI 미지원" : "제한 없음"} disabled={provider === "claude"} /></label>
@@ -534,7 +551,9 @@ export function ExperimentsView({ project }: { project: Json | null }): React.Re
               <input aria-label="Codex evaluator model" value={codexEvaluatorModel} onChange={(event) => setCodexEvaluatorModel(event.target.value)} placeholder="Codex 기본 모델" disabled={!codexEvaluator} />
               <label><input type="checkbox" checked={claudeEvaluator} onChange={(event) => setClaudeEvaluator(event.target.checked)} />Claude judge</label>
               <input aria-label="Claude evaluator model" value={claudeEvaluatorModel} onChange={(event) => setClaudeEvaluatorModel(event.target.value)} placeholder="Claude 기본 모델" disabled={!claudeEvaluator} />
-              <button className="primary" type="submit" disabled={loading || (!codexEvaluator && !claudeEvaluator)}><Play size={13} />평가 시작</button>
+              <label><input type="checkbox" checked={grokEvaluator} onChange={(event) => setGrokEvaluator(event.target.checked)} />Grok judge</label>
+              <input aria-label="Grok evaluator model" value={grokEvaluatorModel} onChange={(event) => setGrokEvaluatorModel(event.target.value)} placeholder="Grok 기본 모델" disabled={!grokEvaluator} />
+              <button className="primary" type="submit" disabled={loading || (!codexEvaluator && !claudeEvaluator && !grokEvaluator)}><Play size={13} />평가 시작</button>
             </form>}
             {!!detail.evaluations?.length && <div className="lab-evaluations">{detail.evaluations.map((evaluation: Json) => <article key={evaluation.id}>
               <div><strong>Rubric evaluation</strong><span className={`lab-status ${evaluation.status}`}>{STATUS_LABELS[evaluation.status] || evaluation.status}</span>{ACTIVE_EVALUATION_STATUSES.has(evaluation.status) && <button className="danger" type="button" onClick={() => void cancelEvaluation(evaluation.id)}><Square size={11} />취소</button>}</div>

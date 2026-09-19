@@ -1,7 +1,7 @@
 import { GoogleAuth } from "google-auth-library";
 import type { AppConfig } from "../core/config";
 import type { AppDatabase } from "../core/database";
-import type { Notifier } from "./notifier";
+import type { NotificationPresentation, Notifier } from "./notifier";
 
 interface PushDeviceRow {
   id: number;
@@ -22,6 +22,7 @@ export function fcmTitle(eventType: string): string {
   if (eventType === "rate_limit_hit") return "사용량 한도 도달";
   if (eventType === "rate_limit_reset") return "사용량 한도 초기화";
   if (eventType === "usage_session_reset") return "사용량 세션 초기화";
+  if (eventType === "usage_keepalive_exhausted") return "세션 유지 실패";
   if (eventType === "terminal_exited") return "터미널 종료";
   if (eventType === "test") return "알림 테스트";
   return "웹 에이전트 관리자";
@@ -92,7 +93,7 @@ export class FcmNotifier implements Notifier {
   }
 
   // 전송이 필요한 활성 기기를 500개씩 나눠 보내고 만료된 토큰을 자동 비활성화한다.
-  async notify(eventId: string, eventType: string, text: string): Promise<void> {
+  async notify(eventId: string, eventType: string, text: string, presentation?: NotificationPresentation): Promise<void> {
     if (this.config.fcm?.enabled !== true) return;
     const devices = this.database.prepare(`
       SELECT d.id, d.token FROM push_devices d
@@ -103,7 +104,7 @@ export class FcmNotifier implements Notifier {
       const batch = devices.slice(offset, offset + 500);
       let results: SendResult[];
       try {
-        results = await this.sender(batch.map((device) => device.token), fcmTitle(eventType), text, { eventType, eventId });
+        results = await this.sender(batch.map((device) => device.token), presentation?.title ?? fcmTitle(eventType), text, { eventType, eventId });
       } catch (error) {
         const code = error instanceof Error ? error.name : "FCM 전송 실패";
         for (const device of batch) this.recordDelivery(eventId, eventType, device.id, "failed", code);

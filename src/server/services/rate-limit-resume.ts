@@ -1,5 +1,5 @@
 import type { AppDatabase } from "../core/database";
-import type { Provider } from "../../shared/types";
+import type { Provider, UsageWindow } from "../../shared/types";
 import type { ProviderAdapter } from "../providers/provider";
 import type { RealtimeHub } from "./realtime";
 import type { Notifier } from "./notifier";
@@ -47,6 +47,31 @@ function parseDatedResetTime(resetAt: string): Date | null {
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
+// 리셋 문구에서 시:분을 뽑는다. Claude CLI는 정각을 "6pm"처럼 분 없이 찍는데(실측), 분을 필수로
+// 요구하던 예전 정규식이 이걸 못 읽어 옛 스냅샷 방어 로직이 정각 표기에서만 통째로 무력화됐다
+// (실사용 재현: 5시간 롤링 창인데 8시간 뒤인 "6pm"이 그대로 최신값으로 채택됨 — #53).
+// 분이 없으면 그 숫자가 시각인지 확신할 수 없으므로 am/pm이 붙은 경우만 정각으로 인정한다.
+// 날짜가 붙은 문구("Aug 29, 1am")는 이 함수가 다룰 대상이 아니다 — 시:분만 보고 오늘/내일로
+// 추측하면 CLI가 이미 명시한 날짜를 무시하게 되므로, 그 경우 정각 단독 매치는 하지 않고 예전처럼
+// 콜론이 있는 시:분만 읽는다(날짜 처리는 parseDatedResetTime·parseUsageResetMoment가 따로 맡는다).
+export function parseClockTime(text: string): { hour: number; minute: number } | null {
+  // 날짜 판별은 월 이름으로만 한다. 예전 `[A-Za-z]{3}\s+\d` 판별은 "resets 3am"의 "ets 3"까지 날짜로
+  // 오인해 콜론 없는 정각 리셋을 통째로 null로 만들었다(#94, StopFailure 문구 실측).
+  const month = "(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\\.?";
+  const hasDate = new RegExp(`\\b${month}\\s+\\d{1,2}|\\b\\d{1,2}\\s+${month}\\b`, "i").test(text);
+  const match = hasDate
+    ? text.match(/(\d{1,2}):(\d{2})\s*(am|pm)?/i)
+    : text.match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)/i) ?? text.match(/(\d{1,2}):(\d{2})/);
+  if (!match) return null;
+  let hour = Number(match[1]);
+  const minute = Number(match[2] ?? 0);
+  const meridiem = match[3]?.toLowerCase();
+  if (meridiem === "pm" && hour < 12) hour += 12;
+  if (meridiem === "am" && hour === 12) hour = 0;
+  if (hour > 23 || minute > 59) return null;
+  return { hour, minute };
+}
+
 // usage-monitor.ts가 CLI 화면에서 그대로 뽑아온 "5:39pm (Asia/Seoul)" 또는 "16:45" 같은 리셋 문구를,
 // 다음으로 돌아오는 실제 시각으로 해석한다. 시:분만 있고 날짜가 없으므로 이미 지난 시각이면 내일로
 // 본다. 타임존이 명시되지 않으면 서버가 도는 로컬 시간대를 그대로 쓴다. 파싱할 수 없으면 null.
@@ -54,14 +79,9 @@ export function parseResetTime(resetAt: string | null | undefined, now: Date): D
   if (!resetAt) return null;
   const dated = parseDatedResetTime(resetAt);
   if (dated) return dated;
-  const timeMatch = resetAt.match(/(\d{1,2}):(\d{2})\s*(am|pm)?/i);
-  if (!timeMatch) return null;
-  let hour = Number(timeMatch[1]);
-  const minute = Number(timeMatch[2]);
-  const meridiem = timeMatch[3]?.toLowerCase();
-  if (meridiem === "pm" && hour < 12) hour += 12;
-  if (meridiem === "am" && hour === 12) hour = 0;
-  if (hour > 23 || minute > 59) return null;
+  const clock = parseClockTime(resetAt);
+  if (!clock) return null;
+  const { hour, minute } = clock;
   const timeZone = resetAt.match(/\(([A-Za-z]+\/[A-Za-z_]+)\)/)?.[1];
   if (!timeZone) {
     const candidate = new Date(now);
@@ -87,6 +107,26 @@ export function isRateLimitRecovered(resetAt: string | null | undefined, remaini
   const timeReached = !!parsed && parsed <= now;
   const recovered = remainingPercent != null && remainingPercent >= RECOVERY_REMAINING_PERCENT;
   return timeReached || recovered;
+}
+
+interface UsageRecoveryRow {
+  resetAt: string | null;
+  remainingPercent: number | null;
+  detailsJson?: string | null;
+}
+
+// 공급자의 대표 창을 상세 JSON에서 골라 자동 재개에 사용한다. usage_status의 평탄화 값은 예전
+// 서버가 저장한 주간 값일 수 있으므로(특히 Codex 5시간 창 복원 직후), 상세 창이 있으면 그것을
+// 우선하고 파싱할 수 없을 때만 기존 값으로 되돌아간다.
+export function usageRecoveryWindow(row: UsageRecoveryRow, windowId: string | undefined): UsageRecoveryRow {
+  if (!windowId || !row.detailsJson) return row;
+  try {
+    const windows = (JSON.parse(row.detailsJson) as { windows?: UsageWindow[] }).windows ?? [];
+    const selected = windows.find((window) => window.id === windowId);
+    return selected ? { resetAt: selected.resetAt, remainingPercent: selected.remainingPercent } : row;
+  } catch {
+    return row;
+  }
 }
 
 // rate_limit_options 화면에서 "재설정까지 대기"를 자동 선택해둔 채팅들을, 실제 사용량이 회복되면
@@ -124,7 +164,7 @@ export class RateLimitResumeService {
       FROM rate_limit_waits w JOIN chats c ON c.id = w.chat_id
     `).all() as { chatId: number; provider: Provider; resumeAfter: string | null; accountId: number | null }[];
     if (!waits.length) return;
-    const usageRows = this.database.prepare("SELECT provider, account_id AS accountId, reset_at AS resetAt, remaining_percent AS remainingPercent FROM usage_status").all() as { provider: Provider; accountId: number; resetAt: string | null; remainingPercent: number | null }[];
+    const usageRows = this.database.prepare("SELECT provider, account_id AS accountId, reset_at AS resetAt, remaining_percent AS remainingPercent, details_json AS detailsJson FROM usage_status").all() as Array<{ provider: Provider; accountId: number; resetAt: string | null; remainingPercent: number | null; detailsJson: string | null }>;
     const usageByAccount = new Map(usageRows.map((row) => [`${row.provider}:${row.accountId}`, row]));
     const now = new Date();
     for (const wait of waits) {
@@ -135,8 +175,9 @@ export class RateLimitResumeService {
       // "한도 해제됐다"고 알린 뒤 곧바로 다시 한도에 걸리는 일이 반복됐다. usage_status의 최신
       // reset_at으로 대기 시각을 다시 맞춰 다음 폴링(60초 뒤)에 재시도한다.
       const usage = usageByAccount.get(`${wait.provider}:${wait.accountId}`);
-      if (usage && !isRateLimitRecovered(usage.resetAt, usage.remainingPercent, now)) {
-        const nextResumeAfter = parseResetTime(usage.resetAt, now);
+      const recovery = usage ? usageRecoveryWindow(usage, this.adapters.get(wait.provider)?.usageWindowId) : null;
+      if (recovery && !isRateLimitRecovered(recovery.resetAt, recovery.remainingPercent, now)) {
+        const nextResumeAfter = parseResetTime(recovery.resetAt, now);
         if (nextResumeAfter && nextResumeAfter.toISOString() !== wait.resumeAfter) {
           this.database.prepare("UPDATE rate_limit_waits SET resume_after = ? WHERE chat_id = ?").run(nextResumeAfter.toISOString(), wait.chatId);
         }
@@ -147,10 +188,11 @@ export class RateLimitResumeService {
     for (const usage of usageRows) {
       const affected = waits.filter((wait) => wait.provider === usage.provider && wait.accountId === usage.accountId && !(wait.resumeAfter && new Date(wait.resumeAfter) <= now));
       if (!affected.length) continue;
-      if (!isRateLimitRecovered(usage.resetAt, usage.remainingPercent, now)) continue;
+      const recovery = usageRecoveryWindow(usage, this.adapters.get(usage.provider)?.usageWindowId);
+      if (!isRateLimitRecovered(recovery.resetAt, recovery.remainingPercent, now)) continue;
       let resumed = false;
       for (const wait of affected) resumed = await this.resumeChat(wait.chatId) || resumed;
-      if (resumed) void this.notifyReset(usage.provider, parseResetTime(usage.resetAt, now) ?? now);
+      if (resumed) void this.notifyReset(usage.provider, parseResetTime(recovery.resetAt, now) ?? now);
     }
   }
 

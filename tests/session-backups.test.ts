@@ -10,6 +10,7 @@ import { ClaudeAdapter } from "../src/server/providers/claude";
 import { HistoryCache } from "../src/server/services/history-cache";
 import { SessionBackupService } from "../src/server/services/session-backups";
 import { TokenUsageLedger } from "../src/server/services/token-usage-ledger";
+import { AgentAccountService } from "../src/server/services/agent-accounts";
 
 const cleanup: Array<() => void> = [];
 
@@ -45,9 +46,11 @@ function createHarness(): { config: AppConfig; database: AppDatabase; projectPat
 
 // 실제 파서를 쓰되 historyRoot만 테스트 폴더로 바꾼 어댑터를 만든다.
 function testAdapter(base: CodexAdapter | ClaudeAdapter, historyRoot: string): ProviderAdapter {
+  const wrongProcessHomeRoot = path.join(historyRoot, "wrong-process-home");
   return new Proxy(base, {
     get(target, property, receiver) {
-      if (property === "historyRoot") return historyRoot;
+      if (property === "historyRoot") return wrongProcessHomeRoot;
+      if (property === "historyRootFor") return () => historyRoot;
       const value = Reflect.get(target, property, receiver);
       return typeof value === "function" ? value.bind(target) : value;
     },
@@ -62,7 +65,8 @@ function prepareService(provider: "codex" | "claude") {
   const adapter = provider === "codex" ? testAdapter(new CodexAdapter(), historyRoot) : testAdapter(new ClaudeAdapter("", {}), historyRoot);
   const historyCache = new HistoryCache();
   const tokenUsage = new TokenUsageLedger(database);
-  const service = new SessionBackupService(config, database, [adapter], historyCache, tokenUsage);
+  const accounts = new AgentAccountService(config, database);
+  const service = new SessionBackupService(config, database, [adapter], historyCache, accounts, tokenUsage);
   database.prepare("INSERT INTO projects(name, path, source) VALUES ('project', ?, 'manual')").run(projectPath);
   const project = database.prepare("SELECT id FROM projects WHERE path = ?").get(projectPath) as { id: number };
   return { database, projectPath, historyRoot, historyCache, service, tokenUsage, projectId: project.id, adapter };

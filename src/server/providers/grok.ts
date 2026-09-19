@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { ApprovalHint, HistoryMessage, HistorySyncContext, HistorySyncDecision, HistorySession, HistoryTokenUsage, ModelChoice, ModelOptions, ProviderAdapter, ProviderLaunch, TmuxIO } from "./provider";
+import type { ApprovalHint, HistoryMessage, HistorySyncContext, HistorySyncDecision, HistorySession, HistoryTokenUsage, ModelChoice, ModelOptions, ProviderAdapter, ProviderLaunch, ProviderLaunchProfile, TmuxIO } from "./provider";
 import type { UsageRecord, UsageWindow } from "../../shared/types";
 import { extractContent, fallbackId } from "./history-utils";
 import { stripAnsi } from "../core/security";
@@ -43,27 +43,37 @@ function readSessionSummary(directory: string): Record<string, unknown> | null {
   }
 }
 
-// events.jsonl에서 가장 마지막 turn_ended 시각을 읽는다. Grok은 chat_history.jsonl에 stop_reason 같은
+// events.jsonl의 turn_ended 횟수와 마지막 시각을 읽는다. Grok은 chat_history.jsonl에 stop_reason 같은
 // 턴 종료 표시를 남기지 않아, "응답이 실제로 끝났는지"를 알 수 있는 곳은 이 이벤트뿐이다.
-function readLastTurnEndedAt(directory: string): string | null {
+function readGrokTurnEnds(directory: string): { lastEndedAt: string | null; count: number } {
   let raw: string;
   try {
     raw = fs.readFileSync(path.join(directory, EVENTS_FILE), "utf8");
   } catch {
-    return null;
+    return { lastEndedAt: null, count: 0 };
   }
-  const lines = raw.split("\n");
-  for (let index = lines.length - 1; index >= 0; index -= 1) {
-    const line = lines[index].trim();
-    if (!line || !line.includes("turn_ended")) continue;
+  let lastEndedAt: string | null = null;
+  let count = 0;
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || !trimmed.includes("turn_ended")) continue;
     try {
-      const record = JSON.parse(line) as Record<string, unknown>;
-      if (record.type === "turn_ended" && typeof record.ts === "string") return record.ts;
+      const record = JSON.parse(trimmed) as Record<string, unknown>;
+      if (record.type !== "turn_ended" || typeof record.ts !== "string") continue;
+      lastEndedAt = record.ts;
+      count += 1;
     } catch {
       continue;
     }
   }
-  return null;
+  return { lastEndedAt, count };
+}
+
+// 사람 발화 수보다 턴 종료가 적으면 지금 턴이 아직 끝나지 않은 것이라 종료 시각을 쓰지 않는다.
+function currentGrokTurnEndedAt(directory: string, userCount: number): string | null {
+  const { lastEndedAt, count } = readGrokTurnEnds(directory);
+  if (!lastEndedAt || userCount > count) return null;
+  return lastEndedAt;
 }
 
 // Grok 숫자 필드가 유한한 0 이상일 때만 채팅 공통 usage로 가져온다.
@@ -226,7 +236,7 @@ function parseGrokHistory(directory: string): HistorySession | null {
     updatedAt,
     messages,
     model: typeof summary?.current_model_id === "string" ? summary.current_model_id : null,
-    turnEndedAt: readLastTurnEndedAt(directory),
+    turnEndedAt: currentGrokTurnEndedAt(directory, messages.filter((message) => message.role === "user").length),
     displayTitle: generatedTitle || sessionSummary || null,
   };
 }
@@ -348,7 +358,9 @@ export class GrokAdapter implements ProviderAdapter {
   readonly displayLabel = "Grok";
   // /usage show가 보여주는 한도는 플랜 주간 창 하나뿐이다(예: "Weekly limit (SuperGrok)").
   readonly usageWindowId = "weekly";
+  readonly usageWindowLabels = { weekly: "주간" };
   readonly cliVersionCommand = { command: "grok", args: ["--version"] };
+  readonly cliUpdateCommand = { command: "grok", args: ["update"] };
   readonly historyRoot = path.join(os.homedir(), ".grok", "sessions");
 
   // GROK_HOME을 지정하면 grok이 그 폴더 아래에 sessions/를 새로 만들어 기록을 남긴다.
@@ -377,11 +389,26 @@ export class GrokAdapter implements ProviderAdapter {
     modelOptionsWithoutMenu: true,
   };
 
+  readonly supportsNewSessionId = true;
+
+  // hookEnvironment는 전역 훅 브리지가 서버에 보낼 토큰이다(#96). 훅 프로세스는 Grok 환경을 물려받는다(실측).
+  constructor(private readonly hookEnvironment: Record<string, string> = {}) {}
+
   // 새 Grok TUI 또는 저장된 세션 resume 명령을 구성한다.
-  createLaunch(_cwd: string, resumeSessionId?: string): ProviderLaunch {
+  createLaunch(_cwd: string, resumeSessionId?: string, newSessionId?: string, profile?: ProviderLaunchProfile): ProviderLaunch {
     const args: string[] = [];
+    if (profile) {
+      if (profile.additionalWritePaths.length) throw new Error("Grok TUI는 추가 쓰기 경로 project profile을 지원하지 않습니다.");
+      args.push("--sandbox", profile.sandbox === "danger-full-access" ? "off" : profile.sandbox === "workspace-write" ? "workspace" : "read-only");
+      args.push("--permission-mode", profile.sandbox === "read-only" ? "plan" : profile.approvalMode === "never" ? "dontAsk" : "default");
+      if (profile.model) args.push("--model", profile.model);
+      if (profile.reasoningEffort) args.push("--reasoning-effort", profile.reasoningEffort);
+      for (const rule of profile.allowedTools) args.push("--allow", rule);
+      for (const rule of profile.disallowedTools) args.push("--deny", rule);
+    }
     if (resumeSessionId) args.push("--resume", resumeSessionId);
-    return { command: "grok", args };
+    else if (newSessionId) args.push("--session-id", newSessionId);
+    return { command: "grok", args, env: this.hookEnvironment };
   }
 
   // Grok 세션 기록을 공통 세션 형태로 변환한다.

@@ -1,4 +1,4 @@
-import type { ExperimentBudgetConfig, ExperimentTerminationReason, ExperimentVariantConfig } from "../../shared/experiments";
+import type { ExperimentBudgetConfig, ExperimentProvider, ExperimentTerminationReason, ExperimentVariantConfig } from "../../shared/experiments";
 
 export interface RuntimeUsageSnapshot {
   inputTokens: number | null;
@@ -13,7 +13,7 @@ export interface RuntimeUsageSnapshot {
 }
 
 export interface RuntimeSnapshot {
-  provider: "codex" | "claude";
+  provider: ExperimentProvider;
   cliVersion: string;
   resolvedModel: string | null;
   toolProfile: Record<string, unknown>;
@@ -44,6 +44,8 @@ export interface RuntimePrepareInput {
   // fixture가 선언한 검증 명령. 비대화형 실행에는 승인할 사람이 없어 기본 권한 모드로는 Bash가 전부
   // 거부되므로, 이 명령만 정확히 허용해 에이전트가 스스로 검증할 수 있게 한다.
   allowedCommands?: string[][];
+  // Codex는 준비 단계에서 스키마 파일을 만들어야 하므로 run과 같이 준비 입력에도 둔다.
+  outputSchema?: Record<string, unknown>;
 }
 
 export interface RuntimeRunInput extends RuntimePrepareInput {
@@ -65,7 +67,7 @@ export type RuntimeEvent =
   | { type: "completed"; result: Record<string, unknown>; occurredAt: string }
   | { type: "failed"; error: string; reason?: ExperimentTerminationReason; occurredAt: string };
 
-// Codex·Claude의 비대화형 실행을 같은 준비·실행·재개·취소 이벤트 계약으로 노출한다.
+// Codex·Claude·Grok의 비대화형 실행을 같은 준비·실행·재개·취소 이벤트 계약으로 노출한다.
 export interface AgentRuntime {
   prepare(input: RuntimePrepareInput): Promise<RuntimeSnapshot>;
   run(input: RuntimeRunInput, signal: AbortSignal): AsyncIterable<RuntimeEvent>;

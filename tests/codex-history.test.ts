@@ -4,7 +4,7 @@ import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { CodexAdapter } from "../src/server/providers/codex";
 import type { TmuxIO } from "../src/server/providers/provider";
-import { USAGE_KEEPALIVE_PROMPT } from "../src/shared/usage-keepalive";
+import { CODEX_USAGE_KEEPALIVE_PROMPT, CODEX_USAGE_KEEPALIVE_RETRY_PROMPT, LEGACY_CODEX_USAGE_KEEPALIVE_150_PROMPT, LEGACY_CODEX_USAGE_KEEPALIVE_300_RETRY_PROMPT, LEGACY_CODEX_USAGE_KEEPALIVE_500_PROMPT, LEGACY_CODEX_USAGE_KEEPALIVE_700_RETRY_PROMPT, LEGACY_CODEX_USAGE_KEEPALIVE_LONG_PROMPT, LEGACY_CODEX_USAGE_KEEPALIVE_LONG_RETRY_PROMPT, LEGACY_CODEX_USAGE_KEEPALIVE_PROMPT, USAGE_KEEPALIVE_PROMPT } from "../src/shared/usage-keepalive";
 
 // 실제 codex CLI로 재현·확인한 화면 전이를 흉내내는 가짜 TmuxIO. 원래 현재가 아니었던 모델을 고르면
 // Codex가 기본 강도로 곧장 적용해버리고(강도 화면 없이 composer로 복귀) 그 모델이 "현재"가 되며,
@@ -111,6 +111,35 @@ describe("Codex 세션 기록 파싱", () => {
     const adapter = new CodexAdapter();
     expect(adapter.createLaunch("/tmp").args).toEqual(["--no-alt-screen", "--sandbox", "danger-full-access"]);
     expect(adapter.createLaunch("/tmp", "session-1").args).toEqual(["resume", "session-1", "--no-alt-screen", "--sandbox", "danger-full-access"]);
+    expect(adapter.supportsNewSessionId).toBe(false);
+    expect(adapter.createLaunch("/tmp", undefined, "11111111-1111-4111-8111-111111111111").args).toEqual(["--no-alt-screen", "--sandbox", "danger-full-access"]);
+  });
+
+  it("pinned project profile의 sandbox·승인·모델·추론·추가 경로를 argv로 고정한다", () => {
+    const adapter = new CodexAdapter();
+    const profile = {
+      sandbox: "workspace-write" as const, approvalMode: "on-request" as const, model: "gpt-profile", reasoningEffort: "high",
+      additionalWritePaths: ["/tmp/approved-extra"], allowedTools: [], disallowedTools: [],
+    };
+    expect(adapter.createLaunch("/tmp", "session-1", undefined, profile).args).toEqual([
+      "resume", "session-1", "--no-alt-screen", "--sandbox", "workspace-write", "--ask-for-approval", "on-request",
+      "--model", "gpt-profile", "--config", "model_reasoning_effort=\"high\"", "--add-dir", "/tmp/approved-extra",
+    ]);
+    expect(() => adapter.createLaunch("/tmp", undefined, undefined, { ...profile, allowedTools: ["Read"] })).toThrow("allow/deny");
+  });
+
+  it("WAM 훅은 채팅 실행에만 신뢰 우회 플래그와 함께 붙이고 조회 PTY에는 붙이지 않는다(#92)", () => {
+    const hookArgs = ["-c", "hooks.Stop=[{hooks=[{type=\"command\",command=\"x\",timeout=10}]}]"];
+    const adapter = new CodexAdapter(hookArgs, { WEB_AGENT_MANAGER_HOOK_TOKEN: "t" });
+    const bypass = "--dangerously-bypass-hook-trust";
+
+    expect(adapter.createLaunch("/tmp")).toEqual({
+      command: "codex",
+      args: ["--no-alt-screen", "--sandbox", "danger-full-access", ...hookArgs, bypass],
+      env: { WEB_AGENT_MANAGER_HOOK_TOKEN: "t" },
+    });
+    expect(adapter.createLaunch("/tmp", "session-1").args).toEqual(["resume", "session-1", "--no-alt-screen", "--sandbox", "danger-full-access", ...hookArgs, bypass]);
+    expect(adapter.createMonitorLaunch("/tmp")).toEqual({ command: "codex", args: ["--no-alt-screen", "--sandbox", "danger-full-access"] });
   });
 
   it("event_msg 중복을 제거하고 response_item만 사용한다", () => {
@@ -222,11 +251,50 @@ describe("Codex 세션 기록 파싱", () => {
     const file = writeHistory([
       { type: "session_meta", payload: { id: "usage-keepalive", cwd: "/home/testuser/web-agent-manager" } },
       { type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "/usage" }] } },
+      { type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: CODEX_USAGE_KEEPALIVE_PROMPT }] } },
+      { type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "1" }] } },
+    ]);
+
+    expect(new CodexAdapter().isHiddenHistoryFile(file)).toBe(true);
+  });
+
+  it("격리 codex exec가 먼저 기록한 environment_context를 건너뛰고 keepalive를 숨긴다", () => {
+    const file = writeHistory([
+      { type: "session_meta", payload: { id: "isolated-usage-keepalive", cwd: "/tmp/wam-codex-keepalive-test" } },
+      { type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: [
+        "<environment_context>",
+        "  <cwd>/tmp/wam-codex-keepalive-test</cwd>",
+        "</environment_context>",
+      ].join("\n") }] } },
+      { type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: CODEX_USAGE_KEEPALIVE_PROMPT }] } },
+      { type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "가".repeat(150) }] } },
+      { type: "event_msg", payload: { type: "task_complete" } },
+    ]);
+    const adapter = new CodexAdapter();
+
+    expect(adapter.isHiddenHistoryFile(file)).toBe(true);
+    expect(adapter.parseHistoryFile(file)?.messages[0]).toMatchObject({ role: "system", kind: "environment_context" });
+  });
+
+  it("문구 변경 전 Codex 최소 턴 기록도 계속 숨긴다", () => {
+    const file = writeHistory([
+      { type: "session_meta", payload: { id: "legacy-usage-keepalive", cwd: "/home/testuser/web-agent-manager" } },
       { type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: USAGE_KEEPALIVE_PROMPT }] } },
       { type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "1" }] } },
     ]);
 
     expect(new CodexAdapter().isHiddenHistoryFile(file)).toBe(true);
+  });
+
+  it("Codex 재확인 문구와 직전 한 문장 문구도 내부 기록으로 숨긴다", () => {
+    for (const prompt of [CODEX_USAGE_KEEPALIVE_RETRY_PROMPT, "세션 유지 재확인입니다. 도구를 사용하지 말고 현재 세션 상태, 문맥 유지 여부와 응답 가능 여부를 서로 겹치지 않는 표현의 한국어 문장들로 총 1100자 이상 자세히 답해주세요.", LEGACY_CODEX_USAGE_KEEPALIVE_500_PROMPT, LEGACY_CODEX_USAGE_KEEPALIVE_700_RETRY_PROMPT, LEGACY_CODEX_USAGE_KEEPALIVE_150_PROMPT, LEGACY_CODEX_USAGE_KEEPALIVE_300_RETRY_PROMPT, LEGACY_CODEX_USAGE_KEEPALIVE_LONG_PROMPT, LEGACY_CODEX_USAGE_KEEPALIVE_LONG_RETRY_PROMPT, LEGACY_CODEX_USAGE_KEEPALIVE_PROMPT]) {
+      const file = writeHistory([
+        { type: "session_meta", payload: { id: `usage-keepalive-${prompt.length}`, cwd: "/home/testuser/web-agent-manager" } },
+        { type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: prompt }] } },
+        { type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "확인" }] } },
+      ]);
+      expect(new CodexAdapter().isHiddenHistoryFile(file)).toBe(true);
+    }
   });
 
   it("turn_context에 기록된 모델·추론 강도를 세션의 현재 모델로 읽는다", () => {
@@ -241,6 +309,20 @@ describe("Codex 세션 기록 파싱", () => {
     fs.writeFileSync(file, lines.map((line) => JSON.stringify(line)).join("\n"));
     const session = new CodexAdapter().parseHistoryFile(file);
     expect(session?.model).toBe("gpt-5.5 medium");
+  });
+
+  it("task_complete 뒤에 새 사용자 메시지가 오면 현재 턴은 아직 끝나지 않은 것으로 본다", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-history-"));
+    const file = path.join(dir, "rollout.jsonl");
+    const lines = [
+      { type: "session_meta", payload: { id: "session-1", cwd: "/home/testuser/web-agent-manager" }, timestamp: "2026-07-06T13:36:56.000Z" },
+      { type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "첫 질문" }] }, timestamp: "2026-07-06T13:36:57.000Z" },
+      { type: "event_msg", payload: { type: "task_complete", turn_id: "t1" }, timestamp: "2026-07-06T13:37:10.000Z" },
+      { type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "이어서" }] }, timestamp: "2026-07-06T13:37:20.000Z" },
+    ];
+    fs.writeFileSync(file, lines.map((line) => JSON.stringify(line)).join("\n"));
+    const session = new CodexAdapter().parseHistoryFile(file);
+    expect(session?.turnEndedAt).toBeNull();
   });
 
   it("사용량 한도로 assistant 메시지 없이 턴이 끝나도 턴 종료 시각을 기록한다", () => {
@@ -274,9 +356,51 @@ describe("Codex 세션 기록 파싱", () => {
       "> 1. Yes",
       "  2. Yes, and don't ask again this session",
       "  3. No, and tell Codex what to do differently",
+      "",
+      "  Enter to confirm · Esc to cancel",
     ].join("\n");
-    const hint = new CodexAdapter().detectApproval(prompt);
+    const adapter = new CodexAdapter();
+    const hint = adapter.detectApproval(prompt);
     expect(hint?.requestType).toBe("terminal_approval");
+    expect(adapter.approvalInput("decline", "terminal_approval")).toBe("");
+    expect(adapter.resolveApprovalInput("accept", "terminal_approval", prompt)).toBe("1\r");
+    expect(adapter.resolveApprovalInput("acceptForSession", "terminal_approval", prompt)).toBe("2\r");
+    expect(adapter.resolveApprovalInput("decline", "terminal_approval", prompt)).toBe("3\r");
+  });
+
+  it("정상 답변의 번호 목록과 '승인되지 않은' 문구는 권한 요청이나 숫자 입력으로 오인하지 않는다", () => {
+    // 2026-08-30 채팅 #510 실사용 화면: 기존 판정은 1./2.와 '승인' 부분 문자열만 보고
+    // terminal_approval을 만들었고, 닫기에서 decline의 3을 idle composer에 두 번 제출했다.
+    const screen = [
+      "원신과 작업 방식은 조금 달라. 이환은 UE5 기반이라 일반적으로 다음 과정을 사용해.",
+      "1. FModel과 게임 버전에 맞는 매핑으로 텍스처와 메시를 준비",
+      "2. Blender에서 의상 모델·본 가중치·UV 수정",
+      "3. Unreal Engine용 에셋으로 구성",
+      "4. .pak/.utoc/.ucas 형식으로 패키징",
+      "5. Aurora 같은 UE5 모드 로더로 시험",
+      "공식 EULA는 승인되지 않은 제3자 도구를 금지한다.",
+      "› Ask Codex to do anything",
+      "gpt-5.6-sol high · /home/ubuntu/myagent",
+      "[web_agent0:codex* \"myagent\" 04:09 30-Aug-26",
+    ].join("\n");
+    const adapter = new CodexAdapter();
+    expect(adapter.detectApproval(screen)).toBeNull();
+    expect(adapter.resolveApprovalInput("decline", "terminal_approval", screen)).toBeNull();
+  });
+
+  it("과거 선택 메뉴가 본문에 남고 최하단 composer로 돌아왔으면 입력을 보내지 않는다", () => {
+    const stale = [
+      "Would you like to approve this command?",
+      "› 1. Yes",
+      "  2. Yes, and don't ask again this session",
+      "  3. No, and tell Codex what to do differently",
+      "  Enter to confirm · Esc to cancel",
+      "› Ask Codex to do anything",
+      "gpt-5.6-sol high · /home/ubuntu/myagent",
+    ].join("\n");
+    const adapter = new CodexAdapter();
+    expect(adapter.detectApproval(stale)).toBeNull();
+    expect(adapter.resolveApprovalInput("decline", "terminal_approval", stale)).toBeNull();
   });
 
   it("한도 임박 시 경량 모델 전환을 묻는 화면은 approve/승인 키워드 없이도 감지한다", () => {
@@ -291,8 +415,12 @@ describe("Codex 세션 기록 파싱", () => {
       "",
       "  Press enter to confirm or esc to go back",
     ].join("\n");
-    const hint = new CodexAdapter().detectApproval(prompt);
+    const adapter = new CodexAdapter();
+    const hint = adapter.detectApproval(prompt);
     expect(hint?.requestType).toBe("model_switch_prompt");
+    expect(adapter.resolveApprovalInput("accept", "model_switch_prompt", prompt)).toBe("1\r");
+    expect(adapter.resolveApprovalInput("acceptForSession", "model_switch_prompt", prompt)).toBe("2\r");
+    expect(adapter.resolveApprovalInput("decline", "model_switch_prompt", prompt)).toBe("3\r");
   });
 
   it("선택 메뉴 없이 try again 시각만 찍는 사용량 한도 화면도 리밋 대기로 감지한다", () => {
@@ -331,8 +459,10 @@ describe("Codex 세션 기록 파싱", () => {
   it("실제 1./2. 선택 메뉴가 뜬 사용량 한도 화면에서는 wait/upgrade 문구로 번호를 찾는다", () => {
     const screen = [
       "You've hit your usage limit.",
-      "1. Wait and try again later",
-      "2. Upgrade to Pro",
+      "› 1. Wait and try again later",
+      "  2. Upgrade to Pro",
+      "",
+      "  Enter to confirm · Esc to cancel",
     ].join("\n");
     const adapter = new CodexAdapter();
     expect(adapter.resolveRateLimitInput("accept", screen)).toBe("1\r");
@@ -368,8 +498,9 @@ describe("Codex 세션 기록 파싱", () => {
     const adapter = new CodexAdapter();
     const hint = adapter.detectApproval(prompt);
     expect(hint?.requestType).toBe("trust_directory");
-    expect(adapter.approvalInput("accept", "trust_directory")).toBe("1\r");
-    expect(adapter.approvalInput("decline", "trust_directory")).toBe("2\r");
+    expect(adapter.approvalInput("accept", "trust_directory")).toBe("");
+    expect(adapter.resolveApprovalInput("accept", "trust_directory", prompt)).toBe("1\r");
+    expect(adapter.resolveApprovalInput("decline", "trust_directory", prompt)).toBe("2\r");
   });
 
   it("시작 배너에서 모델명을 감지한다", () => {

@@ -6,6 +6,19 @@ export interface ProviderLaunch {
   env?: Record<string, string>;
 }
 
+// 활성 project profile에서 검증한 채팅별 실행 제약이다. 공급자 adapter는 이 값만 CLI argv로
+// 변환하며 원본 JSON을 직접 해석하지 않는다. profile이 없는 기존 채팅은 undefined를 받아 기존
+// 실행 계약을 유지한다.
+export interface ProviderLaunchProfile {
+  sandbox: "read-only" | "workspace-write" | "danger-full-access";
+  approvalMode: "on-request" | "never";
+  model: string | null;
+  reasoningEffort: string | null;
+  additionalWritePaths: string[];
+  allowedTools: string[];
+  disallowedTools: string[];
+}
+
 export interface HistoryTokenUsage {
   inputTokens: number;
   cachedInputTokens: number;
@@ -98,7 +111,16 @@ export interface ProviderAdapter {
   usageWindowId: string;
   // 초기화 알림을 보낼 사용량 창 목록. 생략하면 대표 usageWindowId 하나만 추적한다.
   usageResetWindowIds?: string[];
+  // 공급자가 실제로 제공하는 창 ID를 사용자용 공통 종류 이름(예: 5시간·주간)으로 매핑한다.
+  // 알림 형식은 서버가 통일하고, 공급자별 차이는 이 데이터에만 둔다.
+  usageWindowLabels?: Record<string, string>;
+  // 초기화 경계에서 CLI가 잠시 숨기는 창 목록. 이전 양수 기준선의 예정 시각을 지난 뒤
+  // 사라지면 초기화로 확정하고, 경계 전 누락이면 기준선만 보존한다.
+  // 여기에 없는 추적 창이 사라지면 공급자 정책에서 제거된 것으로 보고 예약도 삭제한다.
+  transientUsageResetWindowIds?: string[];
   cliVersionCommand: ProviderLaunch;
+  // 공급자 CLI 자체 업데이트 명령. 인자를 고정 배열로 두어 웹 요청이 임의 셸 명령으로 확장되지 않게 한다.
+  cliUpdateCommand?: ProviderLaunch;
   // 기본 계정(CLI 기본 설정 디렉터리)의 기록 루트. historyRootFor(null)과 같은 값이다.
   historyRoot: string;
   // 계정 슬롯의 설정 디렉터리를 받아 그 계정의 기록 루트를 계산한다. null이면 CLI 기본 경로를 쓴다.
@@ -117,7 +139,11 @@ export interface ProviderAdapter {
     // 명령이 모델 이름으로 먹혀 "Unknown model: /usage show"가 된다(실측).
     modelOptionsWithoutMenu?: boolean;
   };
-  createLaunch(cwd: string, resumeSessionId?: string): ProviderLaunch;
+  // 새 대화에 `--session-id`로 UUID를 지정할 수 있으면 true. Codex처럼 없으면 생략한다.
+  supportsNewSessionId?: boolean;
+  // CLI 세션 표시 이름을 `/rename <name>`으로 변경할 수 있는 공급자만 true로 선언한다.
+  supportsSessionRename?: boolean;
+  createLaunch(cwd: string, resumeSessionId?: string, newSessionId?: string, profile?: ProviderLaunchProfile): ProviderLaunch;
   // 사용량·모델 조회 전용 CLI에 더 가벼운 실행 모드가 있으면 일반 채팅 실행과 분리해 제공한다.
   createMonitorLaunch?(cwd: string): ProviderLaunch;
   parseHistoryFile(file: string): HistorySession | null;
@@ -126,10 +152,15 @@ export interface ProviderAdapter {
   evaluateHistorySync(context: HistorySyncContext): HistorySyncDecision;
   isReady(output: string): boolean;
   isBusy(output: string): boolean;
+  // resume·MCP 부팅처럼 composer가 먼저 보여도 아직 입력 제출을 받아들이면 안 되는 전환 화면.
+  isInitializing?(output: string): boolean;
   // 화면 하단 입력창에 남아 있는 미전송 텍스트를 돌려준다. 입력창은 있지만 비어 있으면 빈 문자열,
   // 승인·선택 메뉴처럼 입력창 자체가 없는 화면이면 null이다. isReady는 "비어 있는" 입력창만 준비로
   // 인정하므로(제출 확인이 그 성질에 의존한다) 초안이 남은 입력창을 구분하려면 이 판정이 따로 필요하다.
   readPromptDraft?(output: string): string | null;
+  // 작업 중 입력이 CLI 대기열에 들어갔다는 기록(sinceMs 이후·같은 내용)이 세션 기록 파일에 있는지 본다(#103).
+  // 작업 중 입력은 UserPromptSubmit 훅도 user 기록도 바로 생기지 않아 제출 증거가 따로 필요하다.
+  hasQueuedPrompt?(historyFile: string, expectedPrompt: string, sinceMs: number): boolean;
   parseUsage(output: string, now?: Date): Partial<UsageRecord>;
   detectApproval(output: string): ApprovalHint | null;
   detectModel(output: string): string | null;

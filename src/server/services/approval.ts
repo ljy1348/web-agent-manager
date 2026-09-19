@@ -4,6 +4,7 @@ import type { AppDatabase } from "../core/database";
 import type { AuthUser, Provider } from "../../shared/types";
 import type { RealtimeHub } from "./realtime";
 import type { Notifier } from "./notifier";
+import type { CodexStructuredApprovalDecision, CodexStructuredApprovalRequest } from "../providers/codex-structured-session";
 
 interface ClaudeHookRequest {
   session_id?: string;
@@ -73,21 +74,85 @@ export class ApprovalService {
   // 순간 오류 등으로 재시도되면 CLI가 hook을 다시 호출하는데, 그때마다 새 승인을 만들면 사람이 볼
   // 카드가 중복으로 뜨고(실제로 겪음) 어느 쪽에 답해야 실제로 진행되는지 헷갈린다. 같은 채팅에 같은
   // tool_name+tool_input의 pending 요청이 이미 있으면 새로 만들지 않고 그 요청에 합류한다.
-  async handleClaudeHook(input: ClaudeHookRequest): Promise<Record<string, unknown>> {
-    const chat = this.findClaudeChat(input);
+  async handleClaudeHook(input: ClaudeHookRequest, chatIdHint: number | null = null): Promise<Record<string, unknown>> {
+    const chat = this.findHookChat("claude", input, chatIdHint);
     if (!chat) return this.denyClaude("연결된 웹 채팅을 찾지 못했습니다.", false);
+    const { decision, answer } = await this.awaitHookDecision("claude", chat.id, input);
+    if (decision === "accept") return this.allowClaude();
+    if (decision === "acceptForSession") return this.allowClaudeForSession(input.permission_suggestions);
+    // AskUserQuestion처럼 실제 선택·답변이 필요한 도구는 decline의 message에 그 답을 그대로 실어
+    // 보내면, 터미널 조작 없이도 Claude가 자연어 피드백으로 읽고 답변받은 것처럼 이어갈 수 있다.
+    return this.denyClaude(answer || (decision === "cancel" ? "사용자가 작업을 취소했습니다." : "사용자가 권한을 거부했습니다."), decision === "cancel");
+  }
+
+  // Codex PermissionRequest 훅을 웹 승인으로 전환한다(#95). Codex 출력은 allow/deny뿐이라 세션 허용도
+  // 1회 허용으로 보낸다(웹 카드도 Codex에는 세션 허용 버튼을 두지 않는다). 채팅을 못 찾으면 거부하지 않고
+  // 결정 없이 돌려줘 Codex 기본 승인 화면(기존 화면 감지 경로)으로 넘어가게 한다.
+  async handleCodexHook(input: ClaudeHookRequest, chatIdHint: number | null = null): Promise<Record<string, unknown>> {
+    const chat = this.findHookChat("codex", input, chatIdHint);
+    if (!chat) return {};
+    const { decision, answer } = await this.awaitHookDecision("codex", chat.id, input);
+    const behavior = decision === "accept" || decision === "acceptForSession" ? { behavior: "allow" } : {
+      behavior: "deny",
+      message: answer || (decision === "cancel" ? "사용자가 작업을 취소했습니다." : "사용자가 권한을 거부했습니다."),
+    };
+    return { hookSpecificOutput: { hookEventName: "PermissionRequest", decision: behavior } };
+  }
+
+  // app-server가 보낸 구조화 승인 요청을 기존 웹 승인 원장·결정 API에 연결한다. adapter가 이미
+  // command/path/reason 원문을 제거한 식별 메타데이터만 받으므로 request_payload에도 민감 원문이 없다.
+  async awaitCodexAppServerDecision(request: CodexStructuredApprovalRequest): Promise<CodexStructuredApprovalDecision> {
+    const chat = this.database.prepare(`
+      SELECT id FROM chats WHERE id = ? AND provider = 'codex' AND provider_session_id = ?
+    `).get(request.chatId, request.threadId) as { id: number } | undefined;
+    if (!chat) throw new Error("Codex 구조화 승인 요청의 채팅을 찾을 수 없습니다.");
+    const requestType = `app_server_${request.requestType}`;
+    const payload = JSON.stringify({
+      requestId: String(request.requestId),
+      threadId: request.threadId,
+      turnId: request.turnId,
+      itemId: request.itemId,
+      availableDecisions: request.availableDecisions,
+    });
     const duplicate = this.database.prepare(`
-      SELECT id FROM approvals WHERE chat_id = ? AND provider = 'claude' AND request_type = 'permission' AND status = 'pending' AND request_payload = ?
-    `).get(chat.id, JSON.stringify(input)) as { id: string } | undefined;
+      SELECT id FROM approvals
+      WHERE chat_id = ? AND provider = 'codex' AND request_type = ? AND status = 'pending' AND request_payload = ?
+    `).get(request.chatId, requestType, payload) as { id: string } | undefined;
     const id = duplicate?.id ?? crypto.randomUUID();
     if (!duplicate) {
       this.database.prepare(`
         INSERT INTO approvals(id, chat_id, provider, request_type, request_payload)
-        VALUES (?, ?, 'claude', 'permission', ?)
-      `).run(id, chat.id, JSON.stringify(input));
-      this.publish(id, chat.id, "claude", "permission", input);
+        VALUES (?, ?, 'codex', ?, ?)
+      `).run(id, request.chatId, requestType, payload);
+      this.publish(id, request.chatId, "codex", requestType, { summary: request.requestType });
     }
-    const { decision, answer } = await new Promise<{ decision: ApprovalDecision; answer?: string }>((resolve) => {
+    return new Promise<CodexStructuredApprovalDecision>((resolve) => {
+      if (!duplicate) {
+        const timeout = setTimeout(() => this.finalizeApproval(id, "decline", null, undefined, false), 9 * 60 * 1000);
+        timeout.unref();
+        this.waiting.set(id, [(decision) => { clearTimeout(timeout); resolve(decision); }]);
+      } else {
+        const waiters = this.waiting.get(id);
+        if (!waiters) { resolve("decline"); return; }
+        waiters.push((decision) => resolve(decision));
+      }
+    });
+  }
+
+  // 훅 승인 요청을 저장·알리고 사람의 결정을 기다린다. 같은 tool 호출의 재시도는 기존 요청에 합류한다.
+  private async awaitHookDecision(provider: "claude" | "codex", chatId: number, input: ClaudeHookRequest): Promise<{ decision: ApprovalDecision; answer?: string }> {
+    const duplicate = this.database.prepare(`
+      SELECT id FROM approvals WHERE chat_id = ? AND provider = ? AND request_type = 'permission' AND status = 'pending' AND request_payload = ?
+    `).get(chatId, provider, JSON.stringify(input)) as { id: string } | undefined;
+    const id = duplicate?.id ?? crypto.randomUUID();
+    if (!duplicate) {
+      this.database.prepare(`
+        INSERT INTO approvals(id, chat_id, provider, request_type, request_payload)
+        VALUES (?, ?, ?, 'permission', ?)
+      `).run(id, chatId, provider, JSON.stringify(input));
+      this.publish(id, chatId, provider, "permission", input);
+    }
+    return new Promise<{ decision: ApprovalDecision; answer?: string }>((resolve) => {
       // 9분간 응답이 없으면 Claude에는 거부로 응답한다. finalizeApproval을 그대로 타야 DB·웹 화면에도
       // "처리 완료"가 반영되어, 응답 없이 방치된 요청이 승인 목록에 영원히 pending으로 남지 않는다
       // (시스템이 자동으로 정리한 것이므로 decided_by는 비워둔다). 합류한 재시도는 별도 타이머 없이
@@ -102,11 +167,6 @@ export class ApprovalService {
         waiters.push((value, replyText) => resolve({ decision: value, answer: replyText }));
       }
     });
-    if (decision === "accept") return this.allowClaude();
-    if (decision === "acceptForSession") return this.allowClaudeForSession(input.permission_suggestions);
-    // AskUserQuestion처럼 실제 선택·답변이 필요한 도구는 decline의 message에 그 답을 그대로 실어
-    // 보내면, 터미널 조작 없이도 Claude가 자연어 피드백으로 읽고 답변받은 것처럼 이어갈 수 있다.
-    return this.denyClaude(answer || (decision === "cancel" ? "사용자가 작업을 취소했습니다." : "사용자가 권한을 거부했습니다."), decision === "cancel");
   }
 
   // 인증된 사용자의 승인 결정을 저장하고 대기 중인 공급자에 전달한다.
@@ -145,10 +205,10 @@ export class ApprovalService {
       chat_progressed: number;
     } | undefined;
     if (!approval || approval.status !== "pending") throw new Error("처리 가능한 승인 요청이 아닙니다.");
-    // Claude PermissionRequest 훅은 공급자 고유 HTTP 훅 경로라 어댑터 TUI 추상화 대상이 아니다.
+    // PermissionRequest 훅(Claude·Codex)은 공급자 고유 훅 경로라 어댑터 TUI 추상화 대상이 아니다.
     // 요청 이후 기록이 갱신되고 busy까지 내려간 경우만 연결 유실 잔여 상태로 본다. 훅 생성 직후 기록
     // 동기화 전의 짧은 busy=0 구간에서는 새 요청을 실수로 닫지 않는다.
-    const isHookLive = approval.provider === "claude" && approval.request_type === "permission"
+    const isHookLive = (approval.request_type === "permission" || approval.request_type.startsWith("app_server_"))
       && this.waiting.has(id) && (approval.busy === 1 || approval.chat_progressed === 0);
     const isTerminalLive = approval.request_type !== "permission" && (this.terminalLiveCheckHandler?.(approval.chat_id, approval.request_type) ?? false);
     if (isHookLive || isTerminalLive) { this.finalizeApproval(id, "decline", user.id, "사용자가 이 요청을 닫았습니다.", true); return; }
@@ -198,8 +258,9 @@ export class ApprovalService {
       UPDATE approvals SET status = ?, decision = ?, decided_by = ?, resolved_at = CURRENT_TIMESTAMP WHERE id = ?
     `).run(decision === "accept" || decision === "acceptForSession" ? "accepted" : "declined", decision, decidedBy, id);
     const waiters = this.waiting.get(id);
-    // Claude PermissionRequest 훅은 공급자 고유 HTTP 훅 경로라 어댑터 TUI 추상화 대상이 아니다.
-    if (approval.provider === "claude" && waiters) {
+    // PermissionRequest 훅(Claude·Codex)은 공급자 고유 훅 경로라 어댑터 TUI 추상화 대상이 아니다.
+    // 훅 대기자가 있으면 키 입력 대신 대기 중인 훅 응답으로 결정을 돌려준다.
+    if (waiters) {
       // 재시도로 합류한 대기자가 있으면 전부 같은 결정으로 응답해야, 그중 어느 훅 HTTP 호출도
       // 응답 없이 매달려 있지 않는다.
       for (const waiter of waiters) waiter(decision, answer);
@@ -211,17 +272,22 @@ export class ApprovalService {
     return true;
   }
 
-  // Claude 훅 세션 ID 또는 작업 경로로 연결된 채팅을 찾는다.
-  private findClaudeChat(input: ClaudeHookRequest): { id: number } | null {
+  // 훅이 전달한 채팅 ID를 우선하고, 없을 때만 세션 ID·작업 경로로 연결된 채팅을 찾는다. cwd 경로는
+  // 같은 프로젝트의 "가장 최근 채팅"을 고르는 추측이라 채팅 ID가 있으면 쓰지 않는다.
+  private findHookChat(provider: "claude" | "codex", input: ClaudeHookRequest, chatIdHint: number | null): { id: number } | null {
+    if (chatIdHint !== null) {
+      const byChatId = this.database.prepare("SELECT id FROM chats WHERE id = ? AND provider = ?").get(chatIdHint, provider) as { id: number } | undefined;
+      if (byChatId) return byChatId;
+    }
     if (input.session_id) {
-      const bySession = this.database.prepare("SELECT id FROM chats WHERE provider = 'claude' AND provider_session_id = ?").get(input.session_id) as { id: number } | undefined;
+      const bySession = this.database.prepare("SELECT id FROM chats WHERE provider = ? AND provider_session_id = ?").get(provider, input.session_id) as { id: number } | undefined;
       if (bySession) return bySession;
     }
     if (input.cwd) {
       const byCwd = this.database.prepare(`
         SELECT c.id FROM chats c JOIN projects p ON p.id = c.project_id
-        WHERE c.provider = 'claude' AND p.path = ? ORDER BY c.updated_at DESC LIMIT 1
-      `).get(input.cwd) as { id: number } | undefined;
+        WHERE c.provider = ? AND p.path = ? ORDER BY c.updated_at DESC LIMIT 1
+      `).get(provider, input.cwd) as { id: number } | undefined;
       if (byCwd) return byCwd;
     }
     return null;
@@ -230,7 +296,9 @@ export class ApprovalService {
   // 승인 요청을 웹과 등록된 알림 채널에 알린다.
   private publish(id: string, chatId: number, provider: string, requestType: string, payload: unknown): void {
     const detail = approvalNotificationDetail(requestType, payload);
-    this.realtime.broadcast("approval_requested", { id, chatId, provider, requestType, payload });
+    // payload에는 도구 이름과 인자(경로 등)가 그대로 들어간다. 임시 세션은 HTTP 승인 목록도 빈
+    // 배열로 받으므로 이 채널도 같이 닫는다. approval_resolved는 id·decision·chatId뿐이라 제외하지 않는다.
+    this.realtime.broadcast("approval_requested", { id, chatId, provider, requestType, payload }, { skipTemporary: true });
     void this.notifications.notify(
       `approval:${id}`,
       "approval_requested",

@@ -1,0 +1,101 @@
+import { once } from "node:events";
+import crypto from "node:crypto";
+import fs from "node:fs";
+import type { AddressInfo } from "node:net";
+import os from "node:os";
+import path from "node:path";
+import express from "express";
+import { afterEach, describe, expect, it } from "vitest";
+import type { AppConfig } from "../src/server/core/config";
+import { openDatabase } from "../src/server/core/database";
+import { CodexAdapter } from "../src/server/providers/codex";
+import { createOperationsRouter } from "../src/server/routes/operations-routes";
+import { ProviderCanaryService, PROVIDER_CANARY_STEPS } from "../src/server/services/provider-canary";
+import { ProviderCliBackupService } from "../src/server/services/provider-cli-backup";
+import { ProviderUpdateLedger } from "../src/server/services/provider-update-ledger";
+import { ProviderRolloutService } from "../src/server/services/provider-rollout";
+
+const roots: string[] = [];
+let closeServer: (() => Promise<void>) | undefined;
+afterEach(async () => { await closeServer?.(); closeServer = undefined; while (roots.length) fs.rmSync(roots.pop()!, { recursive: true, force: true }); });
+
+describe("provider update/rollback 실제 통합 QA", () => {
+  it("통과 canary부터 binary/config backup, update, one-click rollback까지 불변성을 유지한다", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "wam-update-integration-"));
+    roots.push(root);
+    const dataDir = path.join(root, "data"); const homeDir = path.join(root, "home"); const binDir = path.join(root, "bin"); const candidateDir = path.join(root, "candidates");
+    fs.mkdirSync(dataDir); fs.mkdirSync(path.join(homeDir, ".codex"), { recursive: true }); fs.mkdirSync(binDir); fs.mkdirSync(candidateDir, { mode: 0o700 });
+    const v1 = path.join(root, "codex-v1"); const v2 = path.join(root, "codex-v2"); const command = path.join(binDir, "codex");
+    fs.writeFileSync(v1, "codex 1.0.0"); fs.chmodSync(v1, 0o755); fs.writeFileSync(v2, "codex 2.0.0"); fs.chmodSync(v2, 0o755); fs.symlinkSync(v1, command);
+    fs.copyFileSync(v2, path.join(candidateDir, "codex")); fs.chmodSync(path.join(candidateDir, "codex"), 0o700);
+    const configFile = path.join(homeDir, ".codex/config.toml"); fs.writeFileSync(configFile, "model='old'\n");
+    fs.writeFileSync(path.join(homeDir, ".codex/auth.json"), "credential-must-not-rollback");
+    const database = openDatabase({ dataDir } as AppConfig);
+    database.prepare("INSERT INTO users(id, username, password_hash, role) VALUES (1, 'admin', 'x', 'admin')").run();
+    const projectId = Number(database.prepare("INSERT INTO projects(name, path) VALUES ('p', ?)").run(root).lastInsertRowid);
+    const profile = JSON.stringify({ runtime: { provider: "codex", model: "fixed" } });
+    const chatId = Number(database.prepare(`INSERT INTO chats(project_id, provider, tmux_name, title, provider_session_id, preset_config_json)
+      VALUES (?, 'codex', 'update-chat', 'update', 'session-keep', ?)`).run(projectId, profile).lastInsertRowid);
+    database.prepare("INSERT INTO agent_tasks(id, chat_id, project_id, state) VALUES ('task-keep', ?, ?, 'running')").run(chatId, projectId);
+    const candidateSha256 = crypto.createHash("sha256").update(fs.readFileSync(path.join(candidateDir, "codex"))).digest("hex");
+    database.prepare(`INSERT INTO provider_canary_runs(id, provider, idempotency_key, suite_version, current_version, candidate_version, candidate_sha256, reported_version, state, current_capabilities_json, finished_at)
+      VALUES ('canary-pass', 'codex', 'canary-key', 'provider-cli-v1', 'codex 1.0.0', 'codex 2.0.0', ?, 'codex 2.0.0', 'passed', '{}', CURRENT_TIMESTAMP)`).run(candidateSha256);
+    const insertStep = database.prepare("INSERT INTO provider_canary_steps(id, run_id, ordinal, name, state) VALUES (?, 'canary-pass', ?, ?, 'passed')");
+    PROVIDER_CANARY_STEPS.forEach((name, index) => insertStep.run(`step-${index}`, index + 1, name));
+    const canaries = new ProviderCanaryService(database, dataDir);
+    const updates = new ProviderUpdateLedger(database);
+    const backups = new ProviderCliBackupService(dataDir, homeDir, () => command);
+    const rollouts = new ProviderRolloutService(database, candidateDir, async (candidate) => fs.readFileSync(candidate, "utf8"));
+    const restarts: string[] = [];
+    const usage = { list: () => [], restartProviderTerminals: (provider: string) => { restarts.push(`usage:${provider}`); return 1; } };
+    const sessions = { restartProviderTerminals: async (provider: string) => { restarts.push(`chat:${provider}`); return { restartedChatIds: [chatId], failures: [] }; } };
+    const readVersion = async (name: string) => name === "codex" ? fs.readFileSync(fs.realpathSync(command), "utf8") : `${name} test`;
+    const update = async () => { fs.unlinkSync(command); fs.symlinkSync(v2, command); fs.writeFileSync(configFile, "model='new'\n"); fs.writeFileSync(path.join(homeDir, ".codex/auth.json"), "credential-rotated"); };
+    const app = express(); app.use(express.json()); app.use((request: any, _response, next) => { request.authUser = { id: 1, username: "admin", role: "admin" }; next(); });
+    app.use(createOperationsRouter(database, {} as never, usage as never, { snapshot: () => ({}) } as never, { status: () => ({}) } as never, { status: () => ({}) } as never,
+      [new CodexAdapter()], { settings: () => ({}) } as never, readVersion, sessions as never, update, undefined, canaries, updates, backups, rollouts));
+    app.use((error: any, _request: any, response: any, _next: any) => response.status(error?.statusCode || 400).json({ error: error?.message }));
+    const server = app.listen(0, "127.0.0.1"); await once(server, "listening"); closeServer = () => new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const rolloutResponse = await fetch(`${base}/providers/codex/rollouts`, { method: "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": "rollout-http" }, body: JSON.stringify({ canaryRunId: "canary-pass", maxNewChats: 1 }) });
+    expect(rolloutResponse.status).toBe(201);
+    const rollout = (await rolloutResponse.json() as any).rollout;
+    const stagedChatId = Number(database.prepare("INSERT INTO chats(project_id, provider, tmux_name, title) VALUES (?, 'codex', 'staged-chat', 'staged')").run(projectId).lastInsertRowid);
+    expect(rollouts.assignNewChat("codex", stagedChatId)).toBe(rollout.id);
+    const stagedCommand = rollouts.resolveLaunch(stagedChatId, "codex", { command: "codex", args: [] }).command;
+    expect(stagedCommand).not.toBe(path.join(candidateDir, "codex"));
+    expect(fs.readFileSync(stagedCommand, "utf8")).toBe("codex 2.0.0");
+    const invariantBefore = database.prepare("SELECT provider_session_id, preset_config_json FROM chats WHERE id = ?").get(chatId);
+    const taskBefore = database.prepare("SELECT state, profile_version_id FROM agent_tasks WHERE id = 'task-keep'").get();
+    const started = performance.now();
+    const appliedResponse = await fetch(`${base}/providers/codex/update`, { method: "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": "update-http" }, body: JSON.stringify({ canaryRunId: "canary-pass", rolloutRunId: rollout.id }) });
+    expect(appliedResponse.status).toBe(200);
+    const applied = await appliedResponse.json() as any;
+    expect(applied).toMatchObject({ status: "completed", currentVersion: "codex 2.0.0" });
+    expect(rollouts.get(rollout.id)).toMatchObject({ state: "promoted", assignedCount: 1, errorCount: 0 });
+    expect(fs.readFileSync(fs.realpathSync(command), "utf8")).toBe("codex 2.0.0");
+    const manifestText = (database.prepare("SELECT backup_manifest_json FROM provider_update_runs WHERE id = ?").get(applied.updateRunId) as any).backup_manifest_json;
+    expect(manifestText).not.toContain(root);
+    expect(manifestText).not.toContain("auth.json");
+
+    const updateReplay = await fetch(`${base}/providers/codex/update`, { method: "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": "update-http" }, body: JSON.stringify({ canaryRunId: "canary-pass", rolloutRunId: rollout.id }) });
+    expect(updateReplay.status).toBe(200);
+    await expect(updateReplay.json()).resolves.toMatchObject({ status: "completed", updateRunId: applied.updateRunId, replay: true });
+    expect(restarts).toEqual(["usage:codex", "chat:codex"]);
+
+    const rollbackResponse = await fetch(`${base}/providers/codex/updates/${applied.updateRunId}/rollback`, { method: "POST", headers: { "Idempotency-Key": "rollback-http" } });
+    expect(rollbackResponse.status).toBe(200);
+    await expect(rollbackResponse.json()).resolves.toMatchObject({ status: "rolled_back", restoredVersion: "codex 1.0.0" });
+    expect(fs.readFileSync(fs.realpathSync(command), "utf8")).toBe("codex 1.0.0");
+    expect(fs.readFileSync(configFile, "utf8")).toBe("model='old'\n");
+    expect(fs.readFileSync(path.join(homeDir, ".codex/auth.json"), "utf8")).toBe("credential-rotated");
+    expect(database.prepare("SELECT provider_session_id, preset_config_json FROM chats WHERE id = ?").get(chatId)).toEqual(invariantBefore);
+    expect(database.prepare("SELECT state, profile_version_id FROM agent_tasks WHERE id = 'task-keep'").get()).toEqual(taskBefore);
+    expect((updates.get(applied.updateRunId) as any).events.map((event: any) => event.state)).toEqual(["pending", "updating", "applied", "rolling_back", "rolled_back"]);
+    const replay = await fetch(`${base}/providers/codex/updates/${applied.updateRunId}/rollback`, { method: "POST", headers: { "Idempotency-Key": "rollback-http" } });
+    expect((await replay.json() as any).replay).toBe(true);
+    expect(restarts).toEqual(["usage:codex", "chat:codex", "usage:codex", "chat:codex"]);
+    expect(performance.now() - started).toBeLessThan(2_000);
+    database.close();
+  });
+});

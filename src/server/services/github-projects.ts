@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import type { AppConfig } from "../core/config";
 import type { AppDatabase } from "../core/database";
-import { assertAllowedPath } from "../core/security";
+import { assertAllowedPath, safeBasename } from "../core/security";
 
 export interface GithubRepository {
   id?: string;
@@ -130,6 +130,38 @@ export class GithubProjectService {
     };
   }
 
+  // 선택한 워크스페이스 바로 아래에 새 폴더와 main Git 저장소를 만들고 프로젝트로 등록한다.
+  async createLocal(input: {
+    workspacePath: string;
+    directoryName: string;
+    name?: string;
+    createGithub?: boolean;
+    repository?: string;
+    visibility?: string;
+    description?: string;
+  }): Promise<{ project: ProjectRecord; repository: GithubRepository | null }> {
+    const workspacePath = assertAllowedPath(input.workspacePath, this.config.allowedRoots);
+    if (!fs.statSync(workspacePath).isDirectory()) throw new Error("워크스페이스 경로가 디렉터리가 아닙니다.");
+    const directoryName = safeBasename(input.directoryName);
+    const projectPath = assertAllowedPath(path.join(workspacePath, directoryName), this.config.allowedRoots, false);
+    if (path.dirname(projectPath) !== workspacePath) throw new Error("프로젝트는 선택한 워크스페이스 바로 아래에 생성해야 합니다.");
+    if (fs.existsSync(projectPath)) throw new Error("같은 이름의 파일 또는 폴더가 이미 존재합니다.");
+
+    fs.mkdirSync(projectPath);
+    try {
+      await this.runtime.run("git", ["init", "-b", "main"], projectPath);
+    } catch (error) {
+      // git이 아무 것도 쓰지 못한 경우에만 방금 만든 빈 폴더를 되돌린다. 부분 저장소는 진단을 위해 보존한다.
+      try { fs.rmdirSync(projectPath); } catch { /* 부분 생성된 Git 자료는 보존한다. */ }
+      throw error;
+    }
+
+    const repository = input.createGithub
+      ? await this.createGithubRepository(projectPath, input.repository || directoryName, input.visibility, input.description)
+      : null;
+    return { project: this.saveProject(projectPath, input.name?.trim() || directoryName), repository };
+  }
+
   // GitHub 저장소를 안전한 로컬 경로에 clone하거나 이미 연결된 프로젝트를 재활성화한다.
   async cloneProject(repositoryInput: string, destinationInput?: string): Promise<{ project: ProjectRecord; reused: boolean }> {
     const repository = assertRepositoryName(repositoryInput);
@@ -166,24 +198,29 @@ export class GithubProjectService {
     if (input.createGithub) {
       const existingRemote = await this.gitRemote(actualPath);
       if (existingRemote) throw new Error("이미 origin 원격 저장소가 연결되어 있습니다.");
-      const visibility = ["private", "public", "internal"].includes(input.visibility ?? "") ? input.visibility! : "private";
-      const repositoryName = (input.repository || path.basename(actualPath)).trim();
-      if (!/^(?:[A-Za-z0-9_.-]+\/)?[A-Za-z0-9_.-]+$/.test(repositoryName) || repositoryName.includes("..")) {
-        throw new Error("유효한 GitHub 저장소 이름이 필요합니다.");
-      }
       try {
         await this.runtime.run("git", ["rev-parse", "--is-inside-work-tree"], actualPath);
       } catch {
         await this.runtime.run("git", ["init", "-b", "main"], actualPath);
       }
-      const args = ["repo", "create", repositoryName, "--source", actualPath, "--remote", "origin", `--${visibility}`];
-      if (input.description?.trim()) args.push("--description", input.description.trim().slice(0, 350));
-      await this.runtime.run("gh", args, actualPath);
-      const output = await this.runtime.run("gh", ["repo", "view", "--json", "name,nameWithOwner,url,description,isPrivate,updatedAt,defaultBranchRef"], actualPath);
-      repository = JSON.parse(output) as GithubRepository;
+      repository = await this.createGithubRepository(actualPath, input.repository || path.basename(actualPath), input.visibility, input.description);
     }
     const name = input.name?.trim() || path.basename(actualPath);
     return { project: this.saveProject(actualPath, name), repository };
+  }
+
+  // 검증된 로컬 Git 저장소에서 gh CLI로 원격 저장소를 만들고 origin을 연결한다.
+  private async createGithubRepository(projectPath: string, repositoryInput: string, visibilityInput?: string, description?: string): Promise<GithubRepository> {
+    const visibility = ["private", "public", "internal"].includes(visibilityInput ?? "") ? visibilityInput! : "private";
+    const repositoryName = repositoryInput.trim();
+    if (!/^(?:[A-Za-z0-9_.-]+\/)?[A-Za-z0-9_.-]+$/.test(repositoryName) || repositoryName.includes("..")) {
+      throw new Error("유효한 GitHub 저장소 이름이 필요합니다.");
+    }
+    const args = ["repo", "create", repositoryName, "--source", projectPath, "--remote", "origin", `--${visibility}`];
+    if (description?.trim()) args.push("--description", description.trim().slice(0, 350));
+    await this.runtime.run("gh", args, projectPath);
+    const output = await this.runtime.run("gh", ["repo", "view", "--json", "name,nameWithOwner,url,description,isPrivate,updatedAt,defaultBranchRef"], projectPath);
+    return JSON.parse(output) as GithubRepository;
   }
 
   // 저장소 원격이 같은 기존 프로젝트를 active 여부와 무관하게 찾는다.

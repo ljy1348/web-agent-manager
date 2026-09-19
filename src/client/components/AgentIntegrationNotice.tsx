@@ -4,7 +4,7 @@ import { api } from "../api";
 import type { Json } from "../types";
 
 interface AgentIntegrationStatus {
-  provider: "codex" | "claude";
+  provider: "codex" | "claude" | "grok";
   cliInstalled: boolean;
   version: string | null;
   skillsInstalled: boolean;
@@ -12,7 +12,7 @@ interface AgentIntegrationStatus {
   ready: boolean;
 }
 
-const PROVIDER_LABELS = { codex: "Codex", claude: "Claude" } as const;
+const PROVIDER_LABELS = { codex: "Codex", claude: "Claude", grok: "Grok" } as const;
 
 // 서버 시작 시 실패한 Codex·Claude 연동에 관리자 연결 버튼을 제공한다.
 export function AgentIntegrationNotice({ user }: { user: Json }): React.ReactElement | null {

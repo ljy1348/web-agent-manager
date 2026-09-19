@@ -149,4 +149,41 @@ describe("GitHub 프로젝트 서비스", () => {
     expect(fixture.calls).toContainEqual({ command: "git", args: ["init", "-b", "main"], cwd: projectPath });
     expect(fixture.calls).toContainEqual({ command: "gh", args: ["repo", "create", "owner/local", "--source", projectPath, "--remote", "origin", "--private", "--description", "로컬 프로젝트"], cwd: projectPath });
   });
+
+  it("워크스페이스 아래에 새 폴더와 main Git 저장소를 만든다", async () => {
+    const fixture = createFixture();
+
+    const result = await fixture.service.createLocal({ workspacePath: fixture.projectsDir, directoryName: "study", name: "스터디" });
+
+    const projectPath = path.join(fixture.projectsDir, "study");
+    expect(fs.statSync(projectPath).isDirectory()).toBe(true);
+    expect(result.project).toMatchObject({ name: "스터디", path: projectPath });
+    expect(result.repository).toBeNull();
+    expect(fixture.calls).toContainEqual({ command: "git", args: ["init", "-b", "main"], cwd: projectPath });
+  });
+
+  it("새 프로젝트를 공개 GitHub 저장소와 함께 만들고 origin을 연결한다", async () => {
+    const fixture = createFixture();
+
+    const result = await fixture.service.createLocal({
+      workspacePath: fixture.projectsDir,
+      directoryName: "public-study",
+      createGithub: true,
+      repository: "owner/public-study",
+      visibility: "public",
+    });
+
+    const projectPath = path.join(fixture.projectsDir, "public-study");
+    expect(result.repository?.nameWithOwner).toBe("owner/local");
+    expect(fixture.calls).toContainEqual({ command: "gh", args: ["repo", "create", "owner/public-study", "--source", projectPath, "--remote", "origin", "--public"], cwd: projectPath });
+  });
+
+  it("새 프로젝트 폴더명으로 경로 이동과 기존 항목 덮어쓰기를 거부한다", async () => {
+    const fixture = createFixture();
+    fs.mkdirSync(path.join(fixture.projectsDir, "existing"));
+
+    await expect(fixture.service.createLocal({ workspacePath: fixture.projectsDir, directoryName: "../escape" })).rejects.toThrow("유효하지 않은 파일명");
+    await expect(fixture.service.createLocal({ workspacePath: fixture.projectsDir, directoryName: "existing" })).rejects.toThrow("이미 존재합니다");
+    expect(fs.existsSync(path.join(fixture.root, "escape"))).toBe(false);
+  });
 });

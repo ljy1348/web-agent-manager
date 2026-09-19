@@ -3,9 +3,9 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import type { AppConfig } from "../core/config";
 import type { AppDatabase } from "../core/database";
-import { globalAgentSkillsInstalled, installGlobalAgentSkills, type SkillInstallResult } from "./agent-skill-installer";
+import { globalAgentSkillsInstalled, installGlobalAgentSkills, type AgentSkillProvider, type SkillInstallResult } from "./agent-skill-installer";
 
-export type AgentIntegrationProvider = "codex" | "claude";
+export type AgentIntegrationProvider = AgentSkillProvider;
 
 interface CommandResult {
   status: number | null;
@@ -68,14 +68,53 @@ const DEFAULT_RUNTIME: AgentIntegrationRuntime = { findExecutable, run: runComma
 
 const MCP_SERVER_NAME = "web-agent-manager";
 const LEGACY_MCP_SERVER_NAME = "myagent";
-const PROVIDERS: AgentIntegrationProvider[] = ["codex", "claude"];
+const PROVIDERS: AgentIntegrationProvider[] = ["codex", "claude", "grok"];
+
+// 연동 API 경계에서 알 수 없는 공급자 문자열을 걸러낸다.
+export function isAgentIntegrationProvider(value: unknown): value is AgentIntegrationProvider {
+  return typeof value === "string" && (PROVIDERS as string[]).includes(value);
+}
+
+// 공급자마다 MCP 하위 명령 표면이 달라 확인·삭제·추가 argv를 한곳에서 만든다(실측 기준:
+// Codex `mcp get --json`, Claude `mcp get`, Grok은 `mcp get`이 없어 `mcp list`).
+function mcpCheckArgs(provider: AgentIntegrationProvider): string[] {
+  if (provider === "codex") return ["mcp", "get", MCP_SERVER_NAME, "--json"];
+  if (provider === "grok") return ["mcp", "list", "--json"];
+  return ["mcp", "get", MCP_SERVER_NAME];
+}
+
+// Grok `mcp list --json`은 `[{ name, command, url, enabled, scope }]`를 준다. 출력 전체에서 이름을
+// 부분 문자열로 찾으면 다른 서버의 실행 경로에 같은 문자열이 들어 있을 때 연동됐다고 오판하므로
+// (실측: `grok mcp add other -- /tmp/web-agent-manager-agent.js`만 있어도 참이 된다) name을 정확히 비교한다.
+function grokMcpInstalled(stdout: string): boolean {
+  try {
+    const parsed: unknown = JSON.parse(stdout);
+    return Array.isArray(parsed) && parsed.some((entry) => {
+      const server = entry && typeof entry === "object" ? entry as Record<string, unknown> : null;
+      return server?.name === MCP_SERVER_NAME;
+    });
+  } catch {
+    return false;
+  }
+}
+
+// Codex만 scope 인자가 없고 Claude·Grok은 사용자 범위를 명시해야 한다.
+function mcpRemoveArgs(provider: AgentIntegrationProvider, serverName: string): string[] {
+  return provider === "codex" ? ["mcp", "remove", serverName] : ["mcp", "remove", "--scope", "user", serverName];
+}
+
+// stdio 실행 명령과 소켓 환경변수를 공급자 문법에 맞춰 붙인다(Codex는 `--env`, 나머지는 `-e`).
+function mcpAddArgs(provider: AgentIntegrationProvider, socketVariable: string, launch: { command: string; args: string[] }): string[] {
+  if (provider === "codex") return ["mcp", "add", MCP_SERVER_NAME, "--env", socketVariable, "--", launch.command, ...launch.args];
+  return ["mcp", "add", "--scope", "user", MCP_SERVER_NAME, "-e", socketVariable, "--", launch.command, ...launch.args];
+}
 
 // 아직 확인하지 않은 공급자의 기본 표시 상태를 만든다.
 function emptyStatus(provider: AgentIntegrationProvider): AgentIntegrationStatus {
   return { provider, cliInstalled: false, cliPath: null, version: null, skillsInstalled: false, mcpInstalled: false, ready: false };
 }
 
-// 설치 시점이 다른 Codex·Claude의 글로벌 스킬과 web-agent-manager MCP 연결 상태를 감지·설치한다.
+// 설치 시점이 다른 Codex·Claude·Grok의 글로벌 스킬과 web-agent-manager MCP 연결 상태를 감지·설치한다.
 export class AgentIntegrationManager {
   private readonly statuses = new Map<AgentIntegrationProvider, AgentIntegrationStatus>(
     PROVIDERS.map((provider) => [provider, emptyStatus(provider)]),
@@ -94,7 +133,7 @@ export class AgentIntegrationManager {
     return this.initialization;
   }
 
-  // 두 공급자의 시작 시점 확인 결과를 반환하고 CLI를 다시 실행하지 않는다.
+  // 각 공급자의 시작 시점 확인 결과를 반환하고 CLI를 다시 실행하지 않는다.
   async status(): Promise<{ integrations: AgentIntegrationStatus[] }> {
     await this.initialize();
     return { integrations: PROVIDERS.map((provider) => this.statuses.get(provider) ?? emptyStatus(provider)) };
@@ -131,11 +170,11 @@ export class AgentIntegrationManager {
     if (!executable) {
       return { provider, cliInstalled: false, cliPath: null, version: null, skillsInstalled, mcpInstalled: false, ready: false };
     }
-    const mcpResult = await this.runtime.run(
-      executable,
-      provider === "codex" ? ["mcp", "get", MCP_SERVER_NAME, "--json"] : ["mcp", "get", MCP_SERVER_NAME],
-    );
-    const mcpInstalled = mcpResult.status === 0;
+    const mcpResult = await this.runtime.run(executable, mcpCheckArgs(provider));
+    // Grok에는 `mcp get`이 없어 `mcp list`로 확인하는데, 이 명령은 서버가 하나도 없어도 0으로 끝나므로
+    // 종료 코드만 보면 항상 설치된 것처럼 보인다. 목록에서 이름이 정확히 일치하는지까지 확인한다.
+    const mcpInstalled = mcpResult.status === 0
+      && (provider !== "grok" || grokMcpInstalled(mcpResult.stdout));
     return {
       provider,
       cliInstalled: true,
@@ -174,16 +213,10 @@ export class AgentIntegrationManager {
     }
     const launch = this.mcpLaunch();
     for (const serverName of [MCP_SERVER_NAME, LEGACY_MCP_SERVER_NAME]) {
-      const removeArgs = provider === "codex"
-        ? ["mcp", "remove", serverName]
-        : ["mcp", "remove", "--scope", "user", serverName];
-      await this.runtime.run(executable, removeArgs);
+      await this.runtime.run(executable, mcpRemoveArgs(provider, serverName));
     }
     const socketVariable = `WEB_AGENT_MANAGER_BRIDGE_SOCKET=${path.join(this.config.dataDir, "web-agent-manager-agent.sock")}`;
-    const addArgs = provider === "codex"
-      ? ["mcp", "add", MCP_SERVER_NAME, "--env", socketVariable, "--", launch.command, ...launch.args]
-      : ["mcp", "add", "--scope", "user", MCP_SERVER_NAME, "-e", socketVariable, "--", launch.command, ...launch.args];
-    const result = await this.runtime.run(executable, addArgs);
+    const result = await this.runtime.run(executable, mcpAddArgs(provider, socketVariable, launch));
     if (result.status !== 0) throw new Error((result.stderr || result.stdout || "MCP 설치에 실패했습니다.").trim());
     const integration = await this.inspectProvider(provider);
     this.statuses.set(provider, integration);

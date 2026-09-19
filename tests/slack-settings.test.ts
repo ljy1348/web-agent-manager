@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { loadConfig } from "../src/server/core/config";
 import { openDatabase } from "../src/server/core/database";
 import { SlackNotifier } from "../src/server/services/slack";
@@ -37,5 +37,18 @@ describe("Slack 알림 설정", () => {
     slack.updateSettings("xoxb-real-token", "C12345");
     slack.updateSettings("", "C67890");
     expect(slack.settingsForAdmin()).toEqual({ botTokenConfigured: true, channelId: "C67890" });
+  });
+
+  it("Slack 초기화 알림에도 창별 제목과 본문을 함께 보낸다", async () => {
+    const database = createTestDatabase();
+    const slack = new SlackNotifier(loadConfig(), database);
+    slack.updateSettings("xoxb-real-token", "C12345");
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ ok: true, ts: "1.0" }), { status: 200 }));
+
+    await slack.notify("evt-five-hour", "usage_session_reset", "Codex 5시간 사용량 초기화가 확인되었습니다.", { title: "Codex 5시간 사용량 초기화" });
+
+    const body = JSON.parse(String(fetchSpy.mock.calls[0]?.[1]?.body));
+    expect(body.text).toBe("*Codex 5시간 사용량 초기화*\nCodex 5시간 사용량 초기화가 확인되었습니다.");
+    fetchSpy.mockRestore();
   });
 });

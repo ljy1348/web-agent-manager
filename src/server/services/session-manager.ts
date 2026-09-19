@@ -1,13 +1,17 @@
 import { spawnSync } from "node:child_process";
+import crypto from "node:crypto";
+import fs from "node:fs";
 import * as pty from "node-pty";
 import type { IPty } from "node-pty";
 import type { AppDatabase } from "../core/database";
-import type { ProviderAdapter, TmuxIO } from "../providers/provider";
+import type { ProviderAdapter, ProviderLaunch, TmuxIO } from "../providers/provider";
 import type { AuthUser, ChatRecord, Provider } from "../../shared/types";
 import type { RealtimeHub } from "./realtime";
 import type { ApprovalService } from "./approval";
 import type { Notifier } from "./notifier";
 import type { AgentAccountService } from "./agent-accounts";
+import type { ProviderRolloutService } from "./provider-rollout";
+import type { CredentialVault } from "./credential-vault";
 import { writeAudit } from "../core/audit";
 import { stripAnsi } from "../core/security";
 import { setChatBusy } from "../core/chat-busy";
@@ -17,6 +21,9 @@ import { parseResetTime } from "./rate-limit-resume";
 import { TerminalScreen } from "./terminal-screen";
 import { prepareChatPrompt } from "./chat-prompt";
 import { promptCharacterCount } from "../../shared/chat-prompt";
+import { PromptDeliveryUnknownError } from "./prompt-delivery";
+import { CodexStructuredPreDeliveryError, type CodexStructuredTransportService } from "./codex-structured-transport";
+import { projectProfileLaunch } from "./project-profile-launch";
 
 // 가로 열 수를 바꾸면 이미 찍힌 tmux 스크롤백이 새 폭으로 다시 감기지 않아 한글·긴 줄이 깨질 수 있다.
 // 따라서 256열은 고정하고, 줄바꿈에 영향을 주지 않는 세로 행 수만 웹 패널 높이에 맞춰 동기화한다.
@@ -44,10 +51,68 @@ interface ManagedTerminal {
 const TERMINAL_SCROLL_MAX_LINES = 200;
 const TERMINAL_STATE_SCAN_THROTTLE_MS = 500;
 const TERMINAL_STATE_IDLE_POLL_MS = 5_000;
+// 웹 질문을 막 제출한 직후 CLI가 끝나면 history-sync의 다음 전체 발견(30초)보다 종료 이벤트가 먼저
+// 올 수 있다. 그 채팅만 한 주기 기다렸다가 실제 기록이 붙었는지 재확인한다.
+const EMPTY_CHAT_ACTIVITY_GRACE_MS = 35_000;
+// 같은 판정 결과에서 스피너·경과 시간만 바뀌는 화면은 이 간격보다 자주 상세 로그를 남기지 않는다.
+// debug 운영에서 0.5초마다 화면 전체가 직렬화되어 서버 힙과 로그 파일이 함께 커진 실측을 막는다.
+const TERMINAL_STATE_LOG_INTERVAL_MS = 30_000;
 
 interface ChatWithProject extends ChatRecord {
   project_path: string;
   workspace_path: string;
+  preset_config_json: string | null;
+}
+
+interface PromptHistoryBaseline {
+  file: string;
+  userMessageIds: Set<string>;
+  observedMtimeMs: number;
+  observedSize: number;
+}
+
+export interface PromptDispatchOptions {
+  // 원장에 접수된 명령은 확인 실패 시 초안을 지우거나 Enter를 반복하지 않는다. 외부 CLI가 멱등 키를
+  // 받지 않으므로 불확실한 전달을 재시도하는 대신 상위 서비스가 delivery_unknown으로 보존한다.
+  trackedDelivery?: boolean;
+  // task ledger command ID를 app-server clientUserMessageId와 영속 ACK에 그대로 결합한다.
+  commandId?: string;
+}
+
+export interface PromptDeliveryContext {
+  adapter: "tui" | "codex_app_server";
+  evidenceType: "tui_submission_confirmation" | "provider_turn_ack";
+  supportsQueue: boolean;
+}
+
+// 사용자가 터미널 모드에서 수동 보존하는 단일 시점의 화면·판정 증거다. 화면과 판정을 따로 읽으면
+// 그 사이 TUI가 바뀌어 다시 모순이 생길 수 있으므로 같은 snapshot 문자열에서 모두 계산한다.
+export interface TerminalDiagnosticSnapshot {
+  schemaVersion: 1;
+  capturedAt: string;
+  serverPid: number;
+  chat: {
+    id: number;
+    projectId: number;
+    provider: Provider;
+    title: string;
+    status: ChatRecord["status"];
+    busy: boolean;
+    lastError: string | null;
+    tmuxName: string;
+    providerSessionId: string | null;
+    historyFile: string | null;
+  };
+  terminal: { attached: true; rows: number; copyMode: boolean };
+  classification: {
+    isBusy: boolean;
+    isReady: boolean;
+    promptDraft: string | null;
+    approval: { requestType: string; summary: string } | null;
+    permissionMode: string | null;
+  };
+  pendingApprovals: Array<{ id: string; requestType: string; status: string; createdAt: string }>;
+  screen: string;
 }
 
 type ApprovalDecision = "accept" | "acceptForSession" | "decline" | "cancel";
@@ -58,9 +123,24 @@ function hasPromptBox(adapter: ProviderAdapter, screen: string): boolean {
   return adapter.readPromptDraft ? adapter.readPromptDraft(screen) !== null : false;
 }
 
-// tmux가 지정 세션을 보유하고 있는지 확인한다.
+// 기록 파일의 변경 여부를 비교할 수 있게 수정 시각·크기를 한 문자열로 돌려준다. 파일이 없으면 null.
+function historyFileState(file: string): string | null {
+  try {
+    const stat = fs.statSync(file);
+    return `${stat.mtimeMs}:${stat.size}`;
+  } catch {
+    return null;
+  }
+}
+
+// tmux는 기본이 prefix 매칭이라 chat_1이 chat_10을 칠 수 있어, 정확 이름만 고른다.
+function exactTmuxTarget(name: string): string {
+  return `=${name}`;
+}
+
+// tmux가 지정 세션을 보유하고 있는지 확인한다. prefix 매칭으로 다른 채팅을 건드리지 않게 정확 이름을 쓴다.
 function tmuxExists(name: string): boolean {
-  return spawnSync("tmux", ["has-session", "-t", name], { stdio: "ignore" }).status === 0;
+  return spawnSync("tmux", ["has-session", "-t", exactTmuxTarget(name)], { stdio: "ignore" }).status === 0;
 }
 
 // 채팅별 tmux와 PTY 연결을 생성·복구·종료한다.
@@ -68,23 +148,39 @@ function tmuxExists(name: string): boolean {
 const stateLog = createLogger("state-check");
 
 export class SessionManager {
-  // 같은 화면·같은 판정이 1초 폴링마다 반복 기록되지 않도록 판정 종류별 마지막 로그를 기억한다.
-  private lastStateLog = new Map<string, string>();
+  // 원문 화면을 보관하면 채팅 수·화면 크기만큼 힙을 계속 붙드므로 짧은 해시와 판정만 기억한다.
+  private lastStateLog = new Map<string, { fingerprint: string; result: string; loggedAt: number }>();
 
   // 상태 판정의 실제 입력(터미널 스냅샷)과 출력(판정 결과)을 그대로 로그에 남긴다.
   private logStateCheck(kind: string, chatId: number, snapshot: string, result: unknown): void {
     const key = `${kind}:${chatId}`;
-    const fingerprint = `${snapshot}\u0000${JSON.stringify(result) ?? ""}`;
-    if (this.lastStateLog.get(key) === fingerprint) return;
-    this.lastStateLog.set(key, fingerprint);
+    const resultText = JSON.stringify(result) ?? "";
+    const fingerprint = crypto.createHash("sha256").update(snapshot).update("\u0000").update(resultText).digest("base64url");
+    const previous = this.lastStateLog.get(key);
+    if (previous?.fingerprint === fingerprint) return;
+    const now = Date.now();
+    if (previous?.result === resultText && now - previous.loggedAt < TERMINAL_STATE_LOG_INTERVAL_MS) return;
+    this.lastStateLog.set(key, { fingerprint, result: resultText, loggedAt: now });
     stateLog.debug(kind, { chatId, out: result, in: snapshot });
+  }
+
+  // 종료된 채팅의 판정·프롬프트 캐시를 남기지 않는다. 서버가 오래 떠 있어도 과거 채팅 수에 비례해
+  // 메모리가 늘어나지 않아야 한다.
+  private clearChatCaches(chatId: number): void {
+    for (const key of this.lastStateLog.keys()) if (key.endsWith(`:${chatId}`)) this.lastStateLog.delete(key);
+    this.inputQueues.delete(chatId);
+    this.lastPromptText.delete(chatId);
+    this.promptSubmittedAt.delete(chatId);
   }
 
   private readonly terminals = new Map<number, ManagedTerminal>();
   private readonly adapters: Map<Provider, ProviderAdapter>;
   private readonly inputQueues = new Map<number, Promise<unknown>>();
+  private readonly emptyExitCleanupTimers = new Map<number, NodeJS.Timeout>();
   // 중단 시 Claude가 자기 입력창에 복구해두는 텍스트를 정확한 길이만큼 Backspace로 지우기 위해 기억해둔다.
   private readonly lastPromptText = new Map<number, string>();
+  // 채팅별 마지막 UserPromptSubmit 훅 도착 시각. 전송 확인의 제출 증거다(#98).
+  private readonly promptSubmittedAt = new Map<number, number>();
 
   constructor(
     private readonly database: AppDatabase,
@@ -93,6 +189,9 @@ export class SessionManager {
     private readonly approvals: ApprovalService,
     private readonly notifications: Notifier,
     private readonly accounts: AgentAccountService,
+    private readonly providerRollouts?: Pick<ProviderRolloutService, "assignNewChat" | "resolveLaunch" | "observeChatStatus">,
+    private readonly credentialVault?: Pick<CredentialVault, "withMcpEnvironment">,
+    private readonly structuredTransport?: Pick<CodexStructuredTransportService, "claimOrOwn" | "owns" | "start" | "send" | "interrupt" | "stop" | "close" | "state">,
   ) {
     this.adapters = new Map(adapters.map((adapter) => [adapter.id, adapter]));
     approvals.setTerminalDecisionHandler((chatId, decision, requestType) => this.applyTerminalApproval(chatId, decision, requestType));
@@ -113,14 +212,32 @@ export class SessionManager {
       WHERE c.status IN ('starting', 'running', 'resuming')
     `).all() as ChatWithProject[];
     for (const chat of chats) {
+      if (this.structuredTransport?.claimOrOwn(chat.id)) {
+        void this.structuredTransport.start(chat.id).catch((error) => {
+          if (error instanceof CodexStructuredPreDeliveryError) this.start(chat.id, Boolean(chat.provider_session_id));
+        });
+        continue;
+      }
       if (tmuxExists(chat.tmux_name)) this.attach(chat);
       else this.setStatus(chat.id, "stopped", null);
     }
   }
 
-  // 새 채팅 또는 저장된 공급자 세션을 tmux에서 시작한다.
+  // 새 채팅 또는 저장된 공급자 세션을 tmux에서 시작한다. 예약 ID만 있고 실제 기록이 없는 빈 채팅은
+  // resume하면 CLI가 즉시 종료되므로, 기록을 검증한 뒤 새 세션으로 안전하게 되돌린다.
   start(chatId: number, resume = false): void {
-    const chat = this.getChat(chatId);
+    let chat = this.getChat(chatId);
+    if (this.structuredTransport?.claimOrOwn(chatId)) {
+      const structuredState = this.structuredTransport.state(chatId).state;
+      if (["delivery_unknown", "error"].includes(structuredState)) {
+        throw new Error("Codex 구조화 전달 상태를 먼저 확인해야 세션을 시작할 수 있습니다.");
+      }
+      void this.structuredTransport.start(chatId).catch((error) => {
+        // thread 연결 전 실패는 prompt가 전달될 수 없는 구간이라 TUI로 한 번 안전하게 되돌린다.
+        if (error instanceof CodexStructuredPreDeliveryError) this.start(chatId, Boolean(this.getChat(chatId).provider_session_id));
+      });
+      return;
+    }
     if (this.terminals.has(chatId)) return;
     if (tmuxExists(chat.tmux_name)) {
       this.attach(chat);
@@ -128,8 +245,28 @@ export class SessionManager {
     }
     const adapter = this.adapters.get(chat.provider);
     if (!adapter) throw new Error("지원하지 않는 공급자입니다.");
-    if (resume && !chat.provider_session_id) throw new Error("재개할 공급자 세션 ID가 없습니다.");
-    const launch = adapter.createLaunch(chat.workspace_path, resume ? chat.provider_session_id! : undefined);
+    let shouldResume = resume;
+    if (shouldResume && !this.hasResumableHistory(chat, adapter)) {
+      // history_file이 없거나 사라졌거나 내부 session ID가 다르면 이 ID로 resume할 근거가 없다.
+      // 파일 자체는 삭제하지 않고 DB 연결만 끊어, 빈 채팅을 새 세션으로 다시 사용할 수 있게 한다.
+      this.database.prepare("UPDATE chats SET provider_session_id = NULL, history_file = NULL WHERE id = ?").run(chatId);
+      chat = this.getChat(chatId);
+      shouldResume = false;
+    }
+    if (shouldResume && !chat.provider_session_id) throw new Error("재개할 공급자 세션 ID가 없습니다.");
+    if (!shouldResume) this.providerRollouts?.assignNewChat(chat.provider, chat.id);
+    const newSessionId = this.reserveNewSessionId(chat, adapter, shouldResume);
+    let launch: ProviderLaunch;
+    try {
+      const profile = projectProfileLaunch(chat.preset_config_json, chat.workspace_path);
+      const baseLaunch = adapter.createLaunch(chat.workspace_path, shouldResume ? chat.provider_session_id! : undefined, newSessionId, profile);
+      launch = this.providerRollouts?.resolveLaunch(chat.id, chat.provider, baseLaunch) ?? baseLaunch;
+    } catch (error) {
+      if (newSessionId) this.releaseUnusedSessionId(chatId, newSessionId);
+      const message = error instanceof Error ? error.message : "rollout CLI를 확인하지 못했습니다.";
+      this.setStatus(chatId, "error", message);
+      throw error;
+    }
     // -x/-y를 안 주면 tmux가 클라이언트 없는 세션을 자체 기본 크기(보통 80x24)로 만든다. Claude는
     // --ax-screen-reader 모드에서 시작 시점의 폭으로 이미 그려둔 과거 스크롤백을 나중에 attach()가
     // 120x36으로 리사이즈해도 다시 그리지 않아, 그 사이에 출력된 내용(특히 폭 계산이 더 예민한 한글
@@ -138,13 +275,25 @@ export class SessionManager {
     // 채팅에 할당된 계정의 설정 디렉터리를 환경변수로 실어 보낸다. 환경변수는 tmux 세션을 만드는
     // 이 시점에만 적용되므로, 이미 떠 있는 세션의 계정을 바꾸려면 세션을 종료하고 다시 시작해야 한다.
     const account = this.accounts.resolveForChat(chat.provider, chat.account_id);
-    const launchEnv = { ...(launch.env ?? {}), ...this.accounts.environment(account) };
-    const args = ["new-session", "-d", "-s", chat.tmux_name, "-x", String(DEFAULT_COLS), "-y", String(DEFAULT_ROWS), "-c", chat.workspace_path];
-    for (const [key, value] of Object.entries(launchEnv)) args.push("-e", `${key}=${value}`);
-    args.push("--", launch.command, ...launch.args);
-    this.setStatus(chatId, resume ? "resuming" : "starting", null);
-    const result = spawnSync("tmux", args, { encoding: "utf8", env: { ...process.env, ...launchEnv } });
+    this.setStatus(chatId, shouldResume ? "resuming" : "starting", null);
+    const spawnTerminal = (mcpEnvironment: Record<string, string>) => {
+      const launchEnv = {
+        ...(launch.env ?? {}),
+        ...this.accounts.environment(account),
+        ...mcpEnvironment,
+        // MCP/CLI가 위임 시 부모 채팅을 알 수 있게 채팅 번호를 상속한다.
+        WEB_AGENT_MANAGER_CHAT_ID: String(chat.id),
+      };
+      const args = ["new-session", "-d", "-s", chat.tmux_name, "-x", String(DEFAULT_COLS), "-y", String(DEFAULT_ROWS), "-c", chat.workspace_path];
+      for (const [key, value] of Object.entries(launchEnv)) args.push("-e", `${key}=${value}`);
+      args.push("--", launch.command, ...launch.args);
+      return spawnSync("tmux", args, { encoding: "utf8", env: { ...process.env, ...launchEnv } });
+    };
+    const result = this.credentialVault
+      ? this.credentialVault.withMcpEnvironment(chat.provider, chat.project_id, `chat:${chat.id}:launch`, spawnTerminal)
+      : spawnTerminal({});
     if (result.status !== 0) {
+      if (newSessionId) this.releaseUnusedSessionId(chatId, newSessionId);
       const message = result.stderr?.trim() || "tmux 세션을 시작하지 못했습니다.";
       this.setStatus(chatId, "error", message);
       throw new Error(message);
@@ -152,17 +301,121 @@ export class SessionManager {
     // tmux 상태바(맨 아래 "[세션명:창이름*]" 줄)는 절대 행 번호로 그려지는데, 웹에서는 이미 그 정보를
     // 채팅 헤더로 따로 보여주고 있어 불필요하다. 꺼두지 않으면 클라이언트가 이 상태바의 절대 위치
     // 갱신을 자기 뷰포트 기준으로 잘못 해석해 맨 아래 줄이 계속 새로 쌓이는 것처럼 보이는 문제가 있었다.
-    spawnSync("tmux", ["set-option", "-t", chat.tmux_name, "status", "off"]);
+    spawnSync("tmux", ["set-option", "-t", exactTmuxTarget(chat.tmux_name), "status", "off"]);
     this.attach(this.getChat(chatId));
+  }
+
+  // 공급자 ID 문자열만 남은 상태를 실제 대화로 오인하지 않도록 파일과 내부 session ID까지 확인한다.
+  private hasResumableHistory(chat: ChatWithProject, adapter: ProviderAdapter): boolean {
+    if (!chat.provider_session_id || !chat.history_file) return false;
+    try {
+      if (!fs.statSync(chat.history_file).isFile()) return false;
+      return adapter.parseHistoryFile(chat.history_file)?.sessionId === chat.provider_session_id;
+    } catch {
+      return false;
+    }
+  }
+
+  // 새 대화에 `--session-id`를 쓸 수 있으면 UUID를 미리 정해 기록 동기화가 같은 채팅에 붙게 한다.
+  private reserveNewSessionId(chat: ChatWithProject, adapter: ProviderAdapter, resume: boolean): string | undefined {
+    if (resume || !adapter.supportsNewSessionId) return undefined;
+    if (chat.provider_session_id) return chat.provider_session_id;
+    const sessionId = crypto.randomUUID();
+    this.database.prepare("UPDATE chats SET provider_session_id = ? WHERE id = ? AND provider_session_id IS NULL").run(sessionId, chat.id);
+    return sessionId;
+  }
+
+  // tmux 생성에 실패하면 아직 기록이 없는 예약 ID를 지워 다음 시작이 새 대화로 가게 한다.
+  private releaseUnusedSessionId(chatId: number, sessionId: string): void {
+    this.database.prepare("UPDATE chats SET provider_session_id = NULL WHERE id = ? AND provider_session_id = ? AND history_file IS NULL").run(chatId, sessionId);
+  }
+
+  // 신규 session ID를 미리 정할 수 없는 채팅의 첫 프롬프트를 기록 동기화기와 공유한다. 제출 실패 시
+  // 이 행만 지우고, 성공하면 HistorySynchronizer가 실제 첫 user 메시지와 맞춘 뒤 모두 소비한다.
+  private createHistoryClaim(chatId: number, prompt: string): number | null {
+    const chat = this.getChat(chatId);
+    if (chat.history_file) return null;
+    const result = this.database.prepare(`
+      INSERT INTO chat_history_claims(chat_id, prompt, created_at) VALUES (?, ?, ?)
+    `).run(chatId, prompt.replace(/\r\n/g, "\n").trim(), new Date().toISOString());
+    return Number(result.lastInsertRowid);
+  }
+
+  private releaseHistoryClaim(claimId: number | null): void {
+    if (claimId !== null) this.database.prepare("DELETE FROM chat_history_claims WHERE id = ?").run(claimId);
+  }
+
+  // 터미널이 사라진 뒤에도 실제 사용자·assistant 메시지가 하나라도 있으면 채팅을 보존한다. 공급자가
+  // 예약 UUID나 /exit 같은 로컬 명령만 기록한 경우는 대화가 아니므로 목록 row만 제거한다. JSONL은
+  // 사용자가 명시적으로 삭제한 것이 아니므로 건드리지 않고 history-sync의 숨김 기록 정책에 맡긴다.
+  private removeEmptyChatAfterTerminalExit(chatId: number, allowActivityGrace = true): boolean {
+    const row = this.database.prepare(`
+      SELECT provider, provider_session_id AS providerSessionId, history_file AS historyFile,
+        last_user_activity_at AS lastUserActivityAt
+      FROM chats WHERE id = ?
+    `).get(chatId) as {
+      provider: Provider;
+      providerSessionId: string | null;
+      historyFile: string | null;
+      lastUserActivityAt: string | null;
+    } | undefined;
+    if (!row) return false;
+
+    if (row.historyFile) {
+      try {
+        const session = this.getAdapter(row.provider).parseHistoryFile(row.historyFile);
+        // 해석할 수 없는 파일은 데이터 유실 가능성이 있으므로 자동 삭제하지 않는다.
+        if (!session) return false;
+        if (session.messages.some((message) => message.role === "user" || message.role === "assistant")) return false;
+      } catch {
+        return false;
+      }
+    } else if (allowActivityGrace) {
+      const hasClaim = !!this.database.prepare("SELECT 1 FROM chat_history_claims WHERE chat_id = ? LIMIT 1").get(chatId);
+      if (hasClaim || row.lastUserActivityAt) {
+        if (!this.emptyExitCleanupTimers.has(chatId)) {
+          const timer = setTimeout(() => {
+            this.emptyExitCleanupTimers.delete(chatId);
+            this.removeEmptyChatAfterTerminalExit(chatId, false);
+          }, EMPTY_CHAT_ACTIVITY_GRACE_MS);
+          timer.unref();
+          this.emptyExitCleanupTimers.set(chatId, timer);
+        }
+        return false;
+      }
+    }
+
+    const removed = this.database.prepare("DELETE FROM chats WHERE id = ?").run(chatId).changes > 0;
+    if (!removed) return false;
+    const timer = this.emptyExitCleanupTimers.get(chatId);
+    if (timer) clearTimeout(timer);
+    this.emptyExitCleanupTimers.delete(chatId);
+    writeAudit(this.database, null, "terminal.empty_chat_delete", "chat", chatId, {
+      provider: row.provider,
+      providerSessionId: row.providerSessionId,
+    });
+    this.realtime.broadcast("chat_deleted", { chatId, reason: "empty_terminal_exit" });
+    return true;
   }
 
   // 한 채팅의 질문을 직렬화해 실행 중 또는 재개된 PTY에 전달한다. user가 null이면 rate-limit-resume
   // 같은 시스템 자동화가 보낸 것으로 보고 감사 로그의 행위자를 비워둔다.
-  async sendPrompt(chatId: number, text: string, user: AuthUser | null): Promise<string> {
+  async sendPrompt(chatId: number, text: string, user: AuthUser | null, options: PromptDispatchOptions = {}): Promise<string> {
+    // CLI 시작·큐 대기·실제 제출 성공과 무관하게, 사람이 웹에서 보내기를 누른 순간부터 새 유휴
+    // 시간으로 센다. 시스템의 rate-limit 재개 입력은 사용자 활동으로 위장하지 않는다.
+    if (user) {
+      this.database.prepare("UPDATE chats SET last_user_activity_at = CURRENT_TIMESTAMP WHERE id = ?").run(chatId);
+    }
     const previous = this.inputQueues.get(chatId) ?? Promise.resolve();
-    const queued = previous.then(() => this.sendPromptNow(chatId, text, user));
+    const queued = previous.then(() => this.sendPromptNow(chatId, text, user, options));
     this.inputQueues.set(chatId, queued.catch(() => undefined));
     return await queued;
+  }
+
+  deliveryContext(chatId: number): PromptDeliveryContext {
+    return this.structuredTransport?.owns(chatId)
+      ? { adapter: "codex_app_server", evidenceType: "provider_turn_ack", supportsQueue: false }
+      : { adapter: "tui", evidenceType: "tui_submission_confirmation", supportsQueue: true };
   }
 
   // 시스템 자동 입력은 종료된 세션을 되살리지 않고, 실행 중인 실제 터미널이 있을 때만 직렬 전송한다.
@@ -170,14 +423,57 @@ export class SessionManager {
     let sent = false;
     const previous = this.inputQueues.get(chatId) ?? Promise.resolve();
     const queued = previous.then(async () => {
+      // 빈 터미널 종료 정리와 시스템 재개 타이머가 겹치면 대상 row가 이미 사라질 수 있다.
+      if (!this.database.prepare("SELECT 1 FROM chats WHERE id = ?").get(chatId)) return;
       const chat = this.getChat(chatId);
-      if (chat.status !== "running" || chat.busy || !this.terminals.has(chatId)) return;
+      const structured = this.structuredTransport?.owns(chatId) ?? false;
+      if (chat.status !== "running" || chat.busy || (!structured && !this.terminals.has(chatId))) return;
       await this.sendPromptNow(chatId, text, user);
       sent = true;
     });
     this.inputQueues.set(chatId, queued.catch(() => undefined));
     await queued;
     return sent;
+  }
+
+  // 서버 상태 판정이 실제로 본 현재 화면을 상태·승인 판정과 함께 한 번에 캡처한다. 터미널 입력,
+  // copy-mode, DB busy 값은 변경하지 않는 읽기 전용 진단 동작이며 파일 저장은 HTTP 라우터가 담당한다.
+  captureTerminalDiagnostic(chatId: number): TerminalDiagnosticSnapshot {
+    const chat = this.getChat(chatId);
+    const terminal = this.terminals.get(chatId);
+    if (!terminal) throw new Error("실행 중인 터미널이 없어 스냅샷을 찍을 수 없습니다.");
+    const adapter = this.getAdapter(chat.provider);
+    const screen = this.captureSnapshot(chatId);
+    return {
+      schemaVersion: 1,
+      capturedAt: new Date().toISOString(),
+      serverPid: process.pid,
+      chat: {
+        id: chat.id,
+        projectId: chat.project_id,
+        provider: chat.provider,
+        title: chat.title,
+        status: chat.status,
+        busy: Boolean(chat.busy),
+        lastError: chat.last_error,
+        tmuxName: chat.tmux_name,
+        providerSessionId: chat.provider_session_id,
+        historyFile: chat.history_file,
+      },
+      terminal: { attached: true, rows: terminal.rows, copyMode: Boolean(terminal.copyMode) },
+      classification: {
+        isBusy: adapter.isBusy(screen),
+        isReady: adapter.isReady(screen),
+        promptDraft: adapter.readPromptDraft?.(screen) ?? null,
+        approval: adapter.detectApproval(screen),
+        permissionMode: adapter.detectPermissionMode?.(screen) ?? null,
+      },
+      pendingApprovals: this.database.prepare(`
+        SELECT id, request_type AS requestType, status, created_at AS createdAt
+        FROM approvals WHERE chat_id = ? AND status = 'pending' ORDER BY created_at ASC
+      `).all(chatId) as TerminalDiagnosticSnapshot["pendingApprovals"],
+      screen,
+    };
   }
 
   // TUI 조작이 필요한 관리 작업(모델·이름 변경 등) 전에 이미 busy인 채팅은 시작부터 막는다. 안 그러면
@@ -219,6 +515,8 @@ export class SessionManager {
     const trimmed = name.trim();
     if (!trimmed || trimmed.length > 200) throw new Error("이름은 1자 이상 200자 이하여야 합니다.");
     const chat = this.getChat(chatId);
+    const adapter = this.getAdapter(chat.provider);
+    if (!adapter.supportsSessionRename) throw new Error(`${adapter.displayLabel} CLI는 세션 이름 변경을 지원하지 않습니다.`);
     this.assertChatNotBusy(chat, "이름 변경");
     const terminal = await this.waitUntilReady(chatId, chat.provider);
     pastePromptToTmux(terminal.tmuxName, `/rename ${trimmed}`);
@@ -234,6 +532,9 @@ export class SessionManager {
   // 그래서 계정을 옮기면 세션 연결을 끊고 다음 시작은 새 대화로 진행한다.
   assignAccount(chatId: number, accountId: number | null, user: AuthUser): void {
     const chat = this.getChat(chatId);
+    if (this.structuredTransport?.owns(chatId)) {
+      throw new Error("Codex app-server 후보 채팅은 인증 계정을 바꿀 수 없습니다.");
+    }
     if (this.terminals.has(chatId) || tmuxExists(chat.tmux_name)) {
       throw new Error("실행 중인 채팅은 계정을 바꿀 수 없습니다. 먼저 채팅을 종료해주세요.");
     }
@@ -261,13 +562,38 @@ export class SessionManager {
   }
 
   // 종료 상태면 정확한 세션을 재개하고 입력 가능 프롬프트 뒤 질문을 전송한다.
-  private async sendPromptNow(chatId: number, text: string, user: AuthUser | null): Promise<string> {
-    const chat = this.getChat(chatId);
-    const adapter = this.getAdapter(chat.provider);
+  private async sendPromptNow(chatId: number, text: string, user: AuthUser | null, options: PromptDispatchOptions = {}): Promise<string> {
+    let chat = this.getChat(chatId);
+    let adapter = this.getAdapter(chat.provider);
+    if (this.structuredTransport?.owns(chatId)) {
+      const prepared = prepareChatPrompt(chatId, chat.project_path, chat.workspace_path, text);
+      try {
+        const delivered = await this.structuredTransport.send(chatId, options.commandId ?? crypto.randomUUID(), prepared.terminalText);
+        setChatBusy(this.database, this.realtime, chatId, true);
+        writeAudit(this.database, user?.id ?? null, "chat.prompt", "chat", chatId, {
+          length: text.length,
+          deliveredLength: delivered.length,
+          attachmentPath: prepared.attachmentPath,
+          transport: "app_server",
+        });
+        if (user) this.database.prepare("UPDATE chats SET origin = 'user' WHERE id = ? AND origin = 'delegation'").run(chatId);
+        return delivered;
+      } catch (error) {
+        if (!(error instanceof CodexStructuredPreDeliveryError)) throw error;
+        // app-server thread가 생기기 전 실패만 안전하다. 임시 장문 첨부를 정리하고 같은 원문을 TUI
+        // 준비 경로에서 다시 만들며, turn/start 이후 오류는 위에서 절대 이 분기로 들어오지 않는다.
+        prepared.cleanup();
+        if (!this.terminals.has(chatId)) this.start(chatId, Boolean(this.getChat(chatId).provider_session_id));
+        chat = this.getChat(chatId);
+        adapter = this.getAdapter(chat.provider);
+      }
+    }
+    // resume 세션은 화면 busy 신호보다 실제 JSONL user turn을 제출 증거로 삼는다. 시작 이벤트나 과거
+    // 화면 재생만으로 파일이 바뀌어도 기존 user ID 집합과 구분할 수 있게 전송 전에 기준선을 잡는다.
+    const historyBaseline = chat.provider === "codex" ? this.capturePromptHistoryBaseline(chat, adapter) : null;
     const alreadyRunning = this.terminals.has(chatId);
     if (!alreadyRunning) {
-      if (!chat.provider_session_id) throw new Error("세션 ID가 없어 자동 재개할 수 없습니다. 새 채팅을 생성해주세요.");
-      this.start(chatId, true);
+      this.start(chatId, Boolean(chat.provider_session_id));
     }
     // 세션이 이미 떠 있으면 터미널에 직접 타이핑하는 것과 마찬가지로, CLI가 응답을 생성 중이어도
     // 그 입력창에 그대로 큐잉된다(Claude·Codex TUI 둘 다 지원). 여기서까지 idle 프롬프트를
@@ -288,40 +614,66 @@ export class SessionManager {
     if (alreadyRunning && chat.status === "error") this.setStatus(chatId, "running", null);
     const prepared = prepareChatPrompt(chatId, chat.project_path, chat.workspace_path, text);
     const terminalText = prepared.terminalText;
+    const slashCommand = terminalText.trim().startsWith("/");
+    const historyClaimId = slashCommand ? null : this.createHistoryClaim(chatId, terminalText);
     // 작업 중 추가 입력은 TUI 큐에 들어가므로, 중지 후 복구·정리할 원래 실행 질문을 후속 입력으로
     // 덮어쓰지 않는다.
     if (!chat.busy) this.lastPromptText.set(chatId, terminalText);
     // 누군가 웹에서 기록을 위로 올려둔 상태면 붙여넣기·Enter가 copy-mode에 먹히므로 먼저 되돌린다.
     this.leaveCopyMode(terminal);
+    const sentAt = Date.now();
     try {
       this.clearPromptDraft(chatId, adapter, terminal.tmuxName);
       pastePromptToTmux(terminal.tmuxName, terminalText);
+      // 붙여넣기가 입력창에 반영되기 전에 Enter가 가면 TUI가 빠른 입력 중의 Enter로 보고 줄바꿈으로
+      // 처리할 수 있다(#98). 초안이 보일 때까지 짧게 기다린 뒤 안정화 지연을 둔다.
+      if (!slashCommand) await this.waitForPastedDraft(chatId, adapter, 800);
       const pasteDelay = adapter.promptQuirks?.pasteSubmitDelayMs;
       if (pasteDelay) await new Promise((resolve) => setTimeout(resolve, pasteDelay));
       sendTmuxEnter(terminal.tmuxName);
       // Codex는 "/"로 시작하는 입력에 자동완성 목록을 띄우므로, 첫 Enter는 목록 확정이고
       // 실제 실행에는 Enter가 한 번 더 필요하다(stop()의 /exit 처리와 동일한 이유).
       const slashDelay = adapter.promptQuirks?.slashCommandConfirmDelayMs;
-      const slashCommand = terminalText.trim().startsWith("/");
       if (slashDelay && slashCommand) {
         await new Promise((resolve) => setTimeout(resolve, slashDelay));
         sendTmuxEnter(terminal.tmuxName);
       }
-      // 유휴 Codex 일반 프롬프트는 실제 TUI 전환을 확인하고, 여전히 입력 가능하면 Enter를 한 번만 재시도한다.
-      if (!chat.busy && !slashCommand && adapter.promptQuirks?.verifyPromptSubmission) {
-        let submitted = await this.waitForPromptSubmission(chatId, adapter, 900);
+      // 일반 프롬프트는 유휴·작업 중 모두 실제 제출을 확인한다(#98). 작업 중 입력은 TUI 대기열로 들어가
+      // 입력창이 비워지는 것으로 확인한다. 실패는 글이 입력창에 계속 남아 있을 때만 판정한다.
+      if (!slashCommand && adapter.promptQuirks?.verifyPromptSubmission) {
+        const submitted = await this.confirmPromptSubmission(
+          chatId,
+          adapter,
+          terminal.tmuxName,
+          historyBaseline,
+          terminalText,
+          sentAt,
+          chat.history_file ?? null,
+          !options.trackedDelivery,
+        );
         if (!submitted) {
-          sendTmuxEnter(terminal.tmuxName);
-          submitted = await this.waitForPromptSubmission(chatId, adapter, 900);
-        }
-        if (!submitted) {
-          sendTmuxBackspace(terminal.tmuxName, promptCharacterCount(terminalText));
+          if (options.trackedDelivery) {
+            throw new PromptDeliveryUnknownError(
+              `${adapter.displayLabel}에 메시지 입력을 시도했지만 제출 여부를 확인하지 못했습니다. 자동 재전송하지 않고 확인 필요 상태로 보존했습니다.`,
+              crypto.createHash("sha256").update(terminalText.replace(/\r\n/g, "\n").trim()).digest("hex"),
+            );
+          }
+          const draft = adapter.readPromptDraft?.(this.captureSnapshot(chatId));
+          sendTmuxBackspace(terminal.tmuxName, draft ? promptCharacterCount(draft) : promptCharacterCount(terminalText));
           throw new Error(`${adapter.displayLabel}가 메시지 제출을 확인하지 못했습니다. 입력 내용을 복구했으니 다시 시도해주세요.`);
         }
       }
     } catch (error) {
-      prepared.cleanup();
-      setChatBusy(this.database, this.realtime, chatId, false);
+      const deliveryUnknown = error instanceof PromptDeliveryUnknownError;
+      // 불확실 전달은 뒤늦은 JSONL·훅과 대조할 기준선과 장문 첨부를 보존한다. 일반적인 전송 전
+      // 거부·실패만 이전처럼 임시 claim/첨부를 정리한다.
+      if (!deliveryUnknown) {
+        this.releaseHistoryClaim(historyClaimId);
+        prepared.cleanup();
+      }
+      // 전송 전부터 작업 중이던 채팅은 후속 입력 하나가 실패해도 진행 중인 턴은 그대로다. 예전에는 무조건
+      // busy를 꺼서 작업 중인 채팅이 "대기중"으로 보였다(#103).
+      if (!deliveryUnknown && !chat.busy) setChatBusy(this.database, this.realtime, chatId, false);
       throw error;
     }
     // 새 assistant 메시지가 JSONL에 나타나면 history-sync가 chat_busy:false로 정리한다.
@@ -331,6 +683,8 @@ export class SessionManager {
       deliveredLength: terminalText.length,
       attachmentPath: prepared.attachmentPath,
     });
+    // 사람이 직접 쓰기 시작한 위임 채팅은 일반 목록에서 다시 찾을 수 있게 한다.
+    if (user) this.database.prepare("UPDATE chats SET origin = 'user' WHERE id = ? AND origin = 'delegation'").run(chatId);
     // /model 명령 뒤에는 배너가 다시 그려지므로 잠시 후 재감지해 캐시된 모델명을 갱신한다.
     if (terminalText.trim().startsWith("/model")) void this.detectAndStoreModel(chatId, chat.provider, 8_000);
     return terminalText;
@@ -344,16 +698,113 @@ export class SessionManager {
     if (draft) sendTmuxBackspace(tmuxName, promptCharacterCount(draft));
   }
 
-  // 제출 뒤 TUI가 작업중으로 바뀌거나 본문이 사라진 빈 입력 화면으로 돌아왔는지 확인한다.
-  private async waitForPromptSubmission(chatId: number, adapter: ProviderAdapter, timeoutMs: number): Promise<boolean> {
+  private capturePromptHistoryBaseline(chat: ChatWithProject, adapter: ProviderAdapter): PromptHistoryBaseline | null {
+    if (!chat.history_file) return null;
+    try {
+      const stat = fs.statSync(chat.history_file);
+      const session = adapter.parseHistoryFile(chat.history_file);
+      if (!session) return null;
+      return {
+        file: chat.history_file,
+        userMessageIds: new Set(session.messages.filter((message) => message.role === "user").map((message) => message.id)),
+        observedMtimeMs: stat.mtimeMs,
+        observedSize: stat.size,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private hasNewRecordedUserMessage(adapter: ProviderAdapter, baseline: PromptHistoryBaseline, expectedPrompt: string): boolean {
+    try {
+      const stat = fs.statSync(baseline.file);
+      if (stat.mtimeMs === baseline.observedMtimeMs && stat.size === baseline.observedSize) return false;
+      const session = adapter.parseHistoryFile(baseline.file);
+      if (!session) return false;
+      baseline.observedMtimeMs = stat.mtimeMs;
+      baseline.observedSize = stat.size;
+      // CLI가 줄바꿈·연속 공백을 다르게 기록해도 같은 질문으로 본다.
+      const normalize = (value: string) => value.replace(/\s+/g, " ").trim();
+      const expected = normalize(expectedPrompt);
+      return session.messages.some((message) => message.role === "user"
+        && !baseline.userMessageIds.has(message.id)
+        && normalize(message.content) === expected);
+    } catch {
+      return false;
+    }
+  }
+
+  // UserPromptSubmit 훅이 온 시각을 기록한다(#98). 전송 확인에서 가장 확실한 제출 증거로 쓴다.
+  notePromptSubmitted(chatId: number): void {
+    this.promptSubmittedAt.set(chatId, Date.now());
+  }
+
+  // 붙여넣은 글이 입력창에 보일 때까지 기다린다. 판독을 지원하지 않거나 끝내 안 보이면 그대로 진행한다.
+  private async waitForPastedDraft(chatId: number, adapter: ProviderAdapter, timeoutMs: number): Promise<void> {
+    if (!adapter.readPromptDraft) return;
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
+      if (adapter.readPromptDraft(this.captureSnapshot(chatId))) return;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+
+  // Enter 뒤 실제 제출(또는 작업 중 대기열 진입)을 확인하고, 글이 입력창에 남아 있으면 Enter를 재시도한다(#98).
+  // 성공 증거: UserPromptSubmit 훅, 새 JSONL user 기록, JSONL 대기열 기록(Claude 작업 중 입력, #103), 입력창이
+  // 비워짐, 입력창 없이 작업중. 실패는 글이 입력창에 계속 남아 있을 때만 판정한다 — Codex는 대기열·기록 지연으로
+  // JSONL user 레코드를 수 초~수십 초 늦게 쓰는데, 예전에는 1.8초 안에 그 레코드만 찾다가 실제로 전송된 입력을
+  // 지우고 실패를 알렸다.
+  private async confirmPromptSubmission(
+    chatId: number,
+    adapter: ProviderAdapter,
+    tmuxName: string,
+    historyBaseline: PromptHistoryBaseline | null,
+    expectedPrompt: string,
+    sentAt: number,
+    historyFile: string | null = null,
+    retrySubmission = true,
+  ): Promise<boolean> {
+    const readsDraft = typeof adapter.readPromptDraft === "function";
+    const deadline = Date.now() + 6_000;
+    let nextRetryAt = Date.now() + 900;
+    let retries = 0;
+    let lastDraft: string | null = null;
+    // 대기열 기록은 파일이 바뀌었을 때만 다시 읽는다(100ms마다 끝부분을 읽지 않도록).
+    let queueFileState = "";
+    while (Date.now() < deadline) {
+      if ((this.promptSubmittedAt.get(chatId) ?? 0) >= sentAt) return true;
+      if (historyBaseline && this.hasNewRecordedUserMessage(adapter, historyBaseline, expectedPrompt)) return true;
+      if (historyFile && adapter.hasQueuedPrompt) {
+        const state = historyFileState(historyFile);
+        if (state && state !== queueFileState) {
+          queueFileState = state;
+          if (adapter.hasQueuedPrompt(historyFile, expectedPrompt, sentAt)) return true;
+        }
+      }
       const snapshot = this.captureSnapshot(chatId);
-      // 각 어댑터의 isReady는 본문이 남은 입력창을 제외하므로 미전송 초안을 성공으로 보지 않는다.
-      if (adapter.isBusy(snapshot) || adapter.isReady(snapshot)) return true;
+      const initializing = adapter.isInitializing?.(snapshot) ?? false;
+      let stuck: boolean;
+      if (readsDraft) {
+        // 새 Codex가 MCP를 부팅하는 동안에는 붙여넣은 프롬프트가 입력창에 남아 있어도 "esc to interrupt"
+        // 때문에 isBusy가 true다. 실제 초안이 남아 있으면 busy 신호보다 우선해 아직 제출되지 않은 것으로 본다.
+        const draft = adapter.readPromptDraft!(snapshot);
+        if (draft !== null) lastDraft = draft;
+        if (!initializing && (draft === "" || (draft === null && adapter.isBusy(snapshot)))) return true;
+        stuck = !!draft;
+      } else {
+        // 입력창을 읽지 못하는 공급자는 예전 규칙을 따른다: 연결된 기록이 있으면 기록만 증거로 인정한다.
+        if (!historyBaseline && !initializing && (adapter.isBusy(snapshot) || adapter.isReady(snapshot))) return true;
+        stuck = true;
+      }
+      if (retrySubmission && stuck && retries < 3 && Date.now() >= nextRetryAt) {
+        sendTmuxEnter(tmuxName);
+        retries += 1;
+        nextRetryAt = Date.now() + 1_500;
+      }
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
-    return false;
+    // 입력창을 읽을 수 있는데 글이 남아 있지 않았다면 실패를 증명할 수 없다(승인 화면 등). 지우지 않는다.
+    return readsDraft && !lastDraft;
   }
 
   // 시작·모델 변경 배너가 나타날 때까지 기다렸다가 감지된 모델명을 저장하고 웹에 알린다.
@@ -427,7 +878,8 @@ export class SessionManager {
       if (terminal && adapter.detectApproval(snapshot)) {
         throw new Error("지금은 승인 요청이 떠 있어 입력을 보낼 수 없습니다. 승인 카드에서 먼저 처리해주세요.");
       }
-      if (terminal && (adapter.isReady(`${buffered}\n${snapshot}`) || hasPromptBox(adapter, snapshot))) {
+      const initializing = adapter.isInitializing?.(snapshot) ?? false;
+      if (terminal && !initializing && (adapter.isReady(`${buffered}\n${snapshot}`) || hasPromptBox(adapter, snapshot))) {
         const current = this.database.prepare("SELECT status FROM chats WHERE id = ?").get(chatId) as { status: string } | undefined;
         if (current?.status === "error") this.setStatus(chatId, "running", null);
         return terminal;
@@ -494,7 +946,7 @@ export class SessionManager {
     if (!terminal) return;
     const snapshot = terminal.screen?.ansiSnapshot();
     if (snapshot) this.realtime.terminal(chatId, snapshot);
-    const clients = spawnSync("tmux", ["list-clients", "-t", terminal.tmuxName, "-F", "#{client_pid} #{client_tty}"], { encoding: "utf8" });
+    const clients = spawnSync("tmux", ["list-clients", "-t", exactTmuxTarget(terminal.tmuxName), "-F", "#{client_pid} #{client_tty}"], { encoding: "utf8" });
     const ownClient = clients.status === 0
       ? clients.stdout.split("\n").find((line) => line.startsWith(`${terminal.pty.pid} `))
       : undefined;
@@ -506,6 +958,11 @@ export class SessionManager {
   // 맞다면 "작업중" 표시를 바로 정리한다(놓쳐도 history-sync의 턴 종료 감지가 뒤따라 정리한다).
   async interrupt(chatId: number, user: AuthUser): Promise<void> {
     const chat = this.getChat(chatId);
+    if (this.structuredTransport?.owns(chatId)) {
+      await this.structuredTransport.interrupt(chatId);
+      writeAudit(this.database, user.id, "chat.interrupt", "chat", chatId, { transport: "app_server" });
+      return;
+    }
     const terminal = this.terminals.get(chatId);
     if (!terminal) throw new Error("실행 중인 터미널이 없습니다.");
     // attach된 클라이언트 pty에 raw 0x1b 바이트를 직접 쓰면 클라이언트 쪽 이스케이프 시퀀스 파서에
@@ -545,6 +1002,15 @@ export class SessionManager {
   // user가 null이면 유휴 자동 종료처럼 시스템이 스스로 실행한 종료라 감사 로그에 사용자를 남기지 않는다.
   async stop(chatId: number, user: AuthUser | null): Promise<void> {
     const chat = this.getChat(chatId);
+    if (this.structuredTransport?.owns(chatId)) {
+      this.setStatus(chatId, "stopping", null);
+      this.database.prepare("DELETE FROM rate_limit_waits WHERE chat_id = ?").run(chatId);
+      this.structuredTransport.stop(chatId);
+      this.clearChatCaches(chatId);
+      writeAudit(this.database, user?.id ?? null, "terminal.stop", "chat", chatId, { transport: "app_server" });
+      this.removeEmptyChatAfterTerminalExit(chatId);
+      return;
+    }
     this.setStatus(chatId, "stopping", null);
     // 사용자가 종료를 선택한 세션은 리밋이 풀린 뒤 시스템 입력으로 다시 시작하지 않는다.
     this.database.prepare("DELETE FROM rate_limit_waits WHERE chat_id = ?").run(chatId);
@@ -559,7 +1025,7 @@ export class SessionManager {
     }
     const deadline = Date.now() + 3_000;
     while (tmuxExists(chat.tmux_name) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 100));
-    if (tmuxExists(chat.tmux_name)) spawnSync("tmux", ["kill-session", "-t", chat.tmux_name], { stdio: "ignore" });
+    if (tmuxExists(chat.tmux_name)) spawnSync("tmux", ["kill-session", "-t", exactTmuxTarget(chat.tmux_name)], { stdio: "ignore" });
     const managed = this.terminals.get(chatId);
     if (managed?.busyPollTimer) clearInterval(managed.busyPollTimer);
     if (managed?.stateScanTimer) clearTimeout(managed.stateScanTimer);
@@ -567,13 +1033,48 @@ export class SessionManager {
     this.disposeTerminalScreen(managed);
     managed?.pty.kill();
     this.terminals.delete(chatId);
-    this.inputQueues.delete(chatId);
+    this.clearChatCaches(chatId);
     this.setStatus(chatId, "stopped", null);
     writeAudit(this.database, user?.id ?? null, "terminal.stop", "chat", chatId);
+    this.removeEmptyChatAfterTerminalExit(chatId);
+  }
+
+  // CLI 업데이트가 끝난 공급자의 실행 중 채팅을 전부 새 바이너리로 교체한다. 각 채팅은 먼저 기존
+  // 정상 종료 경로를 거쳐 rate-limit 대기·PTY·화면 캐시를 정리하고, 저장된 공급자 세션 ID가 있으면
+  // 같은 대화를 resume한다. 한 채팅 실패가 나머지 재시작을 막지 않도록 결과를 모아 반환한다.
+  async restartProviderTerminals(provider: Provider, user: AuthUser): Promise<{
+    restartedChatIds: number[];
+    failures: Array<{ chatId: number; error: string }>;
+  }> {
+    const rows = this.database.prepare(`
+      SELECT id, status FROM chats WHERE provider = ? ORDER BY id ASC
+    `).all(provider) as Array<{ id: number; status: ChatRecord["status"] }>;
+    // error 상태는 입력 준비 시간 초과 등으로 PTY가 살아있어도 발생한다. DB의 활성
+    // 상태와 실제 부착 PTY를 합쳐 대상을 정하되, 이미 사용자 종료 중인 채팅은 다시 시작하지 않는다.
+    const targets = rows.filter((row) => ["starting", "running", "resuming"].includes(row.status)
+      || (row.status === "error" && this.terminals.has(row.id)));
+    const restartedChatIds: number[] = [];
+    const failures: Array<{ chatId: number; error: string }> = [];
+    for (const target of targets) {
+      try {
+        await this.stop(target.id, user);
+        const remaining = this.database.prepare("SELECT 1 FROM chats WHERE id = ?").get(target.id);
+        // 사용 기록이 전혀 없는 터미널은 stop() 정책에 따라 목록에서도 제거되므로 재시작하지 않는다.
+        if (!remaining) continue;
+        const stopped = this.getChat(target.id);
+        this.start(target.id, Boolean(stopped.provider_session_id));
+        writeAudit(this.database, user.id, "terminal.restart_after_cli_update", "chat", target.id, { provider });
+        restartedChatIds.push(target.id);
+      } catch (error) {
+        failures.push({ chatId: target.id, error: error instanceof Error ? error.message : "터미널 재시작에 실패했습니다." });
+      }
+    }
+    return { restartedChatIds, failures };
   }
 
   // 서버 종료 시 tmux는 유지하고 연결된 PTY 클라이언트만 정리한다.
   close(): void {
+    this.structuredTransport?.close();
     for (const terminal of this.terminals.values()) {
       if (terminal.busyPollTimer) clearInterval(terminal.busyPollTimer);
       if (terminal.stateScanTimer) clearTimeout(terminal.stateScanTimer);
@@ -582,12 +1083,18 @@ export class SessionManager {
       terminal.pty.kill();
     }
     this.terminals.clear();
+    this.lastStateLog.clear();
+    this.inputQueues.clear();
+    this.lastPromptText.clear();
+    this.promptSubmittedAt.clear();
+    for (const timer of this.emptyExitCleanupTimers.values()) clearTimeout(timer);
+    this.emptyExitCleanupTimers.clear();
   }
 
   // tmux 세션에 PTY 클라이언트를 붙이고 출력을 실시간으로 중계한다.
   private attach(chat: ChatWithProject): void {
     if (this.terminals.has(chat.id)) return;
-    const child = pty.spawn("tmux", ["attach-session", "-t", chat.tmux_name], {
+    const child = pty.spawn("tmux", ["attach-session", "-t", exactTmuxTarget(chat.tmux_name)], {
       name: "xterm-256color",
       cols: DEFAULT_COLS,
       rows: DEFAULT_ROWS,
@@ -629,18 +1136,20 @@ export class SessionManager {
       if (terminal.approvalVerifyTimer) clearTimeout(terminal.approvalVerifyTimer);
       this.disposeTerminalScreen(terminal);
       this.terminals.delete(chat.id);
+      this.clearChatCaches(chat.id);
       const alive = tmuxExists(chat.tmux_name);
-      const current = this.database.prepare("SELECT status FROM chats WHERE id = ?").get(chat.id) as { status: string } | undefined;
-      const wasStopping = current?.status === "stopping";
+      const wasStopping = (this.database.prepare("SELECT status FROM chats WHERE id = ?").get(chat.id) as { status: string } | undefined)?.status === "stopping";
       this.setStatus(chat.id, alive ? "running" : "stopped", null);
       // 프로세스가 사라지면 그 승인 요청에 응답해도 더 이상 전달할 대상이 없으므로, 승인 목록에
       // 방치되지 않게 자동으로 정리한다.
-      if (!alive) this.approvals.closeChatApprovals(chat.id, "터미널 세션이 종료되어 자동으로 정리되었습니다.");
-      if (!alive && !wasStopping) void this.notifications.notify(
-        `terminal-exit:${chat.id}:${Date.now()}`,
-        "terminal_exited",
-        `에이전트 터미널이 종료되었습니다.\n채팅 ID: ${chat.id}`,
-      );
+      if (!alive) {
+        this.approvals.closeChatApprovals(chat.id, "터미널 세션이 종료되어 자동으로 정리되었습니다.");
+        // stop()이 진행 중이면 그 함수가 terminal.stop 감사 기록을 남긴 뒤 삭제한다. 예기치 않은 종료만
+        // 여기서 즉시 수명주기를 마감해 두 경로가 서로 상태/삭제 이벤트 순서를 뒤집지 않게 한다.
+        if (!wasStopping) this.removeEmptyChatAfterTerminalExit(chat.id);
+      }
+      // 사용자의 결정으로 터미널 종료 자체는 외부 알림을 보내지 않는다. 완료·승인·한도 알림은
+      // 각각의 의미 있는 이벤트 경로에서 계속 발송한다.
     });
   }
 
@@ -700,6 +1209,14 @@ export class SessionManager {
       setChatBusy(this.database, this.realtime, chat.id, false);
       return;
     }
+    // composer가 실제로 보이는데 실행 표식이 없다면 작업 중이 아니라 미전송 초안 또는 빈 대기
+    // 화면이다. isReady는 의도적으로 빈 composer만 인정하므로 이 상태를 별도로 내리지 않으면
+    // 제출 성공 오판 뒤 DB busy=1이 영구 고착된다.
+    const promptDraft = adapter.readPromptDraft?.(snapshot);
+    if (promptDraft) {
+      setChatBusy(this.database, this.realtime, chat.id, false);
+      return;
+    }
     terminal.readySince = undefined;
   }
 
@@ -755,6 +1272,17 @@ export class SessionManager {
       this.approvals.autoResolve(approvalId, "accept");
       this.registerRateLimitWait(chat, hint.summary);
     }
+  }
+
+  // Claude StopFailure(rate_limit) 훅의 보완 경로(#94). 화면 감지가 이미 대기를 등록했으면 그 값(화면의
+  // 리셋 시각)을 덮지 않고 아무것도 하지 않는다. 훅 세부 문구에서 리셋 시각을 못 읽으면 resume_after가
+  // 비어 재개 서비스가 그 계정 사용량의 실제 회복을 보고 이어 준다.
+  registerRateLimitWaitFromHook(chatId: number, details: string | null): boolean {
+    if (this.database.prepare("SELECT 1 FROM rate_limit_waits WHERE chat_id = ?").get(chatId)) return false;
+    const chat = this.database.prepare("SELECT 1 FROM chats WHERE id = ? AND status IN ('starting', 'running', 'resuming')").get(chatId);
+    if (!chat) return false;
+    this.registerRateLimitWait(this.getChat(chatId), details ?? "");
+    return true;
   }
 
   // 이 채팅을 rate_limit_waits에 올려두면, 실제 리셋 시각이 됐을 때 rate-limit-resume 서비스가 "계속"을
@@ -856,6 +1384,7 @@ export class SessionManager {
   // 채팅 상태와 오류를 갱신하고 웹에 알린다.
   private setStatus(chatId: number, status: ChatRecord["status"], error: string | null): void {
     this.database.prepare("UPDATE chats SET status = ?, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(status, error, chatId);
+    this.providerRollouts?.observeChatStatus(chatId, status);
     console.debug("[web-agent-manager:chat:server]", "status:update", { at: new Date().toISOString(), chatId, status, hasError: Boolean(error) });
     this.realtime.broadcast("chat_status", { chatId, status, error });
     // 터미널이 멈추거나 오류가 나면 더 이상 응답을 생성할 수 없으므로 생성 중 표시를 정리한다.
