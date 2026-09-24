@@ -10,8 +10,8 @@ import { AgentAccountService } from "../src/server/services/agent-accounts";
 import { UsageMonitor } from "../src/server/services/usage-monitor";
 
 // 인증 안 된 계정을 무작정 폴링하면 codex·claude 모두 로그인·온보딩 화면에 계속 걸려 파싱이
-// 안 됐다(실사용 보고). CliAuthManager의 캐시된 인증 여부로 폴링 PTY 자체를 안 띄우게 게이트하고,
-// 로그인 완료 시 notifyAuthenticated()로 그제서야 띄운다.
+// 안 됐다(실사용 보고). CliAuthManager의 캐시된 인증 여부로 direct poller와 폴백 PTY를 함께 게이트하고,
+// 로그인 완료 시 notifyAuthenticated()로 그제서야 poller를 시작한다.
 
 const cleanup: Array<() => void> = [];
 
@@ -38,6 +38,15 @@ function stubAdapter(): ProviderAdapter {
     createLaunch: () => ({ command: "sleep", args: ["2"] }),
     createMonitorLaunch: () => ({ command: "sleep", args: ["2"] }),
     parseUsage: () => ({ data_status: "unavailable" as const }),
+    collectUsage: async () => ({
+      record: {
+        provider: "claude",
+        data_status: "fresh" as const,
+        error_code: null,
+        details_json: JSON.stringify({ windows: [] }),
+      },
+      snapshot: "{}",
+    }),
   } as unknown as ProviderAdapter;
 }
 
@@ -59,7 +68,7 @@ describe("사용량 폴링의 인증 게이트", () => {
     monitor.stop();
   });
 
-  it("notifyAuthenticated를 부르면 그제서야 PTY를 띄운다", async () => {
+  it("notifyAuthenticated를 부르면 PTY 없이 direct poller부터 시작한다", async () => {
     const { database, accounts, accountId } = prepare();
     let authenticated = false;
     const monitor = new UsageMonitor(database, [stubAdapter()], { broadcast: vi.fn() } as never, accounts, undefined, () => authenticated);
@@ -69,30 +78,29 @@ describe("사용량 폴링의 인증 게이트", () => {
 
     authenticated = true;
     monitor.notifyAuthenticated("claude", accountId);
-    // pty.spawn은 비동기로 실제 프로세스를 띄우므로 한 틱 양보한다.
     await new Promise((resolve) => setTimeout(resolve, 50));
 
-    const state = (monitor as unknown as { monitors: Map<string, { terminal?: unknown }> }).monitors.get(`claude:${accountId}`);
-    expect(state?.terminal).toBeDefined();
+    const state = (monitor as unknown as { monitors: Map<string, { terminal?: unknown; timer?: unknown }> }).monitors.get(`claude:${accountId}`);
+    expect(state?.timer).toBeDefined();
+    expect(state?.terminal).toBeUndefined();
     monitor.stop();
   });
 
-  it("CLI 업데이트 후 공급자 조회 PTY를 재시작하고 구버전 모델 캐시를 비운다", async () => {
+  it("CLI 업데이트 후 구버전 모델 캐시를 비우고 direct 조회를 유지한다", async () => {
     const { database, accounts } = prepare();
     const monitor = new UsageMonitor(database, [stubAdapter()], { broadcast: vi.fn() } as never, accounts, undefined, () => true);
     monitor.start();
     await new Promise((resolve) => setTimeout(resolve, 50));
-    const internal = monitor as unknown as { monitors: Map<string, { terminal?: { pid: number }; modelOptions?: unknown }> };
+    const internal = monitor as unknown as { monitors: Map<string, { terminal?: { pid: number }; timer?: unknown; modelOptions?: unknown }> };
     const state = [...internal.monitors.values()][0];
-    const previousPid = state.terminal?.pid;
     state.modelOptions = { provider: "claude", models: [{ id: "old" }] };
 
     expect(monitor.restartProviderTerminals("claude")).toBe(1);
     await new Promise((resolve) => setTimeout(resolve, 100));
 
     expect(state.modelOptions).toBeUndefined();
-    expect(state.terminal?.pid).toBeDefined();
-    expect(state.terminal?.pid).not.toBe(previousPid);
+    expect(state.timer).toBeDefined();
+    expect(state.terminal).toBeUndefined();
     monitor.stop();
   });
 });

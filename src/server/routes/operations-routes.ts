@@ -345,7 +345,19 @@ export function createOperationsRouter(
     // 실패하면 임시 사용자 화면 전체 로딩이 깨지기 때문이다.
     if (request.authSession?.temporary) return response.json({ approvals: [] });
     const rows = database.prepare(`
-      SELECT a.*, c.title AS chat_title FROM approvals a JOIN chats c ON c.id = a.chat_id
+      SELECT a.*, c.title AS chat_title, c.project_id AS chat_project_id, c.origin AS chat_origin,
+             d.id AS delegation_id, d.source_chat_id AS delegation_source_chat_id
+      FROM approvals a
+      JOIN chats c ON c.id = a.chat_id
+      LEFT JOIN delegations d ON d.id = (
+        SELECT candidate.id FROM delegations candidate
+        WHERE candidate.target_chat_id = a.chat_id
+        ORDER BY
+          CASE WHEN candidate.completed_at IS NULL AND candidate.status != 'failed' THEN 0 ELSE 1 END,
+          candidate.updated_at DESC,
+          candidate.created_at DESC
+        LIMIT 1
+      )
       ORDER BY CASE WHEN a.status = 'pending' THEN 0 ELSE 1 END, a.created_at DESC LIMIT 200
     `).all();
     response.json({ approvals: rows });
@@ -435,8 +447,8 @@ export function createOperationsRouter(
       next(error);
     }
   });
-  // 사용자가 명시적으로 새로고침을 눌렀을 때만 실제 CLI에 /model을 보내 다시 조회한다.
-  // 실행 중인 세션 화면을 실제로 조작하므로 임시 세션에는 열지 않는다.
+  // 사용자가 명시적으로 새로고침을 눌렀을 때 direct catalog를 다시 읽고 실패할 때만 /model PTY를 연다.
+  // 폴백은 실행 중인 공급자 화면을 조작할 수 있으므로 임시 세션에는 열지 않는다.
   router.post("/models/:provider/refresh", requireNonTemporarySession, async (request, response, next) => {
     try {
       const provider = getProvider(String(request.params.provider));

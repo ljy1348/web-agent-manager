@@ -353,6 +353,11 @@ describe("usage_reset_schedules 마이그레이션", () => {
 });
 
 describe("parseUsageResetMoment", () => {
+  it("direct collector의 ISO 절대 시각은 날짜를 보존한다", () => {
+    const now = new Date("2026-08-05T00:00:00.000Z");
+    expect(parseUsageResetMoment("2026-08-12T03:15:00.000Z", now)?.toISOString()).toBe("2026-08-12T03:15:00.000Z");
+  });
+
   it("Codex 주간 한도의 날짜 포함 표기를 실제 로컬 시각으로 변환한다", () => {
     const now = new Date(2026, 6, 9, 15, 0, 0);
     expect(parseUsageResetMoment("19:05 on 9 Jul", now)).toEqual(new Date(2026, 6, 9, 19, 5, 0, 0));

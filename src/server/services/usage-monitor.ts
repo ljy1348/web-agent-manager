@@ -28,7 +28,9 @@ const usageLog = createLogger("usage-check");
 // 보고 0% 사용·5시간 뒤 재리셋으로 직접 채워 넣는다(2분 여유는 CLI의 반영 지연을 감안한 것).
 const SESSION_RESET_GRACE_MS = 2 * 60_000;
 const SESSION_WINDOW_HOURS = 5;
-const USAGE_DETAILS_INTERVAL_MS = 24 * 60 * 60_000;
+// Codex app-server direct 경로는 매 1분 조회마다 초기화권을 함께 받는다. 이 간격은 direct API가
+// 실패했을 때만 여는 무거운 `/usage` PTY 상세 메뉴의 상한이다.
+const USAGE_DETAILS_INTERVAL_MS = 60 * 60_000;
 
 // 조회 전용 PTY를 오래 켜두면 Claude CLI가 /usage 요청에 프로세스 시작 시점의 캐시를 간헐적으로
 // 그대로 돌려준다(실측 #52: 16시간 된 PTY가 최신값 "2pm 13%"와 시작 당시 값 "6pm 89%"를 매분
@@ -149,7 +151,7 @@ export function isMonitorTerminalAged(startedAt: number | undefined, now: number
   return startedAt !== undefined && now - startedAt >= MONITOR_PTY_MAX_AGE_MS;
 }
 
-// 마지막 상세 조회 시각을 기준으로 하루 주기의 다음 조회가 필요한지 판정한다.
+// 마지막 PTY 상세 조회 시각을 기준으로 1시간 주기의 다음 조회가 필요한지 판정한다.
 export function isUsageDetailsDue(lastCheckedAt: number | undefined, now: number): boolean {
   return lastCheckedAt === undefined || now - lastCheckedAt >= USAGE_DETAILS_INTERVAL_MS;
 }
@@ -220,6 +222,12 @@ export function isImplausibleClaudeSessionReset(detailsJson: string | null | und
   const windows = parseWindows(detailsJson);
   const session = windows.find((window) => window.id === "session");
   if (!session?.resetAt) return false;
+  // Direct OAuth usage uses an absolute ISO timestamp. Running that through the date-less TUI
+  // clock parser shifts UTC into the server's local day and can fabricate a 17-hour future reset.
+  if (/^\d{4}-\d{2}-\d{2}T/i.test(session.resetAt)) {
+    const absolute = Date.parse(session.resetAt);
+    return Number.isFinite(absolute) && absolute - now.getTime() > SESSION_RESET_PLAUSIBLE_MAX_MS;
+  }
   const today = todayResetTime(session.resetAt, now);
   if (!today) return false;
   const next = today.getTime() >= now.getTime() ? today : new Date(today.getTime() + 24 * 60 * 60_000);
@@ -507,6 +515,8 @@ interface MonitorState {
   lastSnapshot?: { text: string; capturedAt: string };
 }
 
+type UsageCollectionSource = "direct" | "pty";
+
 function wait(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
@@ -538,6 +548,12 @@ function resetTimeParts(resetAt: string): { dateText: string | null; minutesOfDa
 const SAME_WINDOW_TOLERANCE_MINUTES = 15;
 function isSameResetWindow(a: string, b: string): boolean {
   if (a === b) return true;
+  const absoluteA = /^\d{4}-\d{2}-\d{2}T/i.test(a) ? Date.parse(a) : Number.NaN;
+  const absoluteB = /^\d{4}-\d{2}-\d{2}T/i.test(b) ? Date.parse(b) : Number.NaN;
+  if (Number.isFinite(absoluteA) || Number.isFinite(absoluteB)) {
+    return Number.isFinite(absoluteA) && Number.isFinite(absoluteB)
+      && Math.abs(absoluteA - absoluteB) <= SAME_WINDOW_TOLERANCE_MINUTES * 60_000;
+  }
   const partsA = resetTimeParts(a);
   const partsB = resetTimeParts(b);
   if (partsA.dateText !== partsB.dateText) return false;
@@ -661,9 +677,9 @@ export function claudeUsageBackoffMs(fallbackStreak: number): number {
   return Math.min(CLAUDE_USAGE_BACKOFF_MAX_MS, CLAUDE_USAGE_BACKOFF_BASE_MS * 2 ** Math.max(0, fallbackStreak - 1));
 }
 
-// 공급자별 경량 전용 PTY에서 실제 슬래시 명령을 1분마다 실행한다.
+// 공급자별 구조화 API/RPC를 1분마다 조회하고 실패한 주기에만 경량 PTY로 폴백한다.
 export class UsageMonitor {
-  // 계정마다 조회 PTY가 하나씩이라 "공급자:계정ID"를 키로 쓴다.
+  // 계정마다 독립 사용량 상태가 있으므로 "공급자:계정ID"를 키로 쓴다.
   private readonly monitors = new Map<string, MonitorState>();
   private readonly adapters: ProviderAdapter[];
   private readonly resetCreditRedemptions = new Set<string>();
@@ -695,11 +711,11 @@ export class UsageMonitor {
     }
   }
 
-  // 조회 대상 계정의 상태 조회 PTY를 시작한다.
+  // 조회 대상 계정의 direct poller를 시작한다. PTY는 direct 실패나 모델 목록 요청 때만 지연 생성한다.
   start(): void {
     this.stopping = false;
     this.buildMonitors();
-    for (const monitor of this.monitors.values()) if (!monitor.terminal) this.startProvider(monitor);
+    for (const monitor of this.monitors.values()) if (!monitor.timer) this.startProvider(monitor);
   }
 
   // 사용량 조회 범위 설정이 바뀌면 대상 목록을 다시 계산해, 빠진 계정의 PTY는 정리하고 새 계정은 띄운다.
@@ -725,7 +741,10 @@ export class UsageMonitor {
     if (monitor.retryTimer) clearTimeout(monitor.retryTimer);
     if (monitor.keepaliveTimer) clearTimeout(monitor.keepaliveTimer);
     if (monitor.keepaliveVerificationTimer) clearTimeout(monitor.keepaliveVerificationTimer);
-    monitor.terminal?.kill();
+    if (monitor.terminal) {
+      monitor.recycling = true;
+      monitor.terminal.kill();
+    }
     monitor.terminal = undefined;
     monitor.screen.dispose();
   }
@@ -756,12 +775,11 @@ export class UsageMonitor {
     return this.findMonitor(provider, accountId)?.lastSnapshot ?? null;
   }
 
-  // CliAuthManager가 로그인 완료를 감지하면 부른다. 인증 안 돼 startProvider가 건너뛴 계정을
-  // 그제서야 실제로 띄운다. github 등 이 클래스가 모르는 공급자·계정 없음(null)은 조용히 무시한다.
+  // CliAuthManager가 로그인 완료를 감지하면 인증 때문에 시작하지 못했던 direct poller를 시작한다.
   notifyAuthenticated(provider: string, accountId: number | null): void {
     if (accountId == null) return;
     const monitor = this.monitors.get(monitorKey(provider as Provider, accountId));
-    if (monitor && !monitor.terminal) this.startProvider(monitor);
+    if (monitor && !monitor.timer) this.startProvider(monitor);
   }
 
   // 지정 공급자의 사용량을 즉시 다시 조회한다. 계정을 지정하지 않으면 그 공급자의 모든 조회 대상을 갱신한다.
@@ -773,10 +791,8 @@ export class UsageMonitor {
     for (const monitor of targets) this.requestUsage(monitor, true);
   }
 
-  // CLI 업데이트 뒤 해당 공급자의 계정별 조회 PTY를 모두 새 프로세스로 교체한다. 모델 목록 캐시는
-  // 구버전 메뉴에서 읽은 값이므로 비우고, 사용량 DB의 마지막 정상값은 새 조회가 끝날 때까지 유지한다.
-  // modelOptions()와 requestUsage()가 같은 PTY를 공유하므로 이 한 경로로 모델 조회·사용량 파싱이 모두
-  // 새 바이너리를 사용하게 된다.
+  // CLI 업데이트 뒤 남아 있는 폴백 PTY를 닫고 구버전 모델 캐시를 비운 뒤 direct 조회를 당긴다.
+  // API 이름은 기존 클라이언트 호환을 위해 유지한다.
   restartProviderTerminals(provider: Provider): number {
     const targets = [...this.monitors.values()].filter((monitor) => monitor.adapter.id === provider);
     for (const monitor of targets) {
@@ -785,7 +801,7 @@ export class UsageMonitor {
       monitor.usagePollNotBeforeAt = undefined;
       monitor.usageFallbackStreak = 0;
       if (monitor.terminal) this.recycleTerminal(monitor);
-      else this.startProvider(monitor, { keepLastValue: true });
+      this.requestUsage(monitor, true);
     }
     return targets.length;
   }
@@ -838,10 +854,10 @@ export class UsageMonitor {
     return this.findMonitor(provider)?.modelOptions ?? null;
   }
 
-  // 서버 시작 직후 딱 한 번 모델 옵션을 조회해 캐시를 채운다. 조회 전용 PTY가 마침 사용량 조회로
-  // 바쁘면 잠깐 뒤로 미루되, 무한 재시도로 쌓이지 않도록 시도 횟수를 제한한다.
+  // 서버 시작 직후 딱 한 번 direct 모델 옵션을 조회해 캐시를 채운다. 실패할 때만 여는 조회 전용
+  // PTY가 마침 사용량 조회로 바쁘면 잠깐 뒤로 미루되, 무한 재시도로 쌓이지 않도록 제한한다.
   private fetchModelOptionsOnce(monitor: MonitorState, attemptsLeft = 5): void {
-    if (this.stopping || !monitor.terminal) return;
+    if (this.stopping) return;
     if (monitor.busy) {
       if (attemptsLeft <= 0) return;
       const retry = setTimeout(() => this.fetchModelOptionsOnce(monitor, attemptsLeft - 1), 3_000);
@@ -851,25 +867,44 @@ export class UsageMonitor {
     void this.modelOptions(monitor.adapter.id).catch(() => undefined);
   }
 
-  // 상태 조회 전용 PTY에서 /model 메뉴를 열어 현재 선택 가능한 모델·추론 강도 목록을 읽는다.
+  // 공급자 direct catalog를 우선 읽고 실패할 때만 상태 조회 PTY의 /model 메뉴를 파싱한다.
   async modelOptions(provider: Provider): Promise<ModelOptions> {
     const monitor = this.findMonitor(provider);
-    if (!monitor?.terminal) throw new Error("상태 조회 터미널이 준비되지 않았습니다.");
+    if (!monitor) throw new Error("상태 조회 대상을 찾을 수 없습니다.");
     if (!monitor.adapter.parseModelOptions) throw new Error("이 공급자는 모델 목록 조회를 지원하지 않습니다.");
     if (monitor.busy) {
       if (monitor.modelOptions) return monitor.modelOptions;
       throw new Error("상태 조회 터미널이 사용 중입니다. 잠시 후 다시 시도해주세요.");
     }
-    // 메뉴를 열 필요가 없는 공급자는 지금 화면만으로 목록을 만든다. 굳이 `/model`을 보내면 그 공급자에
-    // 따라 인자 입력 대기 상태가 남아 다음 사용량 조회 명령까지 망가진다(grok에서 실측).
-    if (monitor.adapter.promptQuirks?.modelOptionsWithoutMenu) {
-      const options = monitor.adapter.parseModelOptions(monitor.screen.text());
-      if (options.models.length) monitor.modelOptions = options;
-      return options.models.length || !monitor.modelOptions ? options : monitor.modelOptions;
-    }
     monitor.busy = true;
     if (monitor.parseTimer) clearTimeout(monitor.parseTimer);
     try {
+      if (monitor.adapter.collectModelOptions) {
+        try {
+          const options = await monitor.adapter.collectModelOptions({
+            environment: this.accounts.environment(monitor.account),
+            command: monitor.adapter.cliVersionCommand.command,
+          });
+          if (!options.models.length) throw new Error("direct model catalog is empty");
+          monitor.modelOptions = options;
+          return options;
+        } catch (error) {
+          usageLog.warn("direct_models_failed_pty_fallback", {
+            provider: monitor.adapter.id,
+            accountId: monitor.account.id,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      await this.ensureProviderTerminal(monitor);
+      if (!monitor.terminal) throw new Error("상태 조회 터미널이 준비되지 않았습니다.");
+      // 메뉴를 열 필요가 없는 공급자는 준비 화면만으로 목록을 만든다. 굳이 `/model`을 보내면 그
+      // 공급자에 따라 인자 입력 대기 상태가 남는다(grok에서 실측).
+      if (monitor.adapter.promptQuirks?.modelOptionsWithoutMenu) {
+        const options = monitor.adapter.parseModelOptions(monitor.screen.text());
+        if (options.models.length) monitor.modelOptions = options;
+        return options.models.length || !monitor.modelOptions ? options : monitor.modelOptions;
+      }
       monitor.screen.reset();
       monitor.terminal.write("/model\r");
       let modelScreen = await this.waitForModelScreen(monitor, monitor.adapter.promptQuirks?.modelMenuInitialTimeoutMs ?? 2_000);
@@ -900,6 +935,7 @@ export class UsageMonitor {
     } finally {
       monitor.busy = false;
       monitor.screen.reset();
+      this.closeProviderTerminal(monitor);
     }
   }
 
@@ -928,67 +964,72 @@ export class UsageMonitor {
     });
   }
 
-  // 공급자 인터랙티브 CLI를 상태 조회 전용 PTY로 실행한다. 아직 인증 안 된 계정은 PTY를 아예
-  // 띄우지 않는다 — 띄우면 codex·claude 모두 로그인·온보딩 화면에 계속 걸려서 파싱이 안 됐다
-  // (실사용 보고). CliAuthManager가 로그인 완료를 감지하면 notifyAuthenticated()로 다시 불린다.
-  private startProvider(monitor: MonitorState, options: { keepLastValue?: boolean } = {}): void {
-    if (this.isAuthenticated && !this.isAuthenticated(monitor.adapter.id, monitor.account.id)) {
-      this.update(monitor, { monitor_status: "error", data_status: "unavailable", error_code: "auth_required" });
-      return;
-    }
-    // 수명 만료로 갈아타는 중이면 직전 정상값이 여전히 유효하므로 data_status를 내리지 않는다.
-    this.update(monitor, options.keepLastValue
-      ? { monitor_status: "starting", error_code: null }
-      : { monitor_status: "starting", data_status: "unavailable", error_code: null });
-    try {
+  // direct 실패나 모델 목록 요청 시에만 공급자 TUI를 만들고 입력 가능한 화면까지 기다린다.
+  private async ensureProviderTerminal(monitor: MonitorState): Promise<void> {
+    if (!monitor.terminal) {
+      monitor.screen.reset();
       const terminal = this.spawnProviderTerminal(monitor);
       monitor.terminal = terminal;
       monitor.terminalStartedAt = Date.now();
       terminal.onData((data) => monitor.screen.write(data));
       terminal.onExit(() => {
-        monitor.terminal = undefined;
-        monitor.busy = false;
-        if (monitor.timer) clearInterval(monitor.timer);
-        if (monitor.parseTimer) clearTimeout(monitor.parseTimer);
-        if (this.stopping) return;
-        // 수명이 다해 우리가 일부러 끊은 것이면 실패가 아니므로, error를 띄우거나 백오프를 기다리지
-        // 않고 곧바로 새 PTY로 갈아탄다. 마지막 정상값은 그대로 두어 화면에서 사용량이 사라지지 않게 한다.
-        if (monitor.recycling) {
-          monitor.recycling = false;
-          monitor.screen.reset();
-          this.startProvider(monitor, { keepLastValue: true });
-          return;
+        if (monitor.terminal === terminal) monitor.terminal = undefined;
+        monitor.terminalStartedAt = undefined;
+        monitor.screen.reset();
+        const expected = !!monitor.recycling;
+        monitor.recycling = false;
+        if (!expected && !this.stopping && monitor.busy) {
+          monitor.busy = false;
+          this.update(monitor, { monitor_status: "error", data_status: "stale", error_code: "cli_exited" });
+          this.scheduleRestart(monitor);
         }
-        this.update(monitor, { monitor_status: "error", data_status: "stale", error_code: "cli_exited" });
-        this.scheduleRestart(monitor);
       });
-      const initial = setTimeout(() => this.requestUsage(monitor), 3_000);
-      initial.unref();
-      monitor.timer = setInterval(() => this.requestUsage(monitor), 60_000);
-      monitor.timer.unref();
-      // 모델·effort 목록은 서버가 뜰 때 딱 한 번만 조회해 캐시해두고, 그 뒤로는 사용자가 "새로고침"을
-      // 눌렀을 때만 다시 조회한다(매 채팅 진입마다 CLI에 /model을 보내지 않기 위함). CLI가 막 떠서
-      // 아직 준비 안 됐을 때 바로 보내지 않도록 최초 사용량 조회와 같은 지연을 둔다.
-      // 모델 목록은 계정이 아니라 CLI 버전에 달린 값이라, 같은 공급자의 조회 대상이 여럿이어도
-      // 대표 하나에서만 읽는다(계정 수만큼 /model 메뉴를 여는 낭비와 조회 충돌을 막는다).
-      if (monitor.adapter.parseModelOptions && this.findMonitor(monitor.adapter.id) === monitor) {
-        const initialModelFetch = setTimeout(() => this.fetchModelOptionsOnce(monitor), 4_000);
-        initialModelFetch.unref();
-      }
-    } catch {
-      this.update(monitor, { monitor_status: "error", data_status: "unavailable", error_code: "cli_exited" });
-      this.scheduleRestart(monitor);
+    }
+    const deadline = Date.now() + 90_000;
+    while (monitor.terminal && !monitor.adapter.isReady(monitor.screen.text()) && Date.now() < deadline) await wait(100);
+    if (!monitor.terminal || !monitor.adapter.isReady(monitor.screen.text())) {
+      this.closeProviderTerminal(monitor);
+      throw new Error("상태 조회 터미널이 준비되지 않았습니다.");
     }
   }
 
-  // 연속 실패 횟수에 따라 최대 60초까지 지수 백오프로 재시작한다.
+  // 평상시에는 조회 TUI 프로세스를 남기지 않는다. 종료 callback은 recycling을 보고 실패로 세지 않는다.
+  private closeProviderTerminal(monitor: MonitorState): void {
+    if (!monitor.terminal || monitor.recycling) return;
+    monitor.recycling = true;
+    monitor.terminal.kill();
+  }
+
+  // 인증된 계정의 direct poll timer만 시작한다. 아직 인증 안 된 계정은 네트워크·PTY를 모두 건너뛴다.
+  private startProvider(monitor: MonitorState, options: { keepLastValue?: boolean } = {}): void {
+    if (this.isAuthenticated && !this.isAuthenticated(monitor.adapter.id, monitor.account.id)) {
+      this.update(monitor, { monitor_status: "error", data_status: "unavailable", error_code: "auth_required" });
+      return;
+    }
+    this.update(monitor, options.keepLastValue
+      ? { monitor_status: "starting", error_code: null }
+      : { monitor_status: "starting", data_status: "unavailable", error_code: null });
+    const initial = setTimeout(() => this.requestUsage(monitor), 3_000);
+    initial.unref();
+    if (!monitor.timer) {
+      monitor.timer = setInterval(() => this.requestUsage(monitor), 60_000);
+      monitor.timer.unref();
+    }
+    // 모델 목록은 대표 계정에서 direct-first로 한 번 읽고, 실패해 열린 PTY도 즉시 닫는다.
+    if (monitor.adapter.parseModelOptions && this.findMonitor(monitor.adapter.id) === monitor) {
+      const initialModelFetch = setTimeout(() => this.fetchModelOptionsOnce(monitor), 4_000);
+      initialModelFetch.unref();
+    }
+  }
+
+  // PTY 폴백 자체가 실패하면 direct 조회를 지수 백오프로 다시 당긴다.
   private scheduleRestart(monitor: MonitorState): void {
     if (this.stopping || monitor.retryTimer) return;
     monitor.failureCount += 1;
     const delay = Math.min(60_000, 5_000 * 2 ** Math.max(0, monitor.failureCount - 1));
     monitor.retryTimer = setTimeout(() => {
       monitor.retryTimer = undefined;
-      this.startProvider(monitor);
+      this.requestUsage(monitor, true);
     }, delay);
     monitor.retryTimer.unref();
   }
@@ -1245,17 +1286,50 @@ export class UsageMonitor {
 
   // 중복 실행을 막고 공급자별 실제 슬래시 명령을 순서대로 전달한다.
   private requestUsage(monitor: MonitorState, force = false): void {
-    if (!monitor.terminal || monitor.busy) return;
+    if (monitor.busy) return;
     if (!force && monitor.usagePollNotBeforeAt && Date.now() < monitor.usagePollNotBeforeAt) return;
-    if (this.recycleTerminalIfAged(monitor)) return;
+    if (monitor.terminal && this.recycleTerminalIfAged(monitor)) return;
     monitor.busy = true;
     monitor.commandIndex = 0;
-    const now = Date.now();
-    monitor.collectUsageDetails = !!monitor.adapter.usageDetails && isUsageDetailsDue(monitor.usageDetailsCheckedAt, now);
-    if (monitor.collectUsageDetails) monitor.usageDetailsCheckedAt = now;
-    monitor.screen.reset();
+    monitor.collectUsageDetails = false;
     this.update(monitor, { monitor_status: "refreshing", last_checked_at: new Date().toISOString() });
-    this.runNextCommand(monitor);
+    if (monitor.adapter.collectUsage) {
+      void monitor.adapter.collectUsage({ environment: this.accounts.environment(monitor.account) }).then(
+        (collection) => this.finishUsageRecord(monitor, collection.record, collection.snapshot, "direct"),
+        (error) => {
+          usageLog.warn("direct_failed_pty_fallback", {
+            provider: monitor.adapter.id,
+            accountId: monitor.account.id,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          this.beginPtyUsageFallback(monitor);
+        },
+      );
+      return;
+    }
+    this.beginPtyUsageFallback(monitor);
+  }
+
+  // 직접 API/RPC가 실패한 경우에만 기존 slash-command TUI 수집기로 내려간다. Codex의 초기화권
+  // 상세 메뉴는 이 폴백 경로에서만 1시간 제한을 적용한다.
+  private beginPtyUsageFallback(monitor: MonitorState): void {
+    void this.ensureProviderTerminal(monitor).then(() => {
+      const now = Date.now();
+      monitor.commandIndex = 0;
+      monitor.collectUsageDetails = !!monitor.adapter.usageDetails && isUsageDetailsDue(monitor.usageDetailsCheckedAt, now);
+      if (monitor.collectUsageDetails) monitor.usageDetailsCheckedAt = now;
+      monitor.screen.reset();
+      this.runNextCommand(monitor);
+    }).catch((error) => {
+      monitor.busy = false;
+      usageLog.warn("pty_fallback_failed", {
+        provider: monitor.adapter.id,
+        accountId: monitor.account.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      this.update(monitor, { monitor_status: "error", data_status: "stale", error_code: "cli_exited" });
+      this.scheduleRestart(monitor);
+    });
   }
 
   // 상세 메뉴가 로딩을 마칠 때까지 짧게 재확인하고, 완료 또는 시간 초과 화면을 파싱한다.
@@ -1307,18 +1381,30 @@ export class UsageMonitor {
 
   // 터미널 사용량과 Codex 초기화권을 합친 뒤 마지막 정상값 보호 규칙을 적용한다.
   private async finishUsage(monitor: MonitorState, screenText: string): Promise<void> {
-    monitor.lastSnapshot = { text: screenText, capturedAt: new Date().toISOString() };
     const rawParsed = monitor.adapter.parseUsage(screenText);
     // TODO(임시 상세 로그): 사용량 파싱 오판 추적용. 안정화되면 제거하거나 레벨을 낮춘다.
     usageLog.debug("parse", { provider: monitor.adapter.id, out: rawParsed, in: screenText });
+    await this.finishUsageRecord(monitor, rawParsed, screenText, "pty");
+  }
+
+  // 구조화 direct 결과와 PTY parser 결과에 동일한 stale 보호·DB·알림·keepalive 정책을 적용한다.
+  private async finishUsageRecord(
+    monitor: MonitorState,
+    rawParsed: Partial<UsageRecord>,
+    snapshotText: string,
+    source: UsageCollectionSource,
+  ): Promise<void> {
+    monitor.lastSnapshot = { text: snapshotText, capturedAt: new Date().toISOString() };
     // 같은 리셋 시각의 창에서 사용량이 줄었다면 CLI가 돌려준 옛 스냅샷이므로, 이 값으로 마지막
     // 정상값을 덮어쓰지 않고 stale 표시만 남긴다(detectUsageRegression 참고). 다음 주기에 CLI가
     // 다시 최신 값을 주면 퍼센트가 증가 방향이라 그대로 통과돼 자동 복구된다.
     const previous = this.database.prepare("SELECT details_json, reset_at FROM usage_status WHERE provider = ? AND account_id = ?")
       .get(monitor.adapter.id, monitor.account.id) as { details_json: string | null; reset_at: string | null } | undefined;
-    // Claude만 겪는 "리셋 시각이 지나도 예전 스냅샷을 계속 돌려줌" 보정(위 reconcileStaleClaudeSessionWindow 참고).
-    // 새 화면에 세션 Resets가 없으면 직전 저장 창의 만료로 0%를 채운다.
-    let parsed = monitor.adapter.id === "claude" ? reconcileStaleClaudeSessionWindow(rawParsed, new Date(), previous?.details_json) : rawParsed;
+    // Claude TUI만 겪는 "리셋 시각이 지나도 예전 스냅샷을 계속 돌려줌" 보정이다. OAuth API가
+    // 돌려준 절대 ISO 시각에는 날짜 없는 화면용 오늘/내일 추측을 적용하지 않는다.
+    let parsed = monitor.adapter.id === "claude" && source === "pty"
+      ? reconcileStaleClaudeSessionWindow(rawParsed, new Date(), previous?.details_json)
+      : rawParsed;
     // 오직 오류 코드 없는 fresh만 권위 있는 직접 관측이다. stale/unavailable 화면에 정상 모양 숫자가
     // 있어도 DB·알림·keepalive에 절대 채택하지 않는 공급자 공통 불변조건으로 둔다.
     const authoritativeFresh = parsed.data_status === "fresh" && parsed.error_code == null;
@@ -1335,7 +1421,7 @@ export class UsageMonitor {
       usageLog.info("reset_at_changed", { provider: monitor.adapter.id, accountId: monitor.account.id, from: previous.reset_at, to: rawParsed.reset_at });
     }
     if (monitor.adapter.id === "codex" && rawParsed.details_json) {
-      const resetCredits = monitor.collectUsageDetails
+      const resetCredits = source === "pty" && monitor.collectUsageDetails
         ? await readCodexResetCredits(this.accounts.environment(monitor.account))
         : null;
       rawParsed.details_json = mergeCodexResetCredits(rawParsed.details_json, resetCredits, previous?.details_json);
@@ -1393,6 +1479,9 @@ export class UsageMonitor {
           monitor_status: "ready",
           last_success_at: new Date().toISOString(),
         });
+        if (monitor.adapter.id === "codex" && source === "direct") {
+          this.notifyCodexResetCreditsChanged(monitor, previous?.details_json, parsed.details_json);
+        }
         this.resetNotifier?.observe(monitor.adapter.id, parsed.details_json, new Date(), monitor.account.id);
         keepaliveTrigger = detectUsageKeepaliveTrigger(monitor.adapter.id, previous?.details_json, parsed.details_json);
         keepaliveObservationAccepted = true;
@@ -1401,7 +1490,40 @@ export class UsageMonitor {
     monitor.collectUsageDetails = false;
     if (!monitor.recycling) monitor.terminal?.write("\u001b");
     monitor.busy = false;
+    if (source === "pty") this.closeProviderTerminal(monitor);
     if (keepaliveObservationAccepted) await this.reconcileKeepaliveAfterUsage(monitor, keepaliveTrigger);
+  }
+
+  // 첫 관측은 기준선만 만들고, 이후 direct app-server의 개수 또는 가장 이른 만료가 실제로 달라진
+  // 경우에만 외부 알림과 브라우저 이벤트를 보낸다. PTY fallback의 불완전 값은 알림 근거로 쓰지 않는다.
+  private notifyCodexResetCreditsChanged(
+    monitor: MonitorState,
+    previousDetailsJson: string | null | undefined,
+    currentDetailsJson: string | null | undefined,
+  ): void {
+    let previous: CodexResetCredits | null = null;
+    let current: CodexResetCredits | null = null;
+    try {
+      previous = previousDetailsJson ? storedCodexResetCredits(JSON.parse(previousDetailsJson) as Record<string, unknown>) : null;
+      current = currentDetailsJson ? storedCodexResetCredits(JSON.parse(currentDetailsJson) as Record<string, unknown>) : null;
+    } catch {
+      return;
+    }
+    if (!previous || !current) return;
+    if (previous.availableCount === current.availableCount && previous.expiresAt === current.expiresAt) return;
+    const title = "Codex 초기화권 변경";
+    const expiry = current.expiresAt ? ` · 가장 이른 만료 ${current.expiresAt}` : "";
+    const body = `Codex 초기화권이 ${previous.availableCount}개에서 ${current.availableCount}개로 변경되었습니다${expiry}.`;
+    const eventId = `codex-reset-credits:${monitor.account.id}:${current.availableCount}:${current.expiresAt ?? "none"}`;
+    void this.notifications?.notify(eventId, "codex_reset_credits_changed", body, { title });
+    this.realtime.broadcast("codex_reset_credits_changed", {
+      provider: "codex",
+      accountId: monitor.account.id,
+      previous,
+      current,
+      title,
+      body,
+    });
   }
 
   // 계정별 초기화 창 중복 기록을 DB에서 확인하고 조회 PTY에 최소 단답 턴을 보낸다.

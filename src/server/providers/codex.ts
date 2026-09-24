@@ -8,6 +8,7 @@ import { stripAnsi } from "../core/security";
 import { isExpiredResetTime } from "./usage-utils";
 import { isCodexResetCreditsScreenReady, parseCodexResetCreditsScreen } from "./codex-rate-limits";
 import { isCodexUsageKeepalivePrompt } from "../../shared/usage-keepalive";
+import { collectCodexModelOptions, collectCodexUsage } from "./codex-usage-collector";
 
 // Codex가 세션 시작 시 AGENTS.md 등 프로젝트 지침을 첫 user 턴으로 자동 주입할 때 붙이는 고정 헤더.
 const PROJECT_INSTRUCTIONS_MARKER = /^#\s+[\w.-]+\.md instructions\b/i;
@@ -407,6 +408,8 @@ function codexEffortIndex(effortId: string | null): number | null {
 export class CodexAdapter implements ProviderAdapter {
   readonly id = "codex" as const;
   readonly displayLabel = "Codex";
+  readonly collectUsage = collectCodexUsage;
+  readonly collectModelOptions = collectCodexModelOptions;
   // Codex가 5시간 롤링 창을 다시 제공하므로 채팅 상태바·모바일 위젯·한도 자동 재개의 대표값도
   // 주간이 아니라 이 창을 써야 한다. 주간 창은 상세 카드와 별도 초기화 알림 대상으로 남긴다.
   readonly usageWindowId = "five_hour";
@@ -685,15 +688,17 @@ export class CodexAdapter implements ProviderAdapter {
   }
 
   // Codex /model의 모델 화면과 effort 화면을 순서대로 조작해 선택값을 적용한다.
-  async applyModelSelection(io: TmuxIO, modelIndex: number, effortId: string | null): Promise<void> {
+  async applyModelSelection(io: TmuxIO, modelIndex: number, effortId: string | null, modelId?: string | null): Promise<void> {
     await this.waitForModelListMenu(io);
     const options = this.parseModelOptions(io.snapshot());
-    const targetModel = options.models.find((model) => model.index === modelIndex);
+    // direct app-server 목록과 TUI 메뉴 순서가 달라도 안정 ID로 현재 화면의 실제 번호를 다시 찾는다.
+    const targetModel = (modelId ? options.models.find((model) => model.id === modelId) : undefined)
+      ?? options.models.find((model) => model.index === modelIndex);
     if (!targetModel) throw new Error("Codex 모델 선택 항목을 찾지 못했습니다.");
     const wasCurrent = targetModel.current;
     if (wasCurrent) io.sendEnter();
     else {
-      io.sendText(String(modelIndex));
+      io.sendText(String(targetModel.index));
       io.sendEnter();
     }
     const effortIndex = codexEffortIndex(effortId);

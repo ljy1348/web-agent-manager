@@ -2,6 +2,11 @@ import { describe, expect, it } from "vitest";
 import { isRateLimitRecovered, parseResetTime, usageRecoveryWindow } from "../src/server/services/rate-limit-resume";
 
 describe("parseResetTime", () => {
+  it("direct collector의 ISO 절대 시각은 오늘/내일로 다시 추측하지 않는다", () => {
+    const now = new Date("2026-08-05T00:00:00.000Z");
+    expect(parseResetTime("2026-08-12T03:15:00.000Z", now)?.toISOString()).toBe("2026-08-12T03:15:00.000Z");
+  });
+
   it("타임존 없이 24시간 표기(Codex)를 오늘 남은 시각으로 해석한다", () => {
     const now = new Date(2026, 0, 1, 10, 0, 0);
     const result = parseResetTime("16:45", now);

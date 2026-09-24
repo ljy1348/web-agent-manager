@@ -6,6 +6,7 @@ import type { UsageRecord, UsageWindow } from "../../shared/types";
 import { extractContent, fallbackId } from "./history-utils";
 import { stripAnsi } from "../core/security";
 import { isExpiredResetTime } from "./usage-utils";
+import { collectGrokModelOptions, collectGrokUsage } from "./grok-usage-collector";
 
 // Grok은 세션 하나를 파일이 아니라 디렉터리로 저장한다(`<기록루트>/<URL인코딩 cwd>/<세션UUID>/`).
 // 대화 본문은 chat_history.jsonl, 턴 종료는 events.jsonl, 턴 토큰은 updates.jsonl에 있으므로
@@ -356,6 +357,8 @@ function parseGrokSessionUsage(text: string): string[] {
 export class GrokAdapter implements ProviderAdapter {
   readonly id = "grok" as const;
   readonly displayLabel = "Grok";
+  readonly collectUsage = collectGrokUsage;
+  readonly collectModelOptions = collectGrokModelOptions;
   // /usage show가 보여주는 한도는 플랜 주간 창 하나뿐이다(예: "Weekly limit (SuperGrok)").
   readonly usageWindowId = "weekly";
   readonly usageWindowLabels = { weekly: "주간" };

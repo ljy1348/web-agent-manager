@@ -3,6 +3,8 @@ import { Bot, ExternalLink, LoaderCircle, Pause, Play, Plus, Send, Square, X } f
 import { api } from "../api";
 import type { Json } from "../types";
 import { useDialogHistory } from "../lib/dialog-history";
+import { createClientUuid } from "../lib/client-uuid";
+import { ApprovalCard } from "./ApprovalCard";
 
 interface SubagentManagerProps {
   project: Json;
@@ -14,6 +16,8 @@ interface SubagentManagerProps {
   interrupt: (chatId: number) => Promise<void>;
   stop: (chatId: number) => Promise<void>;
   startChat: (chatId: number) => Promise<void>;
+  approvals: Json[];
+  decide: (id: string, decision: string, answer?: string) => Promise<void>;
   onClose: () => void;
 }
 
@@ -78,7 +82,7 @@ function formatDelegationTime(value: string | null | undefined): string {
 
 // 비보안 HTTP 환경에서도 작업 중복 방지용 요청 키를 생성한다.
 function delegationRequestKey(): string {
-  return globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return createClientUuid();
 }
 
 // 다른 채팅의 살아있는 PTY를 끊기 전에 대상 번호를 보여 확인받는다.
@@ -97,6 +101,8 @@ export function SubagentManager({
   interrupt,
   stop,
   startChat,
+  approvals,
+  decide,
   onClose,
 }: SubagentManagerProps): React.ReactElement {
   const dismiss = useDialogHistory(true, onClose, "subagent-manager");
@@ -201,12 +207,14 @@ export function SubagentManager({
     ? groupDelegationsForProjectView(visibleDelegations)
     : { parented: visibleDelegations, parentless: [] as Json[] };
   const workingCount = visibleDelegations.filter((item) => delegationActivity(item).className === "working").length;
-  const attentionCount = visibleDelegations.filter((item) => delegationActivity(item).className === "error").length;
+  const pendingApprovalCount = (chatId: number): number => approvals.filter((item) => item.status === "pending" && Number(item.chat_id) === Number(chatId)).length;
+  const attentionCount = visibleDelegations.filter((item) => delegationActivity(item).className === "error" || pendingApprovalCount(item.target_chat_id) > 0).length;
   const emptyLabel = showProjectWide ? "서브 에이전트가 없습니다." : "이 채팅의 서브 에이전트가 없습니다.";
 
   // 위임 한 건의 상태·동작 버튼을 그린다.
   function renderDelegationItem(item: Json): React.ReactElement {
-    const activity = delegationActivity(item);
+    const itemApprovals = approvals.filter((approval) => approval.status === "pending" && Number(approval.chat_id) === Number(item.target_chat_id));
+    const activity = itemApprovals.length ? { label: "권한 요청", className: "needs-approval" } : delegationActivity(item);
     const stopped = ["stopped", "error"].includes(item.target_status);
     const acting = actingChatId === item.target_chat_id;
     return <article className={`subagent-item ${activity.className}`} key={item.id}>
@@ -223,6 +231,10 @@ export function SubagentManager({
         <span>최근 업데이트</span><time dateTime={item.updated_at}>{formatDelegationTime(item.updated_at)}</time>
       </div>
       {item.error && <div className="subagent-item-error">{item.error}</div>}
+      {!!itemApprovals.length && <div className="subagent-item-approvals">
+        <strong>이 서브 에이전트가 권한 결정을 기다리고 있습니다.</strong>
+        {itemApprovals.map((approval) => <ApprovalCard key={approval.id} item={approval} decide={decide} />)}
+      </div>}
       <div className="subagent-item-actions">
         <button type="button" aria-label={`채팅 #${item.target_chat_id} 열기`} onClick={() => void openTargetChat(item.target_chat_id)}><ExternalLink size={15} aria-hidden="true" />채팅 열기</button>
         {!!item.target_busy && <button type="button" aria-label={`채팅 #${item.target_chat_id} 응답 중단`} disabled={acting} onClick={() => void runChatAction(item.target_chat_id, () => interrupt(item.target_chat_id))}><Pause size={15} aria-hidden="true" />응답 중단</button>}

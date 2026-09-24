@@ -323,11 +323,11 @@ Resets Jul 2, 12:59am (Asia/Seoul)`;
 });
 
 describe("Codex 초기화권 사용량 상세 병합", () => {
-  it("상세 조회는 최초 1회와 24시간이 지난 뒤에만 수행한다", () => {
+  it("API 실패 폴백의 PTY 상세 조회는 최초 1회와 1시간이 지난 뒤에만 수행한다", () => {
     const now = Date.parse("2026-08-11T02:00:00.000Z");
     expect(isUsageDetailsDue(undefined, now)).toBe(true);
-    expect(isUsageDetailsDue(now - 23 * 60 * 60_000, now)).toBe(false);
-    expect(isUsageDetailsDue(now - 24 * 60 * 60_000, now)).toBe(true);
+    expect(isUsageDetailsDue(now - 59 * 60_000, now)).toBe(false);
+    expect(isUsageDetailsDue(now - 60 * 60_000, now)).toBe(true);
   });
 
   it("새 초기화권 정보를 기존 사용량 창과 함께 저장한다", () => {
@@ -509,6 +509,12 @@ describe("정각 리셋 표기 파싱", () => {
     expect(isImplausibleClaudeSessionReset(session("6:00pm (Asia/Seoul)"), now)).toBe(true);
     // 창 안에 있는 값은 그대로 통과해야 한다.
     expect(isImplausibleClaudeSessionReset(session("2pm (Asia/Seoul)"), now)).toBe(false);
+  });
+
+  it("direct OAuth ISO 리셋은 서버 현지 시각으로 다시 해석하지 않는다", () => {
+    const session = (resetAt: string): string => JSON.stringify({ windows: [{ id: "session", label: "Current session", usedPercent: 0, remainingPercent: 100, resetAt }] });
+    expect(isImplausibleClaudeSessionReset(session("2026-08-22T03:00:00.000Z"), now)).toBe(false);
+    expect(isImplausibleClaudeSessionReset(session("2026-08-22T08:00:00.000Z"), now)).toBe(true);
   });
 
   it("정각 표기가 이미 지났으면 stale로 잡는다", () => {

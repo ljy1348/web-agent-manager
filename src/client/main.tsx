@@ -25,6 +25,8 @@ import { notificationPermission, requestNotificationPermission, showNotification
 import { initClientLogging } from "./lib/logger";
 import { effectiveChatViewMode } from "./lib/chat-view-mode";
 import { useDialogHistory } from "./lib/dialog-history";
+import { createClientUuid } from "./lib/client-uuid";
+import { createWebSocketConnectionManager } from "./lib/websocket-connection-manager";
 import type { Json, Tab } from "./types";
 
 // 렌더 전에 콘솔 티·전역 오류 수집을 설치해 이후 모든 로그가 서버에도 남게 한다.
@@ -123,6 +125,8 @@ declare global {
 // 않게 한다. 서버는 25초마다 ping을 보내므로 이 시간 동안 아무것도 안 왔다면 연결이 죽은 것이다.
 const SOCKET_SILENCE_LIMIT_MS = 70_000;
 const SOCKET_WATCHDOG_INTERVAL_MS = 10_000;
+const SOCKET_CONNECT_TIMEOUT_MS = 15_000;
+const SOCKET_RECONNECT_DELAY_MS = 2_000;
 
 // 서버 하트비트가 끊긴 걸 감지해 좀비 소켓을 되살린다. 복귀 훅은 나갔다 들어올 때만 도는데,
 // 앱을 켜둔 채 대기하다 NAT 타임아웃 등으로 close 없이 죽는 경우는 그 경로를 아예 타지 않아
@@ -152,29 +156,16 @@ function createSocketWatchdog(options: {
 // visibilitychange가 안 뜨는 Android WebView 복귀까지 재조회·소켓 교체를 한 경로로 처리한다.
 function createForegroundResume(options: {
   refresh: () => void;
-  getSocket: () => { readyState: number; close: () => void } | null;
-  connect: () => void;
-  markIntentionalClose: () => void;
-  clearReconnectTimer: () => void;
+  replaceSocket: () => void;
 }): { resume: () => void; handleVisibility: () => void; dispose: () => void } {
   let lastReplaceAt = 0;
   function replaceSocket(): void {
     const now = Date.now();
     if (now - lastReplaceAt < 1000) return;
-    const socket = options.getSocket();
-    // readyState OPEN이어도 모바일 백그라운드에서 close 없이 죽은 좀비 소켓일 수 있어 무조건 교체한다.
-    // visibilitychange와 Android 훅이 연달아 오면 새 소켓을 바로 닫지 않도록 1초 동안은 재교체를 건너뛴다.
-    if (socket && socket.readyState === WebSocket.CONNECTING) {
-      lastReplaceAt = now;
-      return;
-    }
+    // OPEN·CONNECTING 등 브라우저가 보고하는 상태를 신뢰하지 않고 manager가 현재 generation을
+    // 폐기·교체한다. visibilitychange와 Android 훅의 연속 호출만 위 1초 guard로 합친다.
     lastReplaceAt = now;
-    options.clearReconnectTimer();
-    if (socket) {
-      options.markIntentionalClose();
-      socket.close();
-    }
-    options.connect();
+    options.replaceSocket();
   }
   function resume(): void {
     options.refresh();
@@ -506,14 +497,8 @@ function App(): React.ReactElement {
   useEffect(() => {
     if (!user) return;
     void loadCore().catch((caught) => setError(caught.message));
-    let closedByCleanup = false;
-    // 복귀 훅이 좀비 소켓을 갈아끼우려고 일부러 닫을 때 그 close 이벤트까지 "예기치 않은 끊김"으로
-    // 오인해 2초 뒤 중복 재연결을 걸지 않도록 구분하는 플래그.
-    let intentionalReplace = false;
-    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let chatRefreshTimer: ReturnType<typeof setTimeout> | null = null;
     let messageRefreshTimer: ReturnType<typeof setTimeout> | null = null;
-    let current: WebSocket | null = null;
     // 마지막으로 서버에서 뭔가 받은 시각. 앱을 켜둔 채 대기하는 동안 조용히 죽은 소켓을 잡아내는
     // 기준이다(#54) — onclose 없이 끊기면 이 값만 멈춘다.
     let lastMessageAt = Date.now();
@@ -537,14 +522,7 @@ function App(): React.ReactElement {
       }, 120);
     }
 
-    function connect(): void {
-      const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);
-      current = ws;
-      // 끊겼다 자동 재연결된 경우(서버 재시작 등) 그 사이 놓친 이벤트(예: 작업 완료로 busy가 풀린 것)가
-      // 있을 수 있어, 연결이 열릴 때마다 항상 최신 상태로 다시 맞춘다. 최초 연결도 겸사겸사 한 번 더
-      // 맞춰주는 정도라 비용은 무시할 만하다.
-      ws.onopen = () => { lastMessageAt = Date.now(); setSocket(ws); void refetchChats().catch(() => undefined); void refetchCurrentMessages().catch(() => undefined); };
-      ws.onmessage = (event) => {
+    function receiveSocketMessage(ws: WebSocket, event: MessageEvent): void {
         // 어떤 메시지든 도착했다는 건 연결이 살아있다는 뜻이라, 종류를 따지기 전에 먼저 기록한다.
         lastMessageAt = Date.now();
         const message = JSON.parse(event.data);
@@ -611,24 +589,31 @@ function App(): React.ReactElement {
         if (message.type === "approval_requested" || message.type === "approval_resolved") {
           void api("/approvals").then((data) => setApprovals(data.approvals || [])).catch(() => undefined);
         }
-      };
-      ws.onclose = () => {
-        setSocket((currentSocket) => (currentSocket === ws ? null : currentSocket));
-        if (closedByCleanup) return;
-        if (intentionalReplace) { intentionalReplace = false; return; }
-        // 서버가 만료된 세션의 소켓을 끊은 경우 곧바로 /auth/me의 401을 공통 로그인 전환으로
-        // 전달한다. 서버 재시작이나 일시 네트워크 장애라면 기존처럼 재연결한다.
-        const reconnect = () => {
-          if (closedByCleanup) return;
-          reconnectTimer = setTimeout(connect, 2000);
-        };
-        void api("/auth/me").then(reconnect).catch((caught) => {
-          if (caught instanceof ApiError && caught.status === 401) return;
-          reconnect();
-        });
-      };
     }
-    connect();
+
+    const connection = createWebSocketConnectionManager({
+      createSocket: () => new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`),
+      connectTimeoutMs: SOCKET_CONNECT_TIMEOUT_MS,
+      reconnectDelayMs: SOCKET_RECONNECT_DELAY_MS,
+      // 끊겼다 재연결된 경우 그 사이 놓친 이벤트가 있을 수 있어 open마다 서버 기준으로 맞춘다.
+      onOpen(ws) {
+        lastMessageAt = Date.now();
+        setSocket(ws as WebSocket);
+        void refetchChats().catch(() => undefined);
+        void refetchCurrentMessages().catch(() => undefined);
+      },
+      onMessage: (ws, event) => receiveSocketMessage(ws as WebSocket, event),
+      onSocketCleared: (ws) => setSocket((currentSocket) => (currentSocket === ws ? null : currentSocket)),
+      onUnexpectedClose(scheduleReconnect) {
+        // 서버가 만료된 세션의 소켓을 끊은 경우 곧바로 /auth/me의 401을 공통 로그인 전환으로
+        // 전달한다. 응답을 기다리는 사이 새 generation이 열리면 manager가 이 재연결을 무효화한다.
+        void api("/auth/me").then(scheduleReconnect).catch((caught) => {
+          if (caught instanceof ApiError && caught.status === 401) return;
+          scheduleReconnect();
+        });
+      },
+    });
+    connection.connect();
 
     // Android onResume 훅과 visibilitychange가 같은 resume()을 타게 해 소켓을 연달아 두 번 갈아끼우지 않는다.
     const foregroundResume = createForegroundResume({
@@ -638,14 +623,7 @@ function App(): React.ReactElement {
         // 백그라운드로 가 있던 사이 chat_busy 이벤트를 놓쳤을 수 있어, 항상 정확한 현재 값으로 다시 맞춘다.
         void refetchChats().catch(() => undefined);
       },
-      getSocket: () => current,
-      connect,
-      markIntentionalClose: () => { intentionalReplace = true; },
-      clearReconnectTimer: () => {
-        if (!reconnectTimer) return;
-        clearTimeout(reconnectTimer);
-        reconnectTimer = null;
-      },
+      replaceSocket: connection.replace,
     });
     document.addEventListener("visibilitychange", foregroundResume.handleVisibility);
 
@@ -659,14 +637,12 @@ function App(): React.ReactElement {
     const watchdog = setInterval(() => socketWatchdog.check(), SOCKET_WATCHDOG_INTERVAL_MS);
 
     return () => {
-      closedByCleanup = true;
       clearInterval(watchdog);
       foregroundResume.dispose();
       document.removeEventListener("visibilitychange", foregroundResume.handleVisibility);
-      if (reconnectTimer) clearTimeout(reconnectTimer);
       if (chatRefreshTimer) clearTimeout(chatRefreshTimer);
       if (messageRefreshTimer) clearTimeout(messageRefreshTimer);
-      current?.close();
+      connection.dispose();
     };
   }, [user?.id]);
   useEffect(() => { if (!project) { setChats([]); return; } void refetchChats(); }, [project?.id, usage.length, approvals.length]);
@@ -778,7 +754,7 @@ function App(): React.ReactElement {
     setMessages((current: Json[]) => [...current, optimisticMessage]);
     patchChatBusy(chatId, true);
     logChatTrace("send:start", { chatId, textLength: text.length, selectedChatId: chatRef.current?.id ?? null });
-    const idempotencyKey = crypto.randomUUID();
+    const idempotencyKey = createClientUuid();
     const request = () => api(`/chats/${chatId}/messages`, {
       method: "POST",
       headers: { "Idempotency-Key": idempotencyKey },

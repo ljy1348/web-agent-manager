@@ -1,5 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "../../api";
+import { createClientUuid } from "../../lib/client-uuid";
+import { formatUsageResetAt } from "../../lib/format";
 import type { Json } from "../../types";
 
 const COLUMNS = [
@@ -113,7 +115,7 @@ function RemoteDispatchPanel({ task, admin }: { task: Json; admin: boolean }): R
   }
   async function dispatch(): Promise<void> {
     if (!mapping || !window.confirm(`${mapping.hostName}의 ${mapping.remotePath}에서 ${REMOTE_CAPABILITY_LABELS[capability] || capability} 작업을 시작할까요?`)) return;
-    const key = requestKey || crypto.randomUUID(); setRequestKey(key); setBusy("dispatch"); setStatus("원격 worker에 고정 task 요청을 전달하는 중…");
+    const key = requestKey || createClientUuid(); setRequestKey(key); setBusy("dispatch"); setStatus("원격 worker에 고정 task 요청을 전달하는 중…");
     try {
       const result = await api(`/tasks/${task.id}/remote-dispatches`, { method: "POST", headers: { "Idempotency-Key": key }, body: JSON.stringify({ capability }) });
       setDispatches((current) => [result.dispatch, ...current.filter((item) => item.id !== result.dispatch.id)]); setRequestKey("");
@@ -154,7 +156,7 @@ export function TaskBoardView({ user, onOpenChat }: { user: Json; onOpenChat: (i
   async function recommend(task: Json): Promise<void> {
     setBusy(task.id); setStatus("사용량·capability·동시 실행 근거를 계산하는 중…");
     try {
-      await api(`/tasks/${task.id}/routing/recommend`, { method: "POST", headers: { "Idempotency-Key": crypto.randomUUID() } });
+      await api(`/tasks/${task.id}/routing/recommend`, { method: "POST", headers: { "Idempotency-Key": createClientUuid() } });
       await load(); setStatus("추천을 만들었습니다. 적용 전에는 공급자나 계정이 바뀌지 않습니다.");
     } catch (error: any) { setStatus(error?.message || "라우팅 추천에 실패했습니다."); }
     finally { setBusy(""); }
@@ -187,7 +189,7 @@ export function TaskBoardView({ user, onOpenChat }: { user: Json; onOpenChat: (i
             {task.checkpoints?.length > 0 && <p>체크포인트 {task.checkpoints.filter((item: Json) => item.status === "completed").length}/{task.checkpoints.length}</p>}
             {task.next_action && <p>다음: {task.next_action}</p>}
             {task.lastVerifiedCheckpoint?.runId && <p>검증 checkpoint <code>{shortId(task.lastVerifiedCheckpoint.runId)}</code></p>}
-            {candidate && <div className="task-routing-evidence"><strong>추천 {candidate.provider} · {candidate.accountLabel}</strong><small>잔여 {candidate.remainingPercent == null ? "확인 불가" : `${candidate.remainingPercent}%`} · 실행 {candidate.active.account}/{candidate.limits.account} · 비용 확인 불가</small><small>reset {candidate.resetAt || "확인 불가"} · {candidate.capability ? "capability 관측됨" : "capability 확인 불가"}</small></div>}
+            {candidate && <div className="task-routing-evidence"><strong>추천 {candidate.provider} · {candidate.accountLabel}</strong><small>잔여 {candidate.remainingPercent == null ? "확인 불가" : `${candidate.remainingPercent}%`} · 실행 {candidate.active.account}/{candidate.limits.account} · 비용 확인 불가</small><small>초기화 {candidate.resetAt ? formatUsageResetAt(candidate.resetAt) : "확인 불가"} · {candidate.capability ? "capability 관측됨" : "capability 확인 불가"}</small></div>}
             {key !== "scheduled" && <TaskPreviewPanel task={task} admin={user.role === "admin"} />}
             {key !== "scheduled" && user.role === "admin" && <RemoteDispatchPanel task={task} admin />}
             {key !== "scheduled" && <div className="slack-settings-actions"><button type="button" onClick={() => onOpenChat(Number(task.chat_id))}>채팅 열기</button>{user.role === "admin" && <button type="button" disabled={busy === task.id} onClick={() => void recommend(task)}>{busy === task.id ? "계산 중…" : "라우팅 추천"}</button>}{user.role === "admin" && candidate && task.recommendation.status === "pending" && <button type="button" className="primary" disabled={busy === task.id} onClick={() => void apply(task, candidate)}>추천 적용</button>}</div>}

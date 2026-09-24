@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../api";
-import { bytes, usageErrorLabel, usageResetCredits, usageWindows } from "../../lib/format";
+import { createClientUuid } from "../../lib/client-uuid";
+import { bytes, formatUsageResetAt, usageErrorLabel, usageResetCredits, usageWindows } from "../../lib/format";
 import { compactTokenCount } from "../../lib/token-usage";
 import type { Json } from "../../types";
 
@@ -149,7 +150,7 @@ function ResetCreditsSummary({ record, canRedeem, redeeming, onRedeem }: { recor
   return <div className="usage-reset-credits">
     <strong>초기화권</strong>
     <b>{credits.availableCount}개</b>
-    <span>{credits.expiresAt ? `${credits.availableCount > 1 ? "가장 이른 " : ""}기한 ${formatTimestamp(credits.expiresAt)}` : "기한 정보 없음"}</span>
+    <span>{credits.expiresAt ? `${credits.availableCount > 1 ? "가장 이른 " : ""}기한 ${formatUsageResetAt(credits.expiresAt)}` : "기한 정보 없음"}</span>
     {canRedeem && credits.availableCount > 0 && <button type="button" className="usage-reset-redeem" disabled={redeeming} onClick={onRedeem}>{redeeming ? "사용 중…" : "사용하기"}</button>}
   </div>;
 }
@@ -167,14 +168,14 @@ export function Overview({ user, deploymentSecurity, providers, providerCapabili
     }
   }
   const [restartingUsageMonitor, setRestartingUsageMonitor] = useState<string | null>(null);
-  // 새로고침과 달리 조회 전용 터미널 자체를 껐다 켠다. 플랜을 바꾸면 CLI가 시작 시점 값을 계속
-  // 돌려줘 새로고침만으로는 갱신되지 않기 때문이다(실행 중인 채팅에는 영향이 없다).
+  // 공급자 모델 캐시와 실패 폴백 PTY를 비운 뒤 direct 수집을 다시 시작한다. API 경로 이름은
+  // 이전 클라이언트 호환을 위해 restart를 유지한다(실행 중인 채팅에는 영향이 없다).
   async function restartUsageMonitor(provider: string): Promise<void> {
     setRestartingUsageMonitor(provider);
     try {
       await api(`/usage/${provider}/restart`, { method: "POST" });
     } catch (error: any) {
-      window.alert(error?.message || "조회 터미널 재시작에 실패했습니다.");
+      window.alert(error?.message || "사용량 수집기 재시작에 실패했습니다.");
     } finally {
       setRestartingUsageMonitor(null);
     }
@@ -195,7 +196,7 @@ export function Overview({ user, deploymentSecurity, providers, providerCapabili
     try {
       await api(`/providers/${provider}/canaries`, {
         method: "POST",
-        headers: { "Idempotency-Key": crypto.randomUUID() },
+        headers: { "Idempotency-Key": createClientUuid() },
         body: JSON.stringify({ candidateVersion }),
       });
       await refresh();
@@ -209,7 +210,7 @@ export function Overview({ user, deploymentSecurity, providers, providerCapabili
   async function redeemResetCredit(record: Json): Promise<void> {
     const credits = usageResetCredits(record);
     if (!credits || credits.availableCount < 1) return;
-    const expiry = credits.expiresAt ? `\n기한: ${formatTimestamp(credits.expiresAt)}` : "";
+    const expiry = credits.expiresAt ? `\n기한: ${formatUsageResetAt(credits.expiresAt)}` : "";
     if (!window.confirm(`맨 위 Full reset 초기화권 1개를 사용해 현재 Codex 사용량을 초기화할까요?${expiry}\n\n사용한 초기화권은 되돌릴 수 없습니다.`)) return;
     setRedeemingResetCredit(true);
     try {
@@ -228,7 +229,7 @@ export function Overview({ user, deploymentSecurity, providers, providerCapabili
     if (!window.confirm(`${label} CLI를 최신 버전으로 업데이트할까요?\n\n업데이트가 끝나면 ${label}의 실행 중인 모든 채팅과 모델·사용량 조회 터미널이 재시작됩니다. 진행 중인 응답은 중단될 수 있습니다.`)) return;
     setUpdatingProvider(provider);
     try {
-      const result = await api(`/providers/${provider}/update`, { method: "POST", headers: { "Idempotency-Key": crypto.randomUUID() }, body: JSON.stringify({ canaryRunId, ...(rolloutRunId ? { rolloutRunId } : {}) }) });
+      const result = await api(`/providers/${provider}/update`, { method: "POST", headers: { "Idempotency-Key": createClientUuid() }, body: JSON.stringify({ canaryRunId, ...(rolloutRunId ? { rolloutRunId } : {}) }) });
       await refresh();
       if (result.failures?.length || result.warnings?.length) {
         const details = [
@@ -248,7 +249,7 @@ export function Overview({ user, deploymentSecurity, providers, providerCapabili
   async function startProviderRollout(provider: string, canaryRunId: string): Promise<void> {
     setChangingRolloutProvider(provider);
     try {
-      await api(`/providers/${provider}/rollouts`, { method: "POST", headers: { "Idempotency-Key": crypto.randomUUID() }, body: JSON.stringify({ canaryRunId, maxNewChats: 1 }) });
+      await api(`/providers/${provider}/rollouts`, { method: "POST", headers: { "Idempotency-Key": createClientUuid() }, body: JSON.stringify({ canaryRunId, maxNewChats: 1 }) });
       await refresh();
       window.alert("단계 rollout을 시작했습니다. 다음 신규 채팅 1개가 후보 CLI로 실행됩니다.");
     } catch (error: any) {
@@ -270,7 +271,7 @@ export function Overview({ user, deploymentSecurity, providers, providerCapabili
     if (!window.confirm(`${label} CLI를 업데이트 전 버전으로 롤백할까요?\n\n검증된 백업만 복원하며 ${label}의 실행 중 채팅과 조회 터미널이 재시작됩니다.`)) return;
     setRollingBackProvider(provider);
     try {
-      const result = await api(`/providers/${provider}/updates/${runId}/rollback`, { method: "POST", headers: { "Idempotency-Key": crypto.randomUUID() } });
+      const result = await api(`/providers/${provider}/updates/${runId}/rollback`, { method: "POST", headers: { "Idempotency-Key": createClientUuid() } });
       await refresh();
       window.alert(`${label} CLI 롤백이 완료되었습니다.\n복원 버전: ${result.restoredVersion || "확인 필요"}`);
     } catch (error: any) {
@@ -383,28 +384,28 @@ export function Overview({ user, deploymentSecurity, providers, providerCapabili
           <button
             className="usage-refresh"
             disabled={restartingUsageMonitor === item.provider}
-            title="조회 전용 터미널을 껐다 켭니다. 플랜을 바꾼 뒤처럼 새로고침으로 값이 안 바뀔 때 사용하세요(실행 중인 채팅에는 영향 없음)."
+            title="사용량·모델 캐시와 실패 폴백을 초기화하고 direct 조회를 다시 시작합니다(실행 중인 채팅에는 영향 없음)."
             onClick={() => void restartUsageMonitor(item.provider)}
           >
-            {restartingUsageMonitor === item.provider ? "재시작 중…" : "터미널 재시작"}
+            {restartingUsageMonitor === item.provider ? "재시작 중…" : "수집기 재시작"}
           </button>
-          <button className="usage-refresh" onClick={() => void loadSnapshot(item.provider)}>터미널 보기</button>
+          <button className="usage-refresh" onClick={() => void loadSnapshot(item.provider)}>조회 원본</button>
         </div>
         <p className="usage-parsed-at">마지막 조회 {formatTimestamp(item.last_checked_at)}{item.data_status === "stale" && ` · 마지막 직접 확인 ${formatTimestamp(item.last_success_at)}`}</p>
         {item.error_code && <p className="usage-parsed-at">{usageErrorLabel(item.error_code)}</p>}
         {item.keepalive_sent_at && <p className="usage-parsed-at">세션 유지 단답 · 마지막 전송 {formatTimestamp(item.keepalive_sent_at)} · {keepaliveReasonLabel(item.keepalive_reason)}</p>}
         {usageWindows(item).map((window) => <div className="meter-row" key={window.id}>
-          <div><strong title={window.label || undefined}>{usageWindowLabel(item.provider, window)}</strong><span>{window.resetAt ? `초기화 ${window.resetAt}` : ""}</span></div>
+          <div><strong title={window.label || undefined}>{usageWindowLabel(item.provider, window)}</strong><span>{window.resetAt ? `초기화 ${formatUsageResetAt(window.resetAt)}` : ""}</span></div>
           <div className="meter"><i style={{ width: `${window.usedPercent || 0}%` }} /></div><b>{window.usedPercent}%</b>
         </div>)}
         {item.provider === "codex" && <ResetCreditsSummary record={item} canRedeem={user?.role === "admin"} redeeming={redeemingResetCredit} onRedeem={() => void redeemResetCredit(item)} />}
         {!usageWindows(item).length && !item.error_code && <p className="muted">조회 중</p>}
         {item.provider in snapshots && (snapshots[item.provider]
           ? <div className="usage-snapshot">
-              <div className="git-box-head"><h4>터미널 스냅샷</h4><span>{formatTimestamp(snapshots[item.provider]!.capturedAt)}</span><button onClick={() => closeSnapshot(item.provider)}>닫기</button></div>
+              <div className="git-box-head"><h4>사용량 조회 원본</h4><span>{formatTimestamp(snapshots[item.provider]!.capturedAt)}</span><button onClick={() => closeSnapshot(item.provider)}>닫기</button></div>
               <pre className="usage-snapshot-text">{snapshots[item.provider]!.text}</pre>
             </div>
-          : <p className="muted">아직 조회된 스냅샷이 없습니다(서버가 최근에 시작됐을 수 있음). <button onClick={() => closeSnapshot(item.provider)}>닫기</button></p>)}
+          : <p className="muted">아직 저장된 조회 원본이 없습니다(서버가 최근에 시작됐을 수 있음). <button onClick={() => closeSnapshot(item.provider)}>닫기</button></p>)}
       </article>)}
       <article className="card"><div className="card-top">호스트 자원</div>
         <div className="stat-pair"><span>CPU<b>{latest ? `${latest.cpuPercent.toFixed(1)}%` : "-"}</b></span><span>메모리<b>{latest ? `${((latest.memory.total - latest.memory.available) / latest.memory.total * 100).toFixed(1)}%` : "-"}</b></span></div>

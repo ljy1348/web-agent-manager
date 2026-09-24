@@ -30,6 +30,12 @@ function nearestDate(candidates: Date[], now: Date): Date | null {
 // 공급자 사용량 화면의 날짜·타임존 혼합 초기화 문구를 실제 발생 시각으로 변환한다.
 export function parseUsageResetMoment(resetAt: string | null | undefined, now: Date): Date | null {
   if (!resetAt) return null;
+  // Direct API/RPC collectors normalize absolute reset timestamps to ISO 8601. These must not be
+  // reduced to a clock-only value, otherwise a weekly reset can be mistaken for today's reset.
+  if (/^\d{4}-\d{2}-\d{2}T/i.test(resetAt)) {
+    const absolute = new Date(resetAt);
+    if (!Number.isNaN(absolute.getTime())) return absolute;
+  }
   const codexDated = resetAt.match(/(\d{1,2}):(\d{2})\s+on\s+(\d{1,2})\s+([A-Za-z]{3})/i);
   if (codexDated) {
     const month = MONTHS[codexDated[4].toLowerCase()];

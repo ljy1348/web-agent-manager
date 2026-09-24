@@ -383,6 +383,7 @@ test("채팅·터미널 모드 전환과 모바일 채팅 메뉴를 렌더링한
   const pastedTextUploadBodies: string[] = [];
   const terminalSnapshotRequests: string[] = [];
   const terminalSnapshotFilename = "chat-1-20260901123456789-abcdef12.json";
+  let terminalSubscriptions = 0;
   let pushTerminalOutput: (data: string) => void = () => undefined;
   await page.routeWebSocket("**/ws", (webSocket) => {
     pushTerminalOutput = (data) => webSocket.send(JSON.stringify({ type: "terminal_output", payload: { chatId: 1, data } }));
@@ -395,6 +396,7 @@ test("채팅·터미널 모드 전환과 모바일 채팅 메뉴를 렌더링한
       const message = JSON.parse(String(raw));
       if (message.type === "terminal_scroll") terminalScrolls.push(message.lines);
       if ((message.type === "terminal_resize" || message.type === "subscribe_terminal") && Number.isInteger(message.rows)) terminalRowRequests.push(message.rows);
+      if (message.type === "subscribe_terminal") terminalSubscriptions += 1;
       if (message.type === "subscribe_terminal" || message.type === "terminal_resize") sendTerminalSnapshot(message.chatId);
       if (message.type === "terminal_input") terminalInputs.push(message.data);
     });
@@ -437,7 +439,7 @@ test("채팅·터미널 모드 전환과 모바일 채팅 메뉴를 렌더링한
       "/api/providers": { providers: [{ id: "codex", label: "Codex", usageWindowId: "five_hour", supportsSessionRename: true, supportsPermissionMode: false }, { id: "claude", label: "Claude", usageWindowId: "session", supportsSessionRename: true, supportsPermissionMode: true }] },
       "/api/projects": { projects: [{ id: 1, name: "샘플 프로젝트", path: "/home/testuser/myagent" }] },
       // 접힌 상태에서도 사용량·초기화 시각이 남는지 보려면 실제 사용량 구간이 있어야 한다.
-      "/api/usage": { usage: [{ provider: "codex", monitor_status: "ready", data_status: "fresh", used_percent: 12, remaining_percent: 88, reset_at: "1:40pm (Asia/Seoul)", details_json: JSON.stringify({ windows: [{ id: "weekly", label: "Current week", usedPercent: 12, remainingPercent: 88, resetAt: "1:40pm (Asia/Seoul)" }] }) }] },
+      "/api/usage": { usage: [{ provider: "codex", monitor_status: "ready", data_status: "fresh", used_percent: 12, remaining_percent: 88, reset_at: "2026-09-23T04:40:00.000Z", details_json: JSON.stringify({ windows: [{ id: "weekly", label: "Current week", usedPercent: 12, remainingPercent: 88, resetAt: "2026-09-23T04:40:00.000Z" }] }) }] },
       "/api/system": { latest: null },
       "/api/runtime": { codex: "disabled", claude: "disabled" },
       "/api/slack": { enabled: false },
@@ -650,7 +652,7 @@ test("채팅·터미널 모드 전환과 모바일 채팅 메뉴를 렌더링한
   await expect(page.locator(".model-bar-summary")).toBeVisible();
   await expect(page.locator(".model-bar")).toBeHidden();
   // 접어도 사용량과 초기화 시각은 남아야 한다(펼쳐야만 보이면 평소 확인하던 값이 사라진다).
-  await expect(page.locator(".model-bar-summary")).toContainText("사용량 12% · 초기화 1:40pm (Asia/Seoul)");
+  await expect(page.locator(".model-bar-summary")).toContainText("사용량 12% · 초기화 09월 23일 13:40");
   expect(await messagesHeight()).toBeGreaterThan(desktopMessages);
   expect(await page.evaluate(() => document.documentElement.scrollHeight - document.documentElement.clientHeight)).toBe(0);
   await page.screenshot({ path: "artifacts/ui-chat-laptop.png", fullPage: true });
@@ -735,6 +737,12 @@ test("채팅·터미널 모드 전환과 모바일 채팅 메뉴를 렌더링한
   // 세로 터치 제스처는 바깥 문서를 절대 움직이지 않는다. 클라이언트는 스크롤백을 쌓지 않으므로
   // (기록의 정본은 tmux copy-mode다) 잘린 행이 남아 있으면 상자를 옮기고, 없으면 tmux 기록을 요청한다.
   await expect(visibleTerminalRows).toContainText("터미널 기록");
+  // Android 앱이 백그라운드에서 돌아오면 native onResume 훅이 소켓을 새로 만들고 터미널을
+  // 다시 구독해야 한다. HTTP 채팅만 정상이고 터미널이 빈 상태로 남아 앱을 종료해야 했던 회귀다.
+  const subscriptionsBeforeResume = terminalSubscriptions;
+  await page.evaluate(() => (window as any).__webAgentManagerResume__?.());
+  await expect.poll(() => terminalSubscriptions).toBeGreaterThan(subscriptionsBeforeResume);
+  await expect(visibleTerminalRows).toContainText("원본 터미널 출력");
   const documentScrollBefore = await page.evaluate(() => window.scrollY);
   const hostScrollBefore = await terminalHost.evaluate((element) => element.scrollTop);
   terminalScrolls.length = 0;
@@ -1054,6 +1062,7 @@ test("작업 중인 Codex·Claude 채팅에도 후속 명령을 전송한다", a
 test("새 서브 에이전트를 만들고 대상 채팅을 중단·종료·열기 할 수 있다", async ({ page }) => {
   test.setTimeout(45_000);
   const delegationRequests: Record<string, unknown>[] = [];
+  const approvalDecisions: Record<string, unknown>[] = [];
   const interruptedChats: number[] = [];
   const stoppedChats: number[] = [];
   let childCreated = false;
@@ -1084,10 +1093,19 @@ test("새 서브 에이전트를 만들고 대상 채팅을 중단·종료·열�
       await route.fulfill({ json: { approvals: approvalPending ? [{
         id: "approval-test",
         chat_id: 2,
+        chat_title: "검증 에이전트",
+        provider: "claude",
         status: "pending",
         request_type: "permission",
+        delegation_source_chat_id: 1,
         request_payload: JSON.stringify({ tool_name: "Bash", tool_input: { command: "npm test" } }),
       }] : [] } });
+      return;
+    }
+    if (pathname === "/api/approvals/approval-test/decision" && route.request().method() === "POST") {
+      approvalDecisions.push(route.request().postDataJSON());
+      approvalPending = false;
+      await route.fulfill({ json: { ok: true } });
       return;
     }
     if (pathname === "/api/chats") {
@@ -1175,6 +1193,25 @@ test("새 서브 에이전트를 만들고 대상 채팅을 중단·종료·열�
   await page.reload();
   await expect(page.locator(".approval-list")).toBeVisible();
   await expect(page.locator(".chat-layout")).toHaveClass(/has-approvals/);
+  const delegatedApproval = page.locator(".delegated-approvals");
+  await expect(delegatedApproval).toContainText("서브 에이전트 권한 요청");
+  await expect(delegatedApproval).toContainText("검증 에이전트");
+  await expect(delegatedApproval).toContainText("npm test");
+  // 모바일에서는 프로젝트 전체 승인 사이드바가 숨겨져도 부모 대화 안의 전달 카드로 결정할 수 있다.
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(page.locator(".approval-list")).toBeHidden();
+  await expect(delegatedApproval).toBeVisible();
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.getByRole("button", { name: "서브 에이전트 관리" }).click();
+  await expect(manager).toBeVisible();
+  const delegatedItem = manager.locator(".subagent-item", { hasText: "검증 에이전트" });
+  await expect(delegatedItem).toContainText("권한 요청");
+  await expect(delegatedItem).toContainText("이 서브 에이전트가 권한 결정을 기다리고 있습니다.");
+  await expect(delegatedItem).toContainText("npm test");
+  await manager.getByRole("button", { name: "서브 에이전트 관리 닫기" }).click();
+  await delegatedApproval.getByRole("button", { name: "거부" }).click();
+  await expect.poll(() => approvalDecisions).toEqual([{ decision: "decline" }]);
+  await expect(delegatedApproval).toHaveCount(0);
   await page.getByRole("button", { name: "서브 에이전트 관리" }).click();
   await expect(manager).toBeVisible();
   await manager.getByRole("button", { name: "채팅 #3 열기" }).click();
@@ -1886,9 +1923,8 @@ test("PR 병합 실패 시 버튼이 '처리 중…'을 거쳐 오류 메시지�
   await page.screenshot({ path: "artifacts/ui-pr-merge-error.png" });
 });
 
-test("대시보드에서 사용량 카드마다 터미널 스냅샷을 볼 수 있다", async ({ page }) => {
-  // 숫자만으로는 파싱이 왜 이상한지 알기 어려워, 파서에 실제로 넘어간 원본 화면 텍스트를 그대로
-  // 볼 수 있어야 한다(실사용 요청으로 추가).
+test("대시보드에서 사용량 카드마다 조회 원본을 볼 수 있다", async ({ page }) => {
+  // direct 조회와 PTY 폴백 중 실제 수집에 쓰인 원본을 카드에서 확인할 수 있어야 한다.
   const snapshotRequests: string[] = [];
   await page.route("**/api/**", async (route) => {
     const pathname = new URL(route.request().url()).pathname;
@@ -1916,15 +1952,15 @@ test("대시보드에서 사용량 카드마다 터미널 스냅샷을 볼 수 �
   await expect(page.getByRole("heading", { name: "운영 대시보드" })).toBeVisible();
   await expect(page.getByText("세션 유지 단답", { exact: false })).toContainText("Claude 세션 창 없음");
   await expect(page.getByText("세션 유지 단답", { exact: false })).toContainText("마지막 전송");
-  await expect(page.getByText("터미널 스냅샷")).toHaveCount(0);
-  await page.getByRole("button", { name: "터미널 보기" }).click();
+  await expect(page.getByText("사용량 조회 원본")).toHaveCount(0);
+  await page.getByRole("button", { name: "조회 원본" }).click();
   expect(snapshotRequests).toHaveLength(1);
-  await expect(page.getByText("터미널 스냅샷")).toBeVisible();
+  await expect(page.getByText("사용량 조회 원본")).toBeVisible();
   await expect(page.locator(".usage-snapshot-text")).toContainText("세션 창 없음");
   fs.mkdirSync("artifacts", { recursive: true });
   await page.screenshot({ path: "artifacts/ui-usage-snapshot.png" });
   await page.getByRole("button", { name: "닫기" }).click();
-  await expect(page.getByText("터미널 스냅샷")).toHaveCount(0);
+  await expect(page.getByText("사용량 조회 원본")).toHaveCount(0);
 });
 
 test("대시보드에서 Codex 초기화권을 확인 후 사용하고 채팅은 터미널 종료 경로를 사용한다", async ({ page }) => {
@@ -1979,7 +2015,7 @@ test("대시보드에서 Codex 초기화권을 확인 후 사용하고 채팅은
   await page.goto("/");
   await expect(page.getByText("초기화권", { exact: true })).toBeVisible();
   await expect(page.locator(".usage-reset-credits")).toContainText("1개");
-  await expect(page.locator(".usage-reset-credits span")).toHaveText(/기한 .*\d/);
+  await expect(page.locator(".usage-reset-credits span")).toHaveText("기한 08월 13일 02:28");
   await page.getByRole("button", { name: "사용하기" }).click();
   await expect.poll(() => resetCreditRedemptions).toEqual([{ path: "/api/usage/codex/reset-credit/redeem", accountId: 1 }]);
   expect(dialogs.some((message) => message.includes("맨 위 Full reset") && message.includes("되돌릴 수 없습니다"))).toBe(true);
@@ -2474,7 +2510,7 @@ test("연속 기록 갱신은 채팅 요청 하나로 합치고 전체 대시보
   expect(systemRequests).toBe(0);
 });
 
-test("사용량 카드의 터미널 재시작 버튼이 조회 전용 PTY 재시작을 요청한다", async ({ page }) => {
+test("사용량 카드의 수집기 재시작 버튼이 direct 수집 재시작을 요청한다", async ({ page }) => {
   const restartRequests: string[] = [];
   await page.routeWebSocket("**/ws", () => undefined);
   await page.route("**/api/**", async (route) => {
@@ -2509,9 +2545,9 @@ test("사용량 카드의 터미널 재시작 버튼이 조회 전용 PTY 재시
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "운영 대시보드" })).toBeVisible();
   const card = page.locator(".usage-card").first();
-  const restartButton = card.getByRole("button", { name: "터미널 재시작" });
+  const restartButton = card.getByRole("button", { name: "수집기 재시작" });
   await expect(restartButton).toBeVisible();
-  // 새로고침 버튼과 별개로 존재해야 한다 — 같은 PTY에 슬래시 명령만 다시 보내는 것과 구분된다.
+  // 새로고침 버튼과 별개로 존재해야 한다 — 캐시·폴백까지 함께 초기화하는 동작과 구분된다.
   await expect(card.getByRole("button", { name: "새로고침" })).toBeVisible();
   fs.mkdirSync("artifacts", { recursive: true });
   await card.screenshot({ path: "artifacts/ui-usage-monitor-restart.png" });

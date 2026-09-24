@@ -90,7 +90,8 @@ describe("TOTP MFA", () => {
     expect(pending.mfaRequired).toBe(true);
     const invalid = await post(baseUrl, "/login/mfa", { challengeToken: pending.challengeToken, code: "000000" });
     expect(invalid.status).toBe(401);
-    const completed = await post(baseUrl, "/login/mfa", { challengeToken: pending.challengeToken, code: totpCode(setup.secret).code });
+    const completedCode = totpCode(setup.secret).code;
+    const completed = await post(baseUrl, "/login/mfa", { challengeToken: pending.challengeToken, code: completedCode });
     const completedBody = await completed.json() as { csrfToken: string };
     const completedCookie = completed.headers.get("set-cookie")?.split(";")[0] ?? "";
     expect(completed.status).toBe(200);
@@ -103,7 +104,9 @@ describe("TOTP MFA", () => {
 
     const replayPassword = await post(baseUrl, "/login", { username: "mfa-admin", password: "correct-password" });
     const replayPending = await replayPassword.json() as { challengeToken: string };
-    expect((await post(baseUrl, "/login/mfa", { challengeToken: replayPending.challengeToken, code: totpCode(setup.secret).code })).status).toBe(401);
+    // 같은 코드를 재전송해야 replay를 검증한다. 현재 코드를 다시 계산하면 30초 경계에서
+    // 새 코드로 바뀌어 정상 인증(200)이 될 수 있어 CI 시각에 따라 간헐적으로 실패한다.
+    expect((await post(baseUrl, "/login/mfa", { challengeToken: replayPending.challengeToken, code: completedCode })).status).toBe(401);
     const recoveryLogin = await post(baseUrl, "/login/mfa", { challengeToken: replayPending.challengeToken, code: confirmed.recoveryCodes[1] });
     expect(recoveryLogin.status).toBe(200);
 

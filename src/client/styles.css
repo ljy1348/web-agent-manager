@@ -716,6 +716,7 @@ nav button.active { color: #fff; border-bottom-color: #d6f56f; }
 .subagent-item.completed { border-left-color: #3f8b64; }
 .subagent-item.idle { border-left-color: #5d8971; }
 .subagent-item.error { border-left-color: var(--danger); }
+.subagent-item.needs-approval { border-color: #dfc46e; border-left-color: #b78216; background: #fffdf5; }
 .subagent-item-head { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 10px; }
 .subagent-item-identity { display: flex; min-width: 0; align-items: center; gap: 7px; }
 .subagent-item-identity strong { min-width: 0; overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
@@ -723,6 +724,10 @@ nav button.active { color: #fff; border-bottom-color: #d6f56f; }
 .subagent-item-meta { display: flex; min-width: 0; align-items: center; gap: 6px; color: var(--muted); font-size: 10px; }
 .subagent-item-meta time { color: var(--muted); font: 10px DM Mono, monospace; }
 .subagent-item-error { padding: 7px 8px; border-radius: 5px; background: #fff1ef; color: var(--danger); font-size: 11px; overflow-wrap: anywhere; }
+.subagent-item-approvals { display: flex; flex-direction: column; gap: 6px; padding: 8px; border: 1px solid #ead79b; border-radius: 7px; background: #fff9e8; }
+.subagent-item-approvals > strong { color: #6c5012; font-size: 11px; }
+.subagent-item-approvals .approval { margin: 0; background: #fff; }
+.subagent-item-approvals .approval pre { max-height: 24vh; overflow: auto; }
 .subagent-item-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; padding-top: 2px; border-top: 1px solid #edf0ed; }
 .subagent-item-actions button { display: inline-flex; min-height: 30px; align-items: center; justify-content: center; gap: 5px; padding: 5px 8px; font-size: 11px; }
 
@@ -933,6 +938,15 @@ nav button.active { color: #fff; border-bottom-color: #d6f56f; }
 .inline-approvals { display: flex; flex-direction: column; gap: 8px; padding: 10px 14px; border-bottom: 1px solid #e4e8e5; background: #fff8e8; }
 .inline-approvals .approval { margin: 0; }
 .inline-approvals .approval pre { max-height: 22vh; overflow: auto; }
+.delegated-approvals { border-bottom-color: #dfc46e; background: #fff4cf; }
+.delegated-approvals-title > div { display: flex; flex-direction: column; gap: 2px; }
+.delegated-approvals-title strong { color: #62480f; font-size: 13px; }
+.delegated-approvals-title span { color: #786737; font-size: 11px; }
+.delegated-approval { padding: 8px; border: 1px solid #e3c96f; border-radius: 8px; background: #fffaf0; }
+.delegated-approval-target { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.delegated-approval-target span { min-width: 0; overflow: hidden; color: #5c4a1d; font-size: 11px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.delegated-approval-target button { flex: 0 0 auto; min-height: 28px; padding: 4px 8px; font-size: 10px; }
+.delegated-approval > .approval { margin-top: 7px; }
 
 /* AskUserQuestion 도구 호출은 일반 허용/거부 버튼 대신 실제 질문·선택지를 보여주는 폼으로 렌더링된다. */
 .approval-question-block { display: block; margin-top: 8px; }
