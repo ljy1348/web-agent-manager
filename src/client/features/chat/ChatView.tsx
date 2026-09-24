@@ -8,7 +8,7 @@ import { TerminalPanel } from "../terminal/TerminalPanel";
 import { splitMessageContent } from "../../message-display";
 import { chatActivity } from "../../lib/approvals";
 import { ApprovalCard } from "../../components/ApprovalCard";
-import { usageWindows } from "../../lib/format";
+import { formatUsageResetAt, usageWindows } from "../../lib/format";
 import { attachmentUrl, isImagePath, MessageBody } from "../../lib/attachments";
 import { DiffView, looksLikeDiff } from "../../lib/diff-view";
 import type { Json } from "../../types";
@@ -54,6 +54,7 @@ function preferredModelOption(options: Json, selectedChat: Json): Json | null {
   const chatModel = normalizeModelLabel(selectedChat?.model);
   return models.find((item: Json) => chatModel && normalizeModelLabel(item.label) === chatModel)
     || models.find((item: Json) => item.current)
+    || models.find((item: Json) => chatModel && normalizeModelLabel(item.resolvedLabel) === chatModel)
     || models[0]
     || null;
 }
@@ -344,6 +345,13 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
 
   const pendingApprovals = approvals.filter((item: Json) => item.status === "pending" && projectChatIds.has(item.chat_id));
   const selectedApprovals = pendingApprovals.filter((item: Json) => item.chat_id === selectedChat?.id);
+  // delegate로 만든 자식 채팅의 승인은 부모가 결과를 기다리는 동안 바로 처리할 수 있어야 한다.
+  // 모바일에서는 프로젝트 전체 approval-list가 숨겨지므로 API가 제공한 최신 위임 source 연결을
+  // 이용해 부모 대화 안에 전달한다. 대상 채팅 자체의 inline 카드와 섞이지 않게 별도로 표시한다.
+  const delegatedApprovals = pendingApprovals.filter((item: Json) => (
+    item.chat_id !== selectedChat?.id
+    && Number(item.delegation_source_chat_id) === Number(selectedChat?.id)
+  ));
   // 모바일 메뉴 목록은 선택된 채팅 것을 빼서 보여준다 — 그건 이미 대화창 안(inline-approvals)에 떠
   // 있어서 메뉴에도 또 나오면 같은 카드가 두 번 보였다(모바일에서 "2장씩" 보고된 원인).
   const otherPendingApprovals = pendingApprovals.filter((item: Json) => item.chat_id !== selectedChat?.id);
@@ -409,8 +417,7 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
     }).catch(() => undefined).finally(() => { if (active) setModelLoading(false); });
     return () => { active = false; };
   }, [selectedChat?.id, selectedChat?.provider, selectedChat?.model]);
-  // 사용자가 직접 눌렀을 때만 상태 조회용 CLI에 /model을 다시 보내 목록을 갱신한다(그 외엔 서버가
-  // 시작할 때 한 번 캐시해둔 값만 읽는다).
+  // 사용자가 직접 눌렀을 때 공급자의 direct 모델 카탈로그를 다시 읽고, 실패한 경우에만 TUI로 폴백한다.
   async function refreshModelOptions(): Promise<void> {
     if (!selectedChat?.provider) return;
     setModelRefreshing(true);
@@ -1101,22 +1108,22 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
       {selectedChat && <div className="model-bar-summary">
         <b>{selectedChat.model || "감지 중…"}</b>
         {selectedActivity && <b className={`activity-text ${selectedActivity.className}`}>{selectedActivity.label}</b>}
-        {primaryUsageWindow && <span className="summary-usage">{primaryUsageLabel} 사용량 {primaryUsageWindow.usedPercent}%{primaryUsageWindow.resetAt && <span className="summary-reset"> · 초기화 {primaryUsageWindow.resetAt}</span>}</span>}
+        {primaryUsageWindow && <span className="summary-usage">{primaryUsageLabel} 사용량 {primaryUsageWindow.usedPercent}%{primaryUsageWindow.resetAt && <span className="summary-reset"> · 초기화 {formatUsageResetAt(primaryUsageWindow.resetAt)}</span>}</span>}
         <button type="button" aria-expanded={modelBarExpanded} onClick={() => setModelBarExpanded((value) => !value)}>{modelBarExpanded ? "접기 ▴" : "자세히 ▾"}</button>
       </div>}
       {selectedChat && <div className={`model-bar${modelBarExpanded ? " expanded" : ""}`}>
         <span>모델 <b>{selectedChat.model || "감지 중…"}</b></span>
         {selectedActivity && <span>상태 <b className={`activity-text ${selectedActivity.className}`}>{selectedActivity.label}</b></span>}
-        {primaryUsageWindow && <span>{primaryUsageLabel} 사용량 <b>{primaryUsageWindow.usedPercent}%</b>{primaryUsageWindow.resetAt && ` · 초기화 ${primaryUsageWindow.resetAt}`}</span>}
+        {primaryUsageWindow && <span>{primaryUsageLabel} 사용량 <b>{primaryUsageWindow.usedPercent}%</b>{primaryUsageWindow.resetAt && ` · 초기화 ${formatUsageResetAt(primaryUsageWindow.resetAt)}`}</span>}
         <label className="tool-details-toggle"><input type="checkbox" checked={showToolDetails} onChange={(event) => setShowToolDetails(event.target.checked)} />도구·diff 상세 보기</label>
         {!structuredChat && !!modelOptions?.models?.length && <select aria-label="모델 선택" value={selectedModelIndex} onChange={(event) => setSelectedModelIndex(event.target.value)}>
-          {modelOptions.models.map((item: Json) => <option key={item.index} value={item.index}>{item.label}{item.index === currentModelOption?.index ? " (현재)" : ""}</option>)}
+          {modelOptions.models.map((item: Json) => <option key={item.index} value={item.index}>{item.label}{item.resolvedLabel && normalizeModelLabel(item.resolvedLabel) !== normalizeModelLabel(item.label) ? ` — ${item.resolvedLabel}` : ""}{item.index === currentModelOption?.index ? " (현재)" : ""}</option>)}
         </select>}
         {!structuredChat && !!modelOptions?.efforts?.length && <select aria-label="추론 강도 선택" value={selectedEffortId} onChange={(event) => setSelectedEffortId(event.target.value)}>
           {modelOptions.efforts.map((item: Json) => <option key={item.id} value={item.id}>{item.label}{item.id === currentEffortOption?.id ? " (현재)" : ""}</option>)}
         </select>}
         {!structuredChat && <button type="button" disabled={modelLoading || modelApplying || !selectedModelIndex} onClick={() => void applyModelSelection()}>{modelApplying ? "적용 중…" : modelLoading ? "모델 확인 중…" : "모델 적용"}</button>}
-        <button type="button" disabled={modelRefreshing} title="상태 조회용 CLI에 다시 물어 모델·추론 강도 목록을 새로고침합니다" onClick={() => void refreshModelOptions()}>{modelRefreshing ? "새로고침 중…" : "모델 목록 새로고침"}</button>
+        <button type="button" disabled={modelRefreshing} title="공급자의 direct 카탈로그를 다시 읽고 실패 시에만 TUI로 확인합니다" onClick={() => void refreshModelOptions()}>{modelRefreshing ? "새로고침 중…" : "모델 목록 새로고침"}</button>
         {selectedProvider.supportsPermissionMode && selectedChat.permission_mode && <span>권한 모드 <b>{selectedChat.permission_mode}</b></span>}
         {!structuredChat && selectedProvider.supportsPermissionMode && selectedChat.status === "running" && <button type="button" disabled={cyclingMode} title="기본(권한 요청)·auto-accept edits·plan mode 순으로 전환합니다" onClick={() => {
           setCyclingMode(true);
@@ -1129,6 +1136,16 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
       </div>}
       {selectedChat && !terminalMode && <VerificationPanel chatId={selectedChat.id} isAdmin={user?.role === "admin"} canRunTests={user?.role === "admin" || testOnly} refreshKey={busy} />}
       {selectedApprovals.length > 0 && <div className="inline-approvals">{selectedApprovals.map((item: Json) => <ApprovalCard key={item.id} item={item} decide={decide} />)}</div>}
+      {delegatedApprovals.length > 0 && <div className="inline-approvals delegated-approvals">
+        <div className="delegated-approvals-title"><div><strong>서브 에이전트 권한 요청</strong><span>부모 채팅에서 바로 처리할 수 있습니다.</span></div></div>
+        {delegatedApprovals.map((item: Json) => <section className="delegated-approval" key={item.id}>
+          <div className="delegated-approval-target">
+            <span>{item.chat_title || `채팅 #${item.chat_id}`}</span>
+            <button type="button" onClick={() => void onOpenChat(Number(item.chat_id))}>채팅 #{item.chat_id} 열기</button>
+          </div>
+          <ApprovalCard item={item} decide={decide} />
+        </section>)}
+      </div>}
       {terminalMode
         ? <section className="terminal-panel terminal-panel-full" aria-label="채팅 터미널"><div className="terminal-panel-head"><span>채팅 터미널</span><small>현재 CLI 세션에 직접 입력합니다</small></div>{selectedChat ? <TerminalPanel chat={selectedChat} socket={socket} /> : <div className="terminal-empty">채팅을 선택하세요.</div>}</section>
         : <div className="conversation"><div className="messages" ref={scrollParent} onScroll={handleMessagesScroll} onWheel={cancelAutomaticScroll} onTouchStart={cancelAutomaticScroll} onPointerDown={cancelAutomaticScroll}>
@@ -1277,6 +1294,8 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
       interrupt={interrupt}
       stop={stop}
       startChat={startChat}
+      approvals={pendingApprovals}
+      decide={decide}
       onClose={() => setSubagentOpen(false)}
     />}
   </>;

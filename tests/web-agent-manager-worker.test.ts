@@ -61,7 +61,7 @@ describe("web-agent-manager-worker CLI", () => {
     const env = setup();
     const capabilities = await cli(env.configPath, ["capabilities", "--json"]);
     expect(capabilities.code).toBe(0);
-    expect(JSON.parse(capabilities.stdout)).toEqual({ protocol: "wam-worker/v1", version: "0.6.0", capabilities: ["test"] });
+    expect(JSON.parse(capabilities.stdout)).toEqual({ protocol: "wam-worker/v1", version: "0.7.0", capabilities: ["test"] });
     const encoded = request(env.project);
     const started = await cli(env.configPath, ["tasks", "start", "--protocol", "wam-worker/v1", "--request-base64", encoded]);
     expect(started.code).toBe(0); expect(started.elapsed).toBeLessThan(2_000);

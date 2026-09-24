@@ -77,6 +77,12 @@ export function parseClockTime(text: string): { hour: number; minute: number } |
 // 본다. 타임존이 명시되지 않으면 서버가 도는 로컬 시간대를 그대로 쓴다. 파싱할 수 없으면 null.
 export function parseResetTime(resetAt: string | null | undefined, now: Date): Date | null {
   if (!resetAt) return null;
+  // Direct collectors return an absolute ISO timestamp. Preserve the date instead of applying the
+  // legacy TUI rule that rolls a time-of-day forward to today or tomorrow.
+  if (/^\d{4}-\d{2}-\d{2}T/i.test(resetAt)) {
+    const absolute = new Date(resetAt);
+    if (!Number.isNaN(absolute.getTime())) return absolute;
+  }
   const dated = parseDatedResetTime(resetAt);
   if (dated) return dated;
   const clock = parseClockTime(resetAt);

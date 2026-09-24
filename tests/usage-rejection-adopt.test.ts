@@ -246,6 +246,8 @@ r to retry · Esc to cancel`;
     expect(state.rejectedStreak).toBe(0);
 
     (state.adapter as any).parseUsage = () => usageRecord(10, 20);
+    // 임시 PTY는 각 폴백 조회가 끝날 때 닫히므로 앞선 정상 종료 호출은 이 검사의 대상이 아니다.
+    state.terminal.kill.mockClear();
     await (monitor as any).finishUsage(state, "screen");
     expect(state.rejectedStreak).toBe(1);
     expect(readStatus(database).used_percent).toBe(90);
@@ -253,7 +255,7 @@ r to retry · Esc to cancel`;
     database.close();
   });
 
-  it("fallback 백오프 동안 자동 조회는 건너뛰고 사용자 수동 조회는 허용한다", () => {
+  it("fallback 백오프 동안 자동 조회는 건너뛰고 사용자 수동 조회는 허용한다", async () => {
     const { database, monitor, state } = buildMonitor();
     Object.assign(state, {
       busy: false,
@@ -262,6 +264,7 @@ r to retry · Esc to cancel`;
       screen: { reset: vi.fn(), text: vi.fn(() => "screen") },
     });
     (state.adapter as any).usageCommands = ["/usage"];
+    (state.adapter as any).isReady = () => true;
     state.terminal.write.mockClear();
 
     (monitor as any).requestUsage(state);
@@ -269,6 +272,7 @@ r to retry · Esc to cancel`;
     expect(state.busy).toBe(false);
 
     (monitor as any).requestUsage(state, true);
+    await Promise.resolve();
     expect(state.terminal.write).toHaveBeenCalledWith("/usage\r");
     expect(state.busy).toBe(true);
     clearTimeout((state as any).parseTimer);
@@ -296,8 +300,8 @@ describe("사용량 리셋 알림은 계정별로 관찰한다", () => {
       {} as never,
       { observe: (provider: string, details: string | null | undefined, _observedAt: Date, accountId: number | undefined) => { observed.push({ provider, details, accountId }); } } as never,
     );
-    const defaultState = { adapter, account: defaultAccount, rejectedStreak: 0, terminal: { write: vi.fn() }, busy: true };
-    const extraState = { adapter, account: extraAccount, rejectedStreak: 0, terminal: { write: vi.fn() }, busy: true };
+    const defaultState = { adapter, account: defaultAccount, rejectedStreak: 0, terminal: { write: vi.fn(), kill: vi.fn() }, busy: true };
+    const extraState = { adapter, account: extraAccount, rejectedStreak: 0, terminal: { write: vi.fn(), kill: vi.fn() }, busy: true };
 
     await (monitor as any).finishUsage(defaultState, "screen");
     await (monitor as any).finishUsage(extraState, "screen");

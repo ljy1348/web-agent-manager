@@ -16,7 +16,6 @@ function androidResumeScript(): string {
   return JSON.parse(`"${match[1]}"`);
 }
 
-type ResumeSocket = { readyState: number; close: () => void };
 type ForegroundResume = {
   resume: () => void;
   handleVisibility: () => void;
@@ -34,13 +33,9 @@ function loadCreateForegroundResume(globals: { window: object; document: { visib
     window: globals.window,
     document: globals.document,
     Date,
-    WebSocket: { CONNECTING: 0 },
     createForegroundResume: undefined as undefined | ((options: {
       refresh: () => void;
-      getSocket: () => ResumeSocket | null;
-      connect: () => void;
-      markIntentionalClose: () => void;
-      clearReconnectTimer: () => void;
+      replaceSocket: () => void;
     }) => ForegroundResume),
   };
   vm.runInNewContext(`${js}\nthis.createForegroundResume = createForegroundResume;`, sandbox);
@@ -70,30 +65,19 @@ describe("웹 복귀 훅", () => {
     const documentObj = { visibilityState };
     const createForegroundResume = loadCreateForegroundResume({ window: windowObj, document: documentObj });
     const refresh = vi.fn();
-    const connect = vi.fn();
-    const markIntentionalClose = vi.fn();
-    const clearReconnectTimer = vi.fn();
-    let socket: ResumeSocket | null = { readyState: 1, close: vi.fn() };
+    const replaceSocket = vi.fn();
     const ctl = createForegroundResume({
       refresh,
-      getSocket: () => socket,
-      connect: () => {
-        connect();
-        socket = { readyState: 0, close: vi.fn() };
-      },
-      markIntentionalClose,
-      clearReconnectTimer,
+      replaceSocket,
     });
-    return { windowObj, documentObj, refresh, connect, markIntentionalClose, clearReconnectTimer, getSocket: () => socket, setSocket: (next: ResumeSocket | null) => { socket = next; }, ctl };
+    return { windowObj, documentObj, refresh, replaceSocket, ctl };
   }
 
   it("훅 호출 시 재조회와 소켓 재연결을 한다", () => {
     const ctx = boot();
     ctx.windowObj.__webAgentManagerResume__?.();
     expect(ctx.refresh).toHaveBeenCalledTimes(1);
-    expect(ctx.markIntentionalClose).toHaveBeenCalledTimes(1);
-    expect(ctx.connect).toHaveBeenCalledTimes(1);
-    expect(ctx.clearReconnectTimer).toHaveBeenCalledTimes(1);
+    expect(ctx.replaceSocket).toHaveBeenCalledTimes(1);
   });
 
   it("visibilitychange와 훅이 연달아 와도 소켓은 한 번만 교체한다", () => {
@@ -101,8 +85,7 @@ describe("웹 복귀 훅", () => {
     ctx.ctl.handleVisibility();
     ctx.windowObj.__webAgentManagerResume__?.();
     expect(ctx.refresh).toHaveBeenCalledTimes(2);
-    expect(ctx.connect).toHaveBeenCalledTimes(1);
-    expect(ctx.markIntentionalClose).toHaveBeenCalledTimes(1);
+    expect(ctx.replaceSocket).toHaveBeenCalledTimes(1);
   });
 
   it("숨김 상태의 visibilitychange는 재조회하지 않지만 훅은 숨김이어도 재조회한다", () => {
@@ -113,12 +96,10 @@ describe("웹 복귀 훅", () => {
     expect(hidden.refresh).toHaveBeenCalledTimes(1);
   });
 
-  it("연결 중인 소켓은 닫지 않고 교체를 건너뛴다", () => {
+  it("복귀할 때 브라우저 readyState 판정 없이 manager 교체를 호출한다", () => {
     const ctx = boot();
-    ctx.setSocket({ readyState: 0, close: vi.fn() });
     ctx.ctl.resume();
-    expect(ctx.connect).not.toHaveBeenCalled();
-    expect(ctx.markIntentionalClose).not.toHaveBeenCalled();
+    expect(ctx.replaceSocket).toHaveBeenCalledTimes(1);
     expect(ctx.refresh).toHaveBeenCalledTimes(1);
   });
 

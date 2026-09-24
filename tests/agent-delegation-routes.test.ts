@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AuthenticatedRequest } from "../src/server/core/auth";
 import { openDatabase, type AppDatabase } from "../src/server/core/database";
 import { createAgentDelegationRouter } from "../src/server/routes/agent-delegation-routes";
+import { createOperationsRouter } from "../src/server/routes/operations-routes";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -86,6 +87,64 @@ describe("서브 에이전트 관리 API", () => {
       },
     });
     expect(database.prepare("SELECT action FROM audit_logs ORDER BY id DESC LIMIT 1").get()).toMatchObject({ action: "agent.delegation_create" });
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    database.close();
+  });
+
+  it("승인 목록에 현재 자식 위임의 부모 채팅 연결을 중복 없이 포함한다", async () => {
+    const { database, root } = createDatabase();
+    database.prepare("INSERT INTO users(id, username, password_hash, role) VALUES (1, 'admin', 'test', 'admin')").run();
+    database.prepare("INSERT INTO projects(id, name, path) VALUES (1, 'sample', ?)").run(root);
+    database.prepare("INSERT INTO chats(id, project_id, provider, tmux_name, status, title) VALUES (1, 1, 'codex', 'parent-current', 'running', '현재 부모')").run();
+    database.prepare("INSERT INTO chats(id, project_id, provider, tmux_name, status, title, origin) VALUES (2, 1, 'claude', 'child', 'running', '위임 자식', 'delegation')").run();
+    database.prepare("INSERT INTO chats(id, project_id, provider, tmux_name, status, title) VALUES (3, 1, 'codex', 'parent-old', 'running', '예전 부모')").run();
+    database.prepare(`
+      INSERT INTO delegations(id, idempotency_key, source_chat_id, target_chat_id, prompt, status, completed_at, created_at, updated_at)
+      VALUES ('delegation-old', 'key-old', 3, 2, '이전 작업', 'sent', '2026-09-23 00:10:00', '2026-09-23 00:00:00', '2026-09-23 00:10:00')
+    `).run();
+    database.prepare(`
+      INSERT INTO delegations(id, idempotency_key, source_chat_id, target_chat_id, prompt, status, created_at, updated_at)
+      VALUES ('delegation-current', 'key-current', 1, 2, '현재 작업', 'sent', '2026-09-24 00:00:00', '2026-09-24 00:00:00')
+    `).run();
+    database.prepare(`
+      INSERT INTO approvals(id, chat_id, provider, request_type, request_payload)
+      VALUES ('approval-child', 2, 'claude', 'permission', '{"tool_name":"Bash"}')
+    `).run();
+
+    const app = express();
+    app.use(express.json());
+    app.use((request: AuthenticatedRequest, _response, next) => {
+      request.authUser = { id: 1, username: "admin", role: "admin" };
+      next();
+    });
+    app.use(createOperationsRouter(
+      database,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      [],
+      {} as never,
+      async () => null,
+    ));
+    const server = app.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const { port } = server.address() as AddressInfo;
+    const response = await fetch(`http://127.0.0.1:${port}/approvals`);
+    const body = await response.json() as { approvals: Array<Record<string, unknown>> };
+
+    expect(response.status).toBe(200);
+    expect(body.approvals).toHaveLength(1);
+    expect(body.approvals[0]).toMatchObject({
+      id: "approval-child",
+      chat_id: 2,
+      chat_title: "위임 자식",
+      chat_project_id: 1,
+      chat_origin: "delegation",
+      delegation_id: "delegation-current",
+      delegation_source_chat_id: 1,
+    });
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     database.close();
   });

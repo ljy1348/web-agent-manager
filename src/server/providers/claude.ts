@@ -7,6 +7,7 @@ import { extractContent, fallbackId } from "./history-utils";
 import { stripAnsi } from "../core/security";
 import { isExpiredResetTime } from "./usage-utils";
 import { USAGE_KEEPALIVE_PROMPT } from "../../shared/usage-keepalive";
+import { collectClaudeModelOptions, collectClaudeUsage } from "./claude-usage-collector";
 
 // Claude API 프로토콜은 도구 실행 결과를 "user" 역할 턴으로 되돌려주므로,
 // 사람이 입력한 메시지와 구분하기 위해 tool_result만 담긴 턴인지 확인한다.
@@ -43,13 +44,8 @@ function claudeEffortId(value: string | null | undefined): string | null {
   return null;
 }
 
-// Claude 모델 ID·라벨을 메뉴 순서와 무관한 모델군 이름으로 정규화한다.
-function claudeModelFamily(value: string | null | undefined): string | null {
-  const normalized = String(value ?? "").toLowerCase();
-  for (const family of ["default", "opus", "sonnet", "fable", "haiku"]) {
-    if (normalized.includes(family)) return family;
-  }
-  return null;
+function claudeSelectionSlug(value: string | null | undefined): string {
+  return String(value ?? "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
 }
 
 // Claude 화면 스크롤백에 남은 예전 effort 결과보다 가장 최근 effort 표시를 우선한다.
@@ -557,6 +553,8 @@ export function ensureClaudeWorkspaceTrusted(homeDir: string, workspacePath: str
 export class ClaudeAdapter implements ProviderAdapter {
   readonly id = "claude" as const;
   readonly displayLabel = "Claude";
+  readonly collectUsage = collectClaudeUsage;
+  readonly collectModelOptions = collectClaudeModelOptions;
   readonly usageWindowId = "session";
   readonly usageResetWindowIds = ["session", "weekly_all"];
   readonly usageWindowLabels = { session: "5시간", weekly_all: "주간" };
@@ -909,11 +907,18 @@ export class ClaudeAdapter implements ProviderAdapter {
   // Claude 실제 /model 화면에서 안정 ID와 같은 모델을 다시 찾아 현재 번호로 선택한다.
   async applyModelSelection(io: TmuxIO, _modelIndex: number, _effortId: string | null, modelId?: string | null): Promise<void> {
     if (!await io.waitForModelMenu("models", 2_500)) throw new Error("Claude 모델 선택 화면을 찾지 못했습니다.");
-    const targetFamily = claudeModelFamily(modelId);
-    if (!targetFamily) throw new Error("유효하지 않은 Claude 모델 선택입니다.");
     const models = this.parseModelOptions(io.snapshot()).models;
-    const exact = models.find((model) => model.id === modelId);
-    const target = exact ?? models.find((model) => claudeModelFamily(`${model.id} ${model.label}`) === targetFamily);
+    let target: ModelChoice | undefined;
+    if (modelId === "default") target = models.find((model) => model.id === "default" || model.id.startsWith("default-"));
+    else if (modelId?.startsWith("alias:")) target = models.find((model) => model.id === claudeSelectionSlug(modelId.slice("alias:".length)));
+    else if (modelId?.startsWith("exact:")) target = models.find((model) => model.id === claudeSelectionSlug(modelId.slice("exact:".length)));
+    else {
+      // 배포 전 클라이언트 캐시의 기존 family ID도 한 번은 안전하게 받아준다. 첫 토큰만 alias로
+      // 해석하며 특정 Claude family 이름은 하드코딩하지 않는다.
+      const legacy = claudeSelectionSlug(modelId).replace(/^claude-/, "").split("-")[0];
+      target = models.find((model) => model.id === claudeSelectionSlug(modelId))
+        ?? (legacy ? models.find((model) => model.id === legacy) : undefined);
+    }
     if (!target) throw new Error("Claude 현재 모델 메뉴에서 선택 항목을 찾지 못했습니다.");
     io.sendText(String(target.index));
     io.sendEnter();

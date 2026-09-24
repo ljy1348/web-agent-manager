@@ -1,4 +1,6 @@
 import type { Provider, UsageRecord } from "../../shared/types";
+import type { ProviderUsageCollector } from "./usage-collector";
+import type { ProviderModelOptionsCollector } from "./model-options-collector";
 
 export interface ProviderLaunch {
   command: string;
@@ -84,6 +86,11 @@ export interface ModelChoice {
   label: string;
   description?: string;
   current?: boolean;
+  // 공급자 picker의 논리 선택과 그 선택이 현재 가리키는 실제 모델을 분리한다. Claude처럼
+  // `Opus` alias가 새 버전으로 이동하는 공급자에서 label/id를 하드코딩하지 않고 표시할 때 쓴다.
+  selectionKind?: "default" | "alias" | "exact";
+  resolvedModelId?: string;
+  resolvedLabel?: string;
 }
 
 export interface ModelOptions {
@@ -162,6 +169,12 @@ export interface ProviderAdapter {
   // 작업 중 입력은 UserPromptSubmit 훅도 user 기록도 바로 생기지 않아 제출 증거가 따로 필요하다.
   hasQueuedPrompt?(historyFile: string, expectedPrompt: string, sinceMs: number): boolean;
   parseUsage(output: string, now?: Date): Partial<UsageRecord>;
+  // 계정별 구조화 사용량 조회. UsageMonitor는 이 경로를 먼저 시도하고 실패할 때만 아래 TUI
+  // usageCommands/parseUsage 계약으로 폴백한다.
+  collectUsage?: ProviderUsageCollector;
+  // 모델 카탈로그도 구조화 RPC/비대화형 CLI/로컬 메타데이터를 먼저 쓰고, 실패할 때만
+  // parseModelOptions용 TUI를 연다.
+  collectModelOptions?: ProviderModelOptionsCollector;
   detectApproval(output: string): ApprovalHint | null;
   detectModel(output: string): string | null;
   parseModelOptions?(output: string): ModelOptions;

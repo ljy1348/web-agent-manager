@@ -768,6 +768,30 @@ describe("Claude 세션 기록 파싱", () => {
     expect(sentTexts).toEqual(["4"]);
   });
 
+  it("동일 family의 최신 alias와 명시적 구버전을 선택 ID로 구분한다", async () => {
+    const sentTexts: string[] = [];
+    const screen = [
+      "Select model",
+      "  1. Default (recommended)  Opus 5.5 · Best for complex tasks",
+      "  2. Opus                   Opus 5.5 · Best for complex tasks",
+      "❯ 6. Opus 5 ✔               Newer version available · select Opus for Opus 5.5",
+    ].join("\n");
+    const io: TmuxIO = {
+      tmuxName: "fake",
+      sendText: (value) => sentTexts.push(value),
+      sendEnter: () => undefined,
+      sendLeft: () => undefined,
+      sendRight: () => undefined,
+      wait: async () => undefined,
+      snapshot: () => screen,
+      waitForModelMenu: async () => true,
+    };
+    const adapter = new ClaudeAdapter("", {});
+    await adapter.applyModelSelection(io, 2, "high", "alias:opus");
+    await adapter.applyModelSelection(io, 3, "high", "exact:opus-5");
+    expect(sentTexts).toEqual(["2", "6"]);
+  });
+
   it("기존 세션 재개 후 /model 메뉴에서 현재 모델명과 중간 effort 게이지를 읽는다", () => {
     const screen = [
       "Select model",

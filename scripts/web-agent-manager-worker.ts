@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { redactVerificationOutput } from "../src/server/services/verification-service";
 
 const PROTOCOL = "wam-worker/v1";
-const WORKER_VERSION = "0.6.0";
+const WORKER_VERSION = "0.7.0";
 const CAPABILITIES = new Set(["build", "test", "verify", "preview"]);
 const STATES = new Set(["queued", "running", "completed", "failed"]);
 const OUTPUT_LIMIT = 64 * 1024;

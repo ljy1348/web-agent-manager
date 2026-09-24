@@ -486,7 +486,9 @@ export class SessionManager {
 
   // 선택한 모델 ID·번호와, 공급자가 지원하면 별도 추론 강도 명령까지 해당 채팅 TUI에 적용한다.
   async changeModel(chatId: number, modelIndex: number, modelId: string | null, effortId: string | null, user: AuthUser): Promise<void> {
-    if (!Number.isInteger(modelIndex) || modelIndex < 1 || modelIndex > 20) throw new Error("유효하지 않은 모델 선택입니다.");
+    // 공급자 카탈로그가 늘어나도 배포 없이 선택할 수 있어야 하므로 임의의 개수 상한을 두지 않는다.
+    // 실제 선택 유효성은 adapter가 방금 연 최신 메뉴/카탈로그의 안정 modelId로 다시 확인한다.
+    if (!Number.isSafeInteger(modelIndex) || modelIndex < 1) throw new Error("유효하지 않은 모델 선택입니다.");
     const chat = this.getChat(chatId);
     this.assertChatNotBusy(chat, "모델 변경");
     const terminal = await this.waitUntilReady(chatId, chat.provider);

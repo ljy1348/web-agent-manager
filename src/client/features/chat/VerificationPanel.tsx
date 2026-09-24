@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { api } from "../../api";
+import { createClientUuid } from "../../lib/client-uuid";
 import type { Json } from "../../types";
 
 const STATE_LABELS: Record<string, string> = {
@@ -38,8 +39,7 @@ function shortHash(value: unknown): string {
 }
 
 function idempotencyKey(prefix: string): string {
-  const suffix = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  return `${prefix}-${suffix}`;
+  return `${prefix}-${createClientUuid()}`;
 }
 
 function stateLabel(value: unknown): string {

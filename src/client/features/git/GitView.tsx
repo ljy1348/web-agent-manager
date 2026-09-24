@@ -8,6 +8,7 @@ import { GithubRepositoryList } from "../../components/GithubRepositoryList";
 import { GitBranchControl } from "../../components/GitBranchControl";
 import { DiffFileCard, DiffModeToggle, DiffView, type DiffLineCommentTarget, type DiffMode, type DiffReviewControls, type ExpandLines } from "../../lib/diff-view";
 import { parseDiffFiles, statusLabel } from "../../lib/diff-parse";
+import { createClientUuid } from "../../lib/client-uuid";
 import type { Json } from "../../types";
 
 type GitTab = "repositories" | "diff" | "github";
@@ -678,7 +679,7 @@ export function GitView({ project, user, chat, providers, refreshChats, onOpenPr
   function startLineComment(target: DiffLineCommentTarget): void {
     const selected = reviewHunk(target.path, target.hunkIndex);
     if (!selected) return;
-    setCommentTarget({ ...target, hunkId: selected.id }); setCommentText(""); setCommentKey(`diff-comment-${crypto.randomUUID()}`);
+    setCommentTarget({ ...target, hunkId: selected.id }); setCommentText(""); setCommentKey(`diff-comment-${createClientUuid()}`);
   }
 
   async function resendLineComment(): Promise<void> {

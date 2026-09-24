@@ -1,5 +1,23 @@
 import { describe, expect, it } from "vitest";
-import { isUsageFallbackNotice, usageErrorLabel } from "../src/client/lib/format";
+import { formatUsageResetAt, isUsageFallbackNotice, usageErrorLabel } from "../src/client/lib/format";
+
+describe("사용량 초기화 시각 한국 시간 표시", () => {
+  const now = new Date("2026-09-23T04:00:00.000Z");
+
+  it.each([
+    ["2026-09-25T04:23:46.615Z", "09월 25일 13:23"],
+    ["17:13 on 26 Sep", "09월 26일 17:13"],
+    ["Sep 25, 1:23pm (Asia/Seoul)", "09월 25일 13:23"],
+    ["September 25, 13:23", "09월 25일 13:23"],
+    ["8:00pm (Asia/Seoul)", "09월 23일 20:00"],
+  ])("%s를 날짜·시·분으로 통일한다", (value, expected) => {
+    expect(formatUsageResetAt(value, now)).toBe(expected);
+  });
+
+  it("해석할 수 없는 레거시 문구는 정보 손실 없이 유지한다", () => {
+    expect(formatUsageResetAt("다음 결제 주기")).toBe("다음 결제 주기");
+  });
+});
 
 describe("사용량 fallback UI 의미", () => {
   it.each([
