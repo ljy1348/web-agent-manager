@@ -13,7 +13,18 @@ interface SendResult {
   errorCode?: string;
 }
 
-export type FcmSender = (tokens: string[], title: string, body: string, data: Record<string, string>) => Promise<SendResult[]>;
+type FcmSender = (tokens: string[], title: string, body: string, data: Record<string, string>) => Promise<SendResult[]>;
+
+// 현재 Android SDK는 registration token 대신 Firebase Installation ID(FID)를 등록한다.
+// HTTP v1의 두 대상 필드는 다르므로 FID를 token 필드에 넣지 않는다.
+export function fcmMessagePayload(fid: string, title: string, body: string, data: Record<string, string>) {
+  return { message: {
+    fid,
+    notification: { title, body },
+    data,
+    android: { priority: "HIGH", notification: { channel_id: "web_agent_manager_events", click_action: "OPEN_WEB_AGENT_MANAGER" } },
+  } };
+}
 
 // 운영 이벤트 유형을 Android 알림 제목으로 변환한다.
 export function fcmTitle(eventType: string): string {
@@ -37,16 +48,11 @@ async function sendWithFirebase(config: AppConfig, tokens: string[], title: stri
   const access = await client.getAccessToken();
   const accessToken = typeof access === "string" ? access : access.token;
   if (!accessToken) throw new Error("FCM 액세스 토큰을 발급받지 못했습니다.");
-  return Promise.all(tokens.map(async (token): Promise<SendResult> => {
+  return Promise.all(tokens.map(async (fid): Promise<SendResult> => {
     const response = await fetch(`https://fcm.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/messages:send`, {
       method: "POST",
       headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json; charset=utf-8" },
-      body: JSON.stringify({ message: {
-        token,
-        notification: { title, body },
-        data,
-        android: { priority: "HIGH", notification: { channel_id: "web_agent_manager_events", click_action: "OPEN_WEB_AGENT_MANAGER" } },
-      } }),
+      body: JSON.stringify(fcmMessagePayload(fid, title, body, data)),
       signal: AbortSignal.timeout(10_000),
     });
     if (response.ok) return { success: true };
@@ -95,6 +101,7 @@ export class FcmNotifier implements Notifier {
   // 전송이 필요한 활성 기기를 500개씩 나눠 보내고 만료된 토큰을 자동 비활성화한다.
   async notify(eventId: string, eventType: string, text: string, presentation?: NotificationPresentation): Promise<void> {
     if (this.config.fcm?.enabled !== true) return;
+    let retryableFailure = false;
     const devices = this.database.prepare(`
       SELECT d.id, d.token FROM push_devices d
       LEFT JOIN fcm_deliveries f ON f.device_id = d.id AND f.event_id = ? AND f.status = 'sent'
@@ -104,10 +111,14 @@ export class FcmNotifier implements Notifier {
       const batch = devices.slice(offset, offset + 500);
       let results: SendResult[];
       try {
-        results = await this.sender(batch.map((device) => device.token), presentation?.title ?? fcmTitle(eventType), text, { eventType, eventId });
+        const push = presentation?.push;
+        const data: Record<string, string> = { eventType, eventId };
+        if (push?.chatId) data.chatId = String(push.chatId);
+        results = await this.sender(batch.map((device) => device.token), push?.title ?? presentation?.title ?? fcmTitle(eventType), push?.body ?? text, data);
       } catch (error) {
         const code = error instanceof Error ? error.name : "FCM 전송 실패";
         for (const device of batch) this.recordDelivery(eventId, eventType, device.id, "failed", code);
+        retryableFailure = true;
         continue;
       }
       for (let index = 0; index < batch.length; index += 1) {
@@ -116,9 +127,11 @@ export class FcmNotifier implements Notifier {
         this.recordDelivery(eventId, eventType, device.id, result.success ? "sent" : "failed", result.errorCode ?? null);
         if (["messaging/registration-token-not-registered", "messaging/invalid-registration-token"].includes(result.errorCode ?? "")) {
           this.database.prepare("UPDATE push_devices SET active = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(device.id);
-        }
+        } else if (!result.success) retryableFailure = true;
       }
     }
+    // 원격 WAM 집계 커서는 실패 시 움직이지 않는다. 이미 보낸 기기는 delivery 기록으로 중복 전송하지 않는다.
+    if (retryableFailure) throw new Error("FCM 전송 실패: 나중에 다시 시도합니다.");
   }
 
   // 기기별 전송 결과를 이벤트 단위로 갱신한다.

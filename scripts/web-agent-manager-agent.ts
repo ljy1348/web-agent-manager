@@ -3,6 +3,7 @@ import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import packageMetadata from "../package.json" with { type: "json" };
+import { agentSocketPath, isNamedPipe } from "../src/server/core/agent-socket";
 
 interface BridgeResponse {
   id: string | number | null;
@@ -220,9 +221,15 @@ const TOOL_METHODS: Record<string, string> = {
 // 새·기존 환경변수와 설치·소스 경로 후보에서 실행 중인 web-agent-manager Unix 소켓을 찾는다.
 function resolveSocketPath(): string {
   const configured = process.env.WEB_AGENT_MANAGER_BRIDGE_SOCKET ?? process.env.MYAGENT_BRIDGE_SOCKET;
+  // Windows 이름 있는 파이프는 파일 존재 여부로 확인할 수 없어 설정값을 그대로 쓴다(#142).
+  if (configured && isNamedPipe(configured)) return configured;
   if (configured && fs.existsSync(path.resolve(configured))) return path.resolve(configured);
   const scriptDir = path.dirname(fileURLToPath(import.meta.url));
   const entryDir = path.dirname(path.resolve(process.argv[1]));
+  if (process.platform === "win32") {
+    const dataDirs = [path.resolve(entryDir, "..", "..", "..", "data"), path.resolve(entryDir, "..", "data"), path.resolve(scriptDir, "..", "data"), path.resolve(scriptDir, "..", "..", "data")];
+    return agentSocketPath(dataDirs.find((dir) => fs.existsSync(dir)) ?? dataDirs[0]);
+  }
   const candidates = [
     path.resolve(entryDir, "..", "..", "..", "data", "web-agent-manager-agent.sock"),
     path.resolve(entryDir, "..", "data", "web-agent-manager-agent.sock"),

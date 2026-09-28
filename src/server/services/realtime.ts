@@ -4,6 +4,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import type { AppDatabase } from "../core/database";
 import { hashToken, parseCookies } from "../core/security";
 import type { AuthUser } from "../../shared/types";
+import type { FederationService } from "./federation";
 
 interface ClientState {
   socket: WebSocket;
@@ -19,6 +20,8 @@ interface ClientState {
   networkAccessAllowed: number;
   lastAuthValidatedAt: number;
   lastActivityPersistedAt: number;
+  serviceTokenId?: string;
+  proxyNodeId?: string;
 }
 
 interface AuthenticatedSocketSession {
@@ -28,6 +31,7 @@ interface AuthenticatedSocketSession {
   sessionId: number;
   mobileTrustedDeviceId: string | null;
   networkAccessAllowed: number;
+  serviceTokenId?: string;
 }
 
 // 모바일 네트워크에서는 NAT 유휴 타임아웃이나 셀룰러↔WiFi 전환으로 TCP가 close 프레임 없이 조용히
@@ -79,7 +83,7 @@ export class RealtimeHub {
   private readonly activityPersistIntervalMs: number;
 
   // heartbeat 옵션은 테스트에서 실제 25초를 기다리지 않고 동작을 확인하기 위한 것이다.
-  constructor(httpServer: Server, private readonly database: AppDatabase, publicUrl?: string, heartbeat?: { intervalMs: number; timeoutMs: number; authRevalidateMs?: number }, idleMinutes = 720) {
+  constructor(httpServer: Server, private readonly database: AppDatabase, publicUrl?: string, heartbeat?: { intervalMs: number; timeoutMs: number; authRevalidateMs?: number }, idleMinutes = 720, private readonly federation?: FederationService) {
     this.heartbeatTimeoutMs = heartbeat?.timeoutMs ?? HEARTBEAT_TIMEOUT_MS;
     this.idleMinutes = idleMinutes;
     this.activityPersistIntervalMs = Math.max(30_000, Math.min(5 * 60_000, idleMinutes * 30_000));
@@ -89,7 +93,8 @@ export class RealtimeHub {
     this.authTimer = setInterval(() => this.sweepAuthorization(), heartbeat?.authRevalidateMs ?? AUTH_REVALIDATE_INTERVAL_MS);
     this.authTimer.unref();
     httpServer.on("upgrade", (request, socket, head) => {
-      if (!request.url?.startsWith("/ws") || !isSameOrigin(request, publicUrl)) {
+      const pathname = new URL(request.url ?? "/", "http://localhost").pathname;
+      if (!["/ws", "/ws/federation"].includes(pathname) || !isSameOrigin(request, publicUrl)) {
         socket.destroy();
         return;
       }
@@ -98,7 +103,14 @@ export class RealtimeHub {
         socket.destroy();
         return;
       }
-      this.server.handleUpgrade(request, socket, head, (webSocket) => this.accept(webSocket, session));
+      const nodeId = pathname === "/ws" ? new URL(request.url!, "http://localhost").searchParams.get("node") : null;
+      if (nodeId && (!this.federation || session.user.role !== "admin" || session.temporary || session.serviceTokenId)) {
+        socket.destroy();
+        return;
+      }
+      this.server.handleUpgrade(request, socket, head, (webSocket) => nodeId
+        ? this.acceptProxy(webSocket, session, nodeId)
+        : this.accept(webSocket, session));
     });
   }
 
@@ -130,6 +142,7 @@ export class RealtimeHub {
   broadcast(type: string, payload: unknown, options?: { skipTemporary?: boolean }): void {
     const encoded = JSON.stringify({ type, payload });
     for (const client of [...this.clients]) {
+      if (client.proxyNodeId) continue;
       if (options?.skipTemporary && client.temporary) continue;
       if (this.isUsable(client)) client.socket.send(encoded);
     }
@@ -195,6 +208,17 @@ export class RealtimeHub {
 
   // 세션 Cookie로 WebSocket 요청 사용자를 확인한다.
   private authenticate(request: IncomingMessage): AuthenticatedSocketSession | null {
+    if (new URL(request.url ?? "/", "http://localhost").pathname === "/ws/federation") {
+      const authorization = request.headers.authorization;
+      if (!authorization?.startsWith("Bearer ")) return null;
+      const token = authorization.slice(7);
+      if (token.length < 32 || token.length > 256) return null;
+      const row = this.database.prepare(`SELECT t.id AS token_id, u.id, u.username, u.role, u.access_scope,
+        u.last_project_id, u.last_chat_id, u.chat_view_mode FROM federation_agent_tokens t JOIN users u ON u.id = t.created_by
+        WHERE t.token_hash = ? AND t.revoked_at IS NULL AND u.role = 'admin' AND u.temporary_expires_at IS NULL`)
+        .get(hashToken(token)) as (AuthUser & { token_id: string }) | undefined;
+      return row ? { user: row, expiresAt: Infinity, temporary: false, sessionId: -1, mobileTrustedDeviceId: null, networkAccessAllowed: 1, serviceTokenId: row.token_id } : null;
+    }
     const cookies = parseCookies(request.headers.cookie);
     const token = cookies.web_agent_manager_session ?? cookies.myagent_session;
     if (!token) return null;
@@ -217,7 +241,7 @@ export class RealtimeHub {
   // 새 WebSocket 클라이언트와 메시지 핸들러를 등록한다.
   private accept(socket: WebSocket, session: AuthenticatedSocketSession): void {
     const user = session.user;
-    const client: ClientState = { socket, user, terminalChatId: null, authProvider: null, lastSeenAt: Date.now(), sessionExpiresAt: session.expiresAt, temporary: session.temporary, sessionId: session.sessionId, mobileTrustedDeviceId: session.mobileTrustedDeviceId, networkAccessAllowed: session.networkAccessAllowed, lastAuthValidatedAt: Date.now(), lastActivityPersistedAt: Date.now() };
+    const client: ClientState = { socket, user, terminalChatId: null, authProvider: null, lastSeenAt: Date.now(), sessionExpiresAt: session.expiresAt, temporary: session.temporary, sessionId: session.sessionId, mobileTrustedDeviceId: session.mobileTrustedDeviceId, networkAccessAllowed: session.networkAccessAllowed, lastAuthValidatedAt: Date.now(), lastActivityPersistedAt: Date.now(), serviceTokenId: session.serviceTokenId };
     this.clients.add(client);
     socket.on("close", () => this.clients.delete(client));
     // 브라우저가 프로토콜 ping에 자동으로 답하는 pong도 생존 신호로 받는다.
@@ -226,7 +250,7 @@ export class RealtimeHub {
       if (!this.isUsable(client, true)) return;
       // 어떤 메시지든 도착했다면 연결은 살아있다.
       client.lastSeenAt = Date.now();
-      if (client.lastSeenAt - client.lastActivityPersistedAt >= this.activityPersistIntervalMs) {
+      if (!client.serviceTokenId && client.lastSeenAt - client.lastActivityPersistedAt >= this.activityPersistIntervalMs) {
         this.database.prepare("UPDATE web_sessions SET last_seen_at = CURRENT_TIMESTAMP WHERE id = ?").run(client.sessionId);
         client.lastActivityPersistedAt = client.lastSeenAt;
       }
@@ -294,11 +318,25 @@ export class RealtimeHub {
     });
   }
 
+  private acceptProxy(socket: WebSocket, session: AuthenticatedSocketSession, nodeId: string): void {
+    const client: ClientState = { socket, user: session.user, terminalChatId: null, authProvider: null, lastSeenAt: Date.now(), sessionExpiresAt: session.expiresAt, temporary: false, sessionId: session.sessionId, mobileTrustedDeviceId: session.mobileTrustedDeviceId, networkAccessAllowed: session.networkAccessAllowed, lastAuthValidatedAt: Date.now(), lastActivityPersistedAt: Date.now(), proxyNodeId: nodeId };
+    this.clients.add(client);
+    socket.on("close", () => this.clients.delete(client));
+    socket.on("pong", () => { client.lastSeenAt = Date.now(); });
+    socket.on("message", () => { client.lastSeenAt = Date.now(); if (!this.isUsable(client, true)) socket.terminate(); });
+    void this.federation!.relaySocket(nodeId, socket).catch(() => socket.terminate());
+  }
+
   // 만료된 세션은 새 메시지를 처리하거나 이벤트를 보내기 전에 즉시 연결에서 제거한다.
   private isUsable(client: ClientState, forceAuthorization = false): boolean {
     const now = Date.now();
     if (client.socket.readyState === WebSocket.OPEN && now < client.sessionExpiresAt) {
       if (!forceAuthorization && now - client.lastAuthValidatedAt < AUTH_REVALIDATE_INTERVAL_MS) return true;
+      if (client.serviceTokenId) {
+        const row = this.database.prepare(`SELECT 1 FROM federation_agent_tokens t JOIN users u ON u.id = t.created_by
+          WHERE t.id = ? AND t.revoked_at IS NULL AND u.role = 'admin' AND u.temporary_expires_at IS NULL`).get(client.serviceTokenId);
+        if (row) { client.lastAuthValidatedAt = now; return true; }
+      } else {
       const row = this.database.prepare(`SELECT u.id, u.role, u.access_scope, u.temporary_expires_at, s.expires_at,
         s.mobile_trusted_device_id, s.network_access_allowed, d.active AS mobile_device_active FROM web_sessions s JOIN users u ON u.id = s.user_id
         LEFT JOIN mobile_trusted_devices d ON d.id = s.mobile_trusted_device_id AND d.user_id = s.user_id
@@ -308,6 +346,7 @@ export class RealtimeHub {
         && row.mobile_trusted_device_id === client.mobileTrustedDeviceId && row.network_access_allowed === client.networkAccessAllowed
         && (row.mobile_trusted_device_id === null || row.mobile_device_active === 1);
       if (valid) { client.lastAuthValidatedAt = now; return true; }
+      }
     }
     this.clients.delete(client);
     if (client.socket.readyState === WebSocket.OPEN) client.socket.terminate();

@@ -13,6 +13,8 @@ import { setChatBusy, shouldHealStuckBusy } from "../core/chat-busy";
 import { tokenUsageSnapshotForChat, type TokenUsageLedger } from "./token-usage-ledger";
 import type { HookObserver } from "./agent-hook-events";
 import type { TaskCommandService } from "./task-command-service";
+import { isInsideRoot } from "../core/security";
+import { PROVIDER_LABELS } from "../core/provider-labels";
 
 // 세션 저장소 아래의 JSONL 파일을 재귀적으로 찾는다. Task 도구로 뜬 서브에이전트 기록
 // (`<세션ID>/subagents/agent-*.jsonl`)은 내부 레코드에 자기 고유 ID 없이 부모 세션의 sessionId를
@@ -94,6 +96,24 @@ interface HeldCompletion {
   title: string;
   cwd: string;
   delegationIds: string[];
+  // 앱 푸시 본문에 보여줄 마지막 응답 앞부분.
+  excerpt: string;
+}
+
+const PUSH_EXCERPT_LENGTH = 120;
+// 응답 본문이 아닌 중간 기록(도구 호출·결과, 진행 설명 등)은 알림 미리보기에서 뺀다.
+const NON_REPLY_KINDS = new Set(["tool_call", "tool_result", "progress_update", "task_notification", "local_command", "compact_summary"]);
+
+// 마지막 assistant 본문을 한 줄로 정리해 알림에 넣을 길이로 자른다.
+export function completionExcerpt(messages: HistorySession["messages"]): string {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]!;
+    if (message.role !== "assistant" || NON_REPLY_KINDS.has(message.kind)) continue;
+    const text = message.content.replace(/\s+/g, " ").trim();
+    if (!text) continue;
+    return text.length > PUSH_EXCERPT_LENGTH ? `${text.slice(0, PUSH_EXCERPT_LENGTH).trimEnd()}…` : text;
+  }
+  return "";
 }
 
 // 발견 세션의 작업 경로가 허용된 루트 내부인지 확인한다.
@@ -107,9 +127,7 @@ function isAllowedProject(cwd: string, allowedRoots: string[]): boolean {
   }
   return allowedRoots.some((root) => {
     if (!fs.existsSync(root)) return false;
-    const actualRoot = fs.realpathSync(root);
-    if (actualRoot === path.sep) return true;
-    return actual === actualRoot || actual.startsWith(`${actualRoot}${path.sep}`);
+    return isInsideRoot(actual, fs.realpathSync(root));
   });
 }
 
@@ -451,11 +469,13 @@ export class HistorySynchronizer {
         // 테이블 재생성이 필요하다. 운영 DB 재생성은 위험 대비 실익이 적어 기존 값을 재사용한다 —
         // 사람이 터미널에서 직접 띄운 세션도 함께 묶이지만, "웹에서 명시적으로 띄우지 않은 건 목록에
         // 보일 필요가 없다"는 판단이라 동작상 차이가 없다.
+        // 예외: Windows 노드는 그 PC의 Claude 앱·Codex 앱 대화를 관리하는 게 목적이라 일반 목록에 보인다(#142).
+        const origin = this.config.showExternalChats ? "user" : "delegation";
         const result = this.database.prepare(`
           INSERT INTO chats(project_id, provider, account_id, provider_session_id, tmux_name, status, title, history_file, worktree_path, git_branch, created_at, updated_at, origin)
-          VALUES (?, ?, ?, ?, ?, 'stopped', ?, ?, ?, ?, ?, ?, 'delegation')
+          VALUES (?, ?, ?, ?, ?, 'stopped', ?, ?, ?, ?, ?, ?, ?)
         `).run(project.id, session.provider, accountId, session.sessionId, `web_agent_manager_${tmuxSuffix}`, preferredTitle, session.historyFile,
-          worktreeOwner ? normalizedPath : null, worktreeOwner?.branch ?? null, session.createdAt, session.updatedAt);
+          worktreeOwner ? normalizedPath : null, worktreeOwner?.branch ?? null, session.createdAt, session.updatedAt, origin);
         chat = { id: Number(result.lastInsertRowid) };
       }
       return { chatId: chat.id };
@@ -539,6 +559,7 @@ export class HistorySynchronizer {
       title: session.title,
       cwd: session.cwd,
       delegationIds: [],
+      excerpt: completionExcerpt(session.messages),
     };
     const open = listOpenSourceDelegations(this.database, chatId);
     const turnAt = session.turnEndedAt ?? last?.createdAt ?? session.updatedAt;
@@ -586,7 +607,16 @@ export class HistorySynchronizer {
       lines.push(`위임 작업 ${summary.total}건 중 ${summary.failed}건이 실패했습니다.`);
     }
     lines.push(`${this.config.publicUrl}/?chat=${held.chatId}`);
-    void this.notifications.notify(held.eventId, "task_completed", lines.join("\n"));
+    // 사용자가 바꾼 채팅 제목이 있으면 그것을 쓴다.
+    const chatTitle = (this.database.prepare("SELECT title FROM chats WHERE id = ?").get(held.chatId) as { title: string | null } | undefined)?.title || held.title;
+    const provider = PROVIDER_LABELS[held.provider] ?? held.provider;
+    const failed = summary && summary.failed > 0 ? ` · 위임 ${summary.failed}건 실패` : "";
+    const push = {
+      title: `#${held.chatId} · ${chatTitle || "제목 없음"}`,
+      body: `${provider}${failed} · ${held.excerpt || "작업이 완료되었습니다."}`,
+      chatId: held.chatId,
+    };
+    void this.notifications.notify(held.eventId, "task_completed", lines.join("\n"), { push });
     // chat_busy:false는 도구 호출 사이 턴 종료 등 완료가 아닌 경우에도 뜨므로, 브라우저 알림은 실제
     // 완료(decision.notifyCompletion)에만 반응하도록 별도 이벤트로 분리해 보낸다.
     this.realtime.broadcast("task_completed", { chatId: held.chatId, provider: held.provider, title: held.title });

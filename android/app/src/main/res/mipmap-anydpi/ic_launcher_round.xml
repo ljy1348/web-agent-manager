@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- API 23~25용 원형 아이콘: 단색 원 배경에 육각 군집을 그린다. -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="48dp" android:height="48dp" android:viewportWidth="108" android:viewportHeight="108">
-    <path android:fillColor="#111827" android:pathData="M54,2a52,52 0,1 0,0 104a52,52 0,1 0,0 -104" />
-    <path android:fillColor="#7C6FF2" android:pathData="M18,27h72v54h-72z" />
-    <path android:fillColor="#B8FF63" android:pathData="M28,45h11l6,17 8,-25 8,25 6,-17h13v7h-8l-11,29 -8,-25 -8,25 -11,-29h-6z" />
+    <path android:fillColor="#1E1B4B" android:pathData="M54,2a52,52 0,1 0,0 104a52,52 0,1 0,0 -104" />
+    <path android:fillColor="#B8FF63" android:pathData="M54,24l14,8.2v16.3l-14,8.2l-14,-8.2v-16.3z" />
+    <path android:fillColor="#7C6FF2" android:pathData="M38.5,52l14,8.2v16.3l-14,8.2l-14,-8.2v-16.3z" />
+    <path android:fillColor="#A89CFF" android:pathData="M69.5,52l14,8.2v16.3l-14,8.2l-14,-8.2v-16.3z" />
 </vector>

@@ -70,6 +70,24 @@ export function parseUsageResetMoment(resetAt: string | null | undefined, now: D
 // 알림 중복 차단 키에 쓸 리셋 시각을 같은 창 허용 오차 단위로 내림한다. CLI가 같은 창의 리셋
 // 시각을 몇 분씩 다르게 표기하는 게 실측됐는데(#56: "12:34 on 27 Aug"↔"12:43 on 27 Aug"), 분 단위
 // 원본을 그대로 키에 쓰면 같은 창인데도 다른 이벤트가 되어 notifier의 중복 차단이 뚫린다.
+// 알림 본문에 넣을 예정 초기화 시각을 서버 로컬 시간의 "M월 D일 HH:mm"으로 만든다.
+export function formatResetMoment(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  const parts = Object.fromEntries(new Intl.DateTimeFormat("ko-KR", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hourCycle: "h23" })
+    .formatToParts(date).map((part) => [part.type, part.value]));
+  return `${parts.month}월 ${parts.day}일 ${parts.hour}:${parts.minute}`;
+}
+
+// 초기화 알림 제목·본문. 예정 시각 전에 감지했으면 조기 초기화임과 원래 예정 시각을 밝힌다(#133).
+export function usageResetMessage(label: string, windowLabel: string, scheduledResetAt: string, detectedEarly: boolean): { title: string; body: string } {
+  if (!detectedEarly) return { title: `${label} ${windowLabel} 사용량 초기화`, body: `${label} ${windowLabel} 사용량 초기화가 확인되었습니다.` };
+  return {
+    title: `${label} ${windowLabel} 사용량 조기 초기화`,
+    body: `${label} ${windowLabel} 사용량이 예정(${formatResetMoment(scheduledResetAt)})보다 먼저 초기화된 것을 감지했습니다.`,
+  };
+}
+
 export function resetEventKey(scheduledResetAt: string): string {
   const time = new Date(scheduledResetAt).getTime();
   if (Number.isNaN(time)) return scheduledResetAt;
@@ -215,8 +233,7 @@ export class UsageResetNotifier {
     const adapter = this.adapters.get(schedule.provider);
     const label = adapter?.displayLabel ?? schedule.provider;
     const windowLabel = usageWindowLabel(adapter, schedule.window_id);
-    const title = `${label} ${windowLabel} 사용량 초기화`;
-    const body = `${label} ${windowLabel} 사용량 초기화가 확인되었습니다.`;
+    const { title, body } = usageResetMessage(label, windowLabel, schedule.scheduled_reset_at, detectedEarly);
     const eventId = `usage-reset:${schedule.provider}:${schedule.account_id}:${schedule.window_id}:${resetEventKey(schedule.scheduled_reset_at)}`;
     const presentation: NotificationPresentation = { title };
     await this.notifications.notify(eventId, "usage_session_reset", body, presentation);

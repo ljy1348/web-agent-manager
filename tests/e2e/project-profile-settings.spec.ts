@@ -25,6 +25,7 @@ test("프로젝트 profile은 분석·draft 저장·특정 version 활성화를 
   });
   page.on("dialog", (dialog) => dialog.accept()); await page.setViewportSize({ width: 390, height: 844 }); await page.goto("/");
   await page.getByRole("button", { name: "더보기", exact: true }).click(); await page.getByRole("dialog", { name: "더보기" }).getByRole("button", { name: /설정/ }).click();
+  await page.getByRole("navigation", { name: "설정 항목" }).getByRole("button", { name: /프로젝트 Agent profile/ }).click();
   await expect(page.getByText("전체 준비 0/1", { exact: true })).toBeVisible(); await expect(page.getByText(/활성 profile 없음/)).toBeVisible();
   await page.getByLabel("Profile provider").selectOption("claude"); const analyze = page.getByRole("button", { name: "초안 분석" });
   const feedback = await analyze.evaluate((button) => new Promise<number>((resolve) => { const started = performance.now(); const observer = new MutationObserver(() => { if ((button as HTMLButtonElement).disabled && button.textContent?.includes("분석 중")) { observer.disconnect(); resolve(performance.now() - started); } }); observer.observe(button, { attributes: true, childList: true, subtree: true }); (button as HTMLButtonElement).click(); }));
@@ -33,6 +34,8 @@ test("프로젝트 profile은 분석·draft 저장·특정 version 활성화를 
   await page.getByLabel("검토 메모").fill("owner review"); await page.getByRole("button", { name: "Draft 저장" }).click(); await expect(page.getByText(/활성화 전에는 새 채팅에 적용되지 않습니다/)).toBeVisible();
   expect(profiles[0].activeVersion).toBeNull(); await page.getByRole("button", { name: "명시 활성화" }).click(); await expect(page.getByRole("button", { name: "활성", exact: true })).toBeDisabled();
   expect(mutations).toEqual([{ path: "/api/projects/13/profiles", body: expect.objectContaining({ name: "myagent implementation", taskKind: "implementation", note: "owner review" }), csrf: "profile-csrf" }, { path: "/api/projects/13/profiles/profile-1/activate", body: { versionId: "version-1" }, csrf: "profile-csrf" }]);
+  await page.getByRole("button", { name: "설정", exact: true }).click();
+  await page.getByRole("navigation", { name: "설정 항목" }).getByRole("button", { name: /Codex structured shadow/ }).click();
   await expect(page.getByText("상태 일수 3/7", { exact: false })).toBeVisible(); await expect(page.getByText("turn 일수 3/7", { exact: false })).toBeVisible(); await expect(page.getByText("종료 pair 7/8", { exact: false })).toBeVisible(); await expect(page.getByText("상태 불일치 발견", { exact: true })).toBeVisible(); await expect(page.getByText("시작 없는 종료 turn 발견", { exact: true })).toBeVisible(); await expect(page.getByText(/대화형 후보 flag: 꺼짐/)).toBeVisible();
   const initialShadowReads = shadowReads;
   const refresh = page.getByRole("button", { name: "Readiness 새로고침" });

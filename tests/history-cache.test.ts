@@ -16,6 +16,30 @@ function writeJsonl(prefix: string, records: Array<Record<string, unknown>>): st
 }
 
 describe("세션 기록 증분 캐시", () => {
+  it("Opus 5.5 진행 설명은 증분 조회와 전체 재조회에서 같은 ID·순서로 복원한다", () => {
+    const file = writeJsonl("web-agent-manager-claude-progress-cache-", [
+      { uuid: "user", type: "user", sessionId: "s1", cwd: "/tmp", message: { content: "확인해줘" } },
+    ]);
+    const adapter = new ClaudeAdapter("", {});
+    const fullParse = vi.spyOn(adapter, "parseHistoryFile");
+    const cache = new HistoryCache();
+    cache.get(adapter, file);
+    const records = [
+      { uuid: "progress", type: "assistant", message: { model: "claude-opus-5-5", stop_reason: "tool_use", content: [{ type: "thinking", thinking: "로그 위치를 확인했습니다.", signature: "opaque" }] } },
+      { uuid: "tool", type: "assistant", message: { model: "claude-opus-5-5", stop_reason: "tool_use", content: [{ type: "tool_use", name: "Read", input: { file_path: "/tmp/log" } }] } },
+      { uuid: "final", type: "assistant", message: { model: "claude-opus-5-5", stop_reason: "end_turn", content: [{ type: "text", text: "확인했습니다." }] } },
+    ];
+    fs.appendFileSync(file, `${records.map((record) => JSON.stringify(record)).join("\n")}\n`);
+    const incremental = cache.get(adapter, file)!;
+    expect(fullParse).toHaveBeenCalledTimes(1);
+    expect(incremental.messages.map((message) => [message.id, message.kind])).toEqual([
+      ["user", "text"], ["progress", "progress_update"], ["tool", "tool_call"], ["final", "turn_end"],
+    ]);
+    cache.invalidate(file);
+    expect(cache.get(adapter, file)?.messages.map((message) => [message.id, message.kind, message.content]))
+      .toEqual(incremental.messages.map((message) => [message.id, message.kind, message.content]));
+  });
+
   it("Codex JSONL이 늘어나면 전체 파일 대신 추가된 줄만 파싱한다", () => {
     const file = writeJsonl("web-agent-manager-codex-cache-", [
       { type: "session_meta", payload: { id: "s1", cwd: "/tmp" }, timestamp: "2026-07-31T00:00:00.000Z" },

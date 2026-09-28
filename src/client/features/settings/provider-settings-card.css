@@ -1,0 +1,34 @@
+/* 공급자 설정 백업·동기화 카드(#135, #136). 공용 styles.css의 서버 로그 필터·세션 행 스타일을 재사용한다. */
+.provider-settings-providers { display: flex; flex-wrap: wrap; gap: 10px; margin: 0; padding: 0; border: 0; font-size: 13px; }
+.provider-settings-providers legend { padding: 0; margin-bottom: 4px; color: var(--muted); font-size: 13px; }
+.provider-settings-providers label { display: inline-flex; align-items: center; gap: 4px; color: var(--text); }
+.provider-settings-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 8px; margin-top: 12px; }
+.provider-settings-summary-item { display: flex; min-width: 0; flex-direction: column; gap: 3px; padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px; }
+.provider-settings-summary-item strong { font-size: 12px; }
+.provider-settings-summary-item small { color: var(--muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.provider-settings-backups, .provider-settings-nodes { display: grid; gap: 6px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
+.provider-settings-backups > strong, .provider-settings-nodes > strong { font-size: 12px; }
+.provider-settings-backups .muted, .provider-settings-nodes .muted { margin: 0; }
+.provider-settings-card .session-security-row > span.provider-settings-row-actions { flex: 0 0 auto; flex-direction: row; align-items: center; gap: 6px; }
+.provider-settings-status { display: block; margin-top: 10px; }
+@media (max-width: 700px) {
+  .provider-settings-card .session-security-row { flex-wrap: wrap; }
+  .provider-settings-card .session-security-row > span.provider-settings-row-actions { width: 100%; justify-content: flex-end; }
+}
+.provider-settings-more { justify-self: start; }
+/* 프로젝트 이동 카드(#137): 미리보기 경고와 대상 컴퓨터의 환경 재구성 단계 */
+.project-transfer-preview { margin-top: 4px; }
+.project-transfer-preview small { white-space: normal; overflow-wrap: anywhere; }
+.project-transfer-warning { color: var(--warning) !important; }
+.project-transfer-step { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
+.project-transfer-step summary { display: flex; justify-content: space-between; gap: 8px; cursor: pointer; font-size: 12px; }
+.project-transfer-step summary i { font-style: normal; font-size: 11px; color: var(--muted); }
+.project-transfer-step.status-succeeded summary i { color: #25713d; }
+.project-transfer-step.status-failed summary i { color: var(--danger); }
+.project-transfer-step code { display: block; margin-top: 6px; font-size: 11px; overflow-wrap: anywhere; }
+.project-transfer-step pre { margin: 6px 0 0; max-height: 240px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; background: var(--surface-muted); padding: 6px; border-radius: 6px; }
+/* 인증 동기화 카드(#138) */
+.credential-sync-card .session-security-row small b { font-weight: 600; color: var(--muted); }
+.credential-sync-card .session-security-row small b.credential-ready { color: #25713d; }
+.credential-sync-http { margin: 0 0 8px; font-size: 12px; }
+.credential-remote-login > div:not(.slack-settings-actions) { max-width: 100%; overflow-x: auto; }

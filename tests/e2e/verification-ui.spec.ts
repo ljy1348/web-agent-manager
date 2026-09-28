@@ -64,7 +64,7 @@ test("검증 패널에서 PR 연결 실행·명시 승인·재검증 timeline을
         artifacts: passedRun.artifacts.map((artifact) => ({ ...artifact, id: `${artifact.id}-${index}` })),
       }));
       const verifications = mode === "empty" ? [] : mode === "blocked" ? [blockedRun] : mode === "passed" ? [passedRun] : mode === "rerun" ? [rerun, passedRun] : longRuns;
-      await json({ task: { id: "task-123456789", state: taskState, state_reason: stateReason, profile_name: "일반 구현", profile_version: 4 }, verifications, hasMore: mode === "long" });
+      await json({ task: { id: "task-123456789", state: taskState, state_reason: stateReason, profile_version_id: "profile-version-4", profile_name: "일반 구현", profile_version: 4 }, verifications, hasMore: mode === "long" });
       return;
     }
     if (pathname === "/api/tasks/task-123456789/verifications" && request.method() === "POST") {
@@ -91,7 +91,8 @@ test("검증 패널에서 PR 연결 실행·명시 승인·재검증 timeline을
 
   await page.goto("/?tab=chat&project=1&chat=1");
   await expect(page.getByRole("heading", { name: "검증 UI QA" })).toBeVisible();
-  await expect(page.getByRole("status").filter({ hasText: "검증 정보 불러오는 중…" })).toBeVisible();
+  // 로딩 중에는 profile 여부를 몰라 패널을 그리지 않는다.
+  await expect(page.locator(".verification-panel")).toHaveCount(0);
   releaseInitialLoad();
   const panel = page.locator(".verification-panel");
   await expect(panel).toBeVisible();
@@ -155,4 +156,28 @@ test("검증 패널에서 PR 연결 실행·명시 승인·재검증 timeline을
   await page.setViewportSize({ width: 390, height: 844 });
   await expect(readonlyPanel).toBeVisible();
   expect(await readonlyPanel.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
+});
+
+test("profile이 없고 검증 기록도 없는 채팅에는 검증 패널을 표시하지 않는다", async ({ page }) => {
+  await page.route("**/api/**", async (route) => {
+    const pathname = new URL(route.request().url()).pathname;
+    const responses: Record<string, unknown> = {
+      "/api/auth/me": { user: { id: 1, username: "qa", role: "admin", access_scope: "standard" }, csrfToken: "c", temporary: false },
+      "/api/providers": { providers: [{ id: "codex", label: "Codex", installed: true, supportsSessionRename: false }] },
+      "/api/projects": { projects: [{ id: 1, name: "sample", path: "/workspace/sample" }], defaultPath: "/workspace" },
+      "/api/chats": { chats: [{ id: 1, project_id: 1, provider: "codex", status: "stopped", title: "profile 없는 채팅" }] },
+      "/api/chats/1/messages": { messages: [{ id: "a1", role: "assistant", kind: "text", content: "profile 없이 끝난 답변" }], hasMore: false },
+      "/api/chats/1/current-task": { task: { id: "task-no-profile", state: "completed", state_reason: null, profile_version_id: null, profile_name: null }, verifications: [], hasMore: false },
+      "/api/usage": { usage: [] }, "/api/system": { latest: null }, "/api/runtime": {}, "/api/slack": { enabled: false }, "/api/ntfy": { enabled: false }, "/api/approvals": { approvals: [] },
+    };
+    await route.fulfill({ json: pathname in responses ? responses[pathname] : {} });
+  });
+  let currentTaskLoaded = false;
+  page.on("response", (response) => { if (response.url().includes("/api/chats/1/current-task")) currentTaskLoaded = true; });
+  await page.goto("/?tab=chat&project=1&chat=1");
+  await expect(page.getByRole("heading", { name: "profile 없는 채팅" })).toBeVisible();
+  await expect.poll(() => currentTaskLoaded).toBe(true);
+  // 화면이 정상 렌더링된 상태에서 패널만 없는지 본다.
+  await expect(page.getByText("profile 없이 끝난 답변")).toBeVisible();
+  await expect(page.locator(".verification-panel")).toHaveCount(0);
 });

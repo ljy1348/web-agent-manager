@@ -10,6 +10,8 @@ import android.os.Build;
 // FCM 전경 메시지를 web-agent-manager 전용 시스템 알림으로 표시한다.
 public final class NotificationHelper {
     public static final String CHANNEL_ID = "web_agent_manager_events";
+    // FCM data와 알림 intent가 같은 키를 써서, 백그라운드 시스템 알림도 같은 채팅으로 이동한다.
+    public static final String EXTRA_CHAT_ID = "chatId";
 
     private NotificationHelper() {}
 
@@ -21,11 +23,14 @@ public final class NotificationHelper {
         context.getSystemService(NotificationManager.class).createNotificationChannel(channel);
     }
 
-    // 제목과 본문을 탭하면 WebView 앱이 열리는 알림으로 표시한다.
-    public static void show(Context context, String title, String body) {
+    // 제목과 본문을 탭하면 앱이 열리고, chatId가 있으면 그 채팅으로 이동하는 알림을 표시한다.
+    public static void show(Context context, String title, String body, String chatId) {
         ensureChannel(context);
         Intent launch = new Intent(context, MainActivity.class).setAction("OPEN_WEB_AGENT_MANAGER");
-        PendingIntent pendingIntent = PendingIntent.getActivity(context, 0, launch, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        if (chatId != null) launch.putExtra(EXTRA_CHAT_ID, chatId);
+        // 채팅마다 다른 requestCode를 써서 여러 알림의 chatId extra가 서로 덮어쓰지 않게 한다.
+        int requestCode = chatId == null ? 0 : chatId.hashCode();
+        PendingIntent pendingIntent = PendingIntent.getActivity(context, requestCode, launch, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         android.app.Notification.Builder builder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
                 ? new android.app.Notification.Builder(context, CHANNEL_ID)
                 : new android.app.Notification.Builder(context);

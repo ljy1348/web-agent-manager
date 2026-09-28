@@ -1,10 +1,35 @@
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { parseAllowedRoots, readProductEnv, resolveHomeDir } from "../src/server/core/config";
+import { loadPrivateFcmEnv, parseAllowedRoots, readProductEnv, resolveHomeDir } from "../src/server/core/config";
+
+const temporaryDirectories: string[] = [];
 
 afterEach(() => {
   vi.unstubAllEnvs();
+  while (temporaryDirectories.length) fs.rmSync(temporaryDirectories.pop()!, { recursive: true, force: true });
+});
+
+describe("loadPrivateFcmEnv", () => {
+  it("소유자 전용 서버 설정만 읽고 그룹에 노출된 파일은 거부한다", () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "wam-fcm-env-"));
+    temporaryDirectories.push(dataDir);
+    const secretDir = path.join(dataDir, "secrets");
+    fs.mkdirSync(secretDir, { mode: 0o700 });
+    const filename = path.join(secretDir, "fcm.env");
+    fs.writeFileSync(filename, "WEB_AGENT_MANAGER_FCM_ENABLED=1\nWEB_AGENT_MANAGER_FCM_PROJECT_ID=private-project\n", { mode: 0o600 });
+    vi.stubEnv("WEB_AGENT_MANAGER_DATA_DIR", dataDir);
+    vi.stubEnv("WEB_AGENT_MANAGER_FCM_ENABLED", undefined);
+    vi.stubEnv("WEB_AGENT_MANAGER_FCM_PROJECT_ID", undefined);
+
+    expect(loadPrivateFcmEnv()).toBe(true);
+    expect(process.env.WEB_AGENT_MANAGER_FCM_ENABLED).toBe("1");
+    expect(process.env.WEB_AGENT_MANAGER_FCM_PROJECT_ID).toBe("private-project");
+
+    fs.chmodSync(filename, 0o640);
+    expect(() => loadPrivateFcmEnv()).toThrow("현재 사용자만 읽을 수 있는 일반 파일");
+  });
 });
 
 describe("readProductEnv", () => {

@@ -1,4 +1,8 @@
 import { spawnSync } from "node:child_process";
+import { directTerminalExists, resizeDirectTerminal, writeDirectTerminal } from "./direct-terminal";
+
+// 직접 PTY(Windows 노드, #144)로 띄운 세션은 tmux 대신 같은 키를 제어 문자로 PTY에 쓴다.
+const KEY = { enter: "\r", escape: "\x1b", backspace: "\x7f", shiftTab: "\x1b[Z", left: "\x1b[D", right: "\x1b[C" } as const;
 
 interface TmuxResult {
   status: number | null;
@@ -21,6 +25,7 @@ function assertTmuxSuccess(result: TmuxResult, fallback: string): void {
 
 // 프롬프트를 브래킷 붙여넣기로 보내 TUI가 빠른 키 입력 burst로 오인하지 않게 한다.
 export function pastePromptToTmux(tmuxName: string, text: string): void {
+  if (writeDirectTerminal(tmuxName, `\x1b[200~${text}\x1b[201~`)) return;
   const bufferName = `web_agent_manager_prompt_${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2)}`;
   const load = spawnSync("tmux", ["load-buffer", "-b", bufferName, "-"], { input: text, encoding: "utf8" });
   assertTmuxSuccess(load, "tmux 입력 버퍼를 만들지 못했습니다.");
@@ -34,6 +39,7 @@ export function pastePromptToTmux(tmuxName: string, text: string): void {
 
 // tmux pane에 실제 Enter 키 이벤트를 보낸다.
 export function sendTmuxEnter(tmuxName: string): void {
+  if (writeDirectTerminal(tmuxName, KEY.enter)) return;
   const result = spawnSync("tmux", ["send-keys", "-t", exactTmuxTarget(tmuxName), "Enter"], { encoding: "utf8" });
   assertTmuxSuccess(result, "tmux에 Enter 키를 보내지 못했습니다.");
 }
@@ -43,6 +49,7 @@ export function sendTmuxEnter(tmuxName: string): void {
 // 중인 도구를 실제로는 중단시키지 못하는 경우가 있었다. tmux의 이름 있는 키 전송은 서버 쪽에서
 // 곧바로 처리되어 실제로 중단이 확인됐다(Bash 도구 실행 중 Escape로 "Interrupted" 확인).
 export function sendTmuxEscape(tmuxName: string): void {
+  if (writeDirectTerminal(tmuxName, KEY.escape)) return;
   const result = spawnSync("tmux", ["send-keys", "-t", exactTmuxTarget(tmuxName), "Escape"], { encoding: "utf8" });
   assertTmuxSuccess(result, "tmux에 Escape 키를 보내지 못했습니다.");
 }
@@ -50,6 +57,7 @@ export function sendTmuxEscape(tmuxName: string): void {
 // tmux pane에 실제 Backspace 키 이벤트를 count번 보낸다.
 export function sendTmuxBackspace(tmuxName: string, count: number): void {
   if (count <= 0) return;
+  if (writeDirectTerminal(tmuxName, KEY.backspace.repeat(count))) return;
   const result = spawnSync("tmux", ["send-keys", "-t", exactTmuxTarget(tmuxName), "-N", String(count), "BSpace"], { encoding: "utf8" });
   assertTmuxSuccess(result, "tmux에 Backspace 키를 보내지 못했습니다.");
 }
@@ -58,18 +66,21 @@ export function sendTmuxBackspace(tmuxName: string, count: number): void {
 // auto-accept edits·plan mode를 순환한다. raw 이스케이프 시퀀스를 pty에 직접 쓰면 다른 이름 있는
 // 키들과 마찬가지로 클라이언트 파서에 걸려 CLI에 전달되지 않을 수 있어 tmux 이름 있는 키로 보낸다.
 export function sendTmuxShiftTab(tmuxName: string): void {
+  if (writeDirectTerminal(tmuxName, KEY.shiftTab)) return;
   const result = spawnSync("tmux", ["send-keys", "-t", exactTmuxTarget(tmuxName), "BTab"], { encoding: "utf8" });
   assertTmuxSuccess(result, "tmux에 Shift+Tab 키를 보내지 못했습니다.");
 }
 
 // tmux pane에 실제 왼쪽 화살표 키 이벤트를 보낸다.
 export function sendTmuxLeft(tmuxName: string): void {
+  if (writeDirectTerminal(tmuxName, KEY.left)) return;
   const result = spawnSync("tmux", ["send-keys", "-t", exactTmuxTarget(tmuxName), "Left"], { encoding: "utf8" });
   assertTmuxSuccess(result, "tmux에 왼쪽 화살표 키를 보내지 못했습니다.");
 }
 
 // tmux pane에 실제 오른쪽 화살표 키 이벤트를 보낸다.
 export function sendTmuxRight(tmuxName: string): void {
+  if (writeDirectTerminal(tmuxName, KEY.right)) return;
   const result = spawnSync("tmux", ["send-keys", "-t", exactTmuxTarget(tmuxName), "Right"], { encoding: "utf8" });
   assertTmuxSuccess(result, "tmux에 오른쪽 화살표 키를 보내지 못했습니다.");
 }
@@ -79,6 +90,8 @@ export function sendTmuxRight(tmuxName: string): void {
 // 실제 CLI에서처럼 이전 내역을 보려면 tmux의 copy-mode를 대신 움직여야 한다. `-e`로 진입하면 맨
 // 아래까지 되돌아왔을 때 tmux가 알아서 copy-mode를 빠져나간다.
 export function scrollTmuxHistory(tmuxName: string, lines: number): boolean {
+  // 직접 PTY에는 tmux copy-mode 같은 서버 쪽 기록 보기가 없다.
+  if (directTerminalExists(tmuxName)) return false;
   if (!lines) return isTmuxCopyMode(tmuxName);
   // 이미 최신 화면인데 "더 아래로"를 요청하면 아무것도 하지 않는다. 여기서 copy-mode에 새로 들어가면
   // 화면만 기록 보기로 바뀌어 오히려 실시간 화면에서 벗어난다.
@@ -94,17 +107,20 @@ export function scrollTmuxHistory(tmuxName: string, lines: number): boolean {
 
 // 해당 pane이 지금 copy-mode(기록 보기) 상태인지 확인한다.
 export function isTmuxCopyMode(tmuxName: string): boolean {
+  if (directTerminalExists(tmuxName)) return false;
   const result = spawnSync("tmux", ["display-message", "-p", "-t", exactTmuxTarget(tmuxName), "#{pane_in_mode}"], { encoding: "utf8" });
   return result.status === 0 && result.stdout.trim() === "1";
 }
 
 // 기록 보기를 끝내고 실시간 화면으로 되돌린다. copy-mode가 아니면 조용히 무시한다.
 export function exitTmuxCopyMode(tmuxName: string): void {
+  if (directTerminalExists(tmuxName)) return;
   spawnSync("tmux", ["send-keys", "-X", "-t", exactTmuxTarget(tmuxName), "cancel"], { stdio: "ignore" });
 }
 
 // tmux 창을 웹 xterm과 같은 논리 그리드 크기로 맞춘다.
 export function resizeTmuxWindow(tmuxName: string, cols: number, rows: number): void {
+  if (resizeDirectTerminal(tmuxName, cols, rows)) return;
   const result = spawnSync("tmux", ["resize-window", "-t", exactTmuxTarget(tmuxName), "-x", String(cols), "-y", String(rows)], { encoding: "utf8" });
   assertTmuxSuccess(result, "tmux 터미널 크기를 바꾸지 못했습니다.");
 }
@@ -112,6 +128,7 @@ export function resizeTmuxWindow(tmuxName: string, cols: number, rows: number): 
 // tmux pane에 짧은 리터럴 키 입력을 보낸다.
 export function sendTmuxText(tmuxName: string, text: string): void {
   if (!text) return;
+  if (writeDirectTerminal(tmuxName, text)) return;
   const result = spawnSync("tmux", ["send-keys", "-t", exactTmuxTarget(tmuxName), "-l", "--", text], { encoding: "utf8" });
   assertTmuxSuccess(result, "tmux에 텍스트 키 입력을 보내지 못했습니다.");
 }

@@ -71,7 +71,7 @@ function preferredEffortOption(options: Json, selectedChat: Json): Json | null {
 
 // 일반 응답은 바로 표시하고 도구·diff 상세는 접힌 상태로 렌더링한다. 본문에 첨부 표시가 있으면
 // 사람이 올렸든(파일 첨부) 세션이 검증용으로 남겼든 구분 없이 실제 이미지 썸네일로 바꿔 보여준다.
-function MessageCard({ message, showDetails, project, chat, onOpenProjectFile, onOpenChat }: { message: Json; showDetails: boolean; project?: Json; chat?: Json; onOpenProjectFile?: (path: string, line?: number) => void; onOpenChat?: (chatId: number) => void }): React.ReactElement | null {
+export function MessageCard({ message, showDetails, project, chat, onOpenProjectFile, onOpenChat }: { message: Json; showDetails: boolean; project?: Json; chat?: Json; onOpenProjectFile?: (path: string, line?: number) => void; onOpenChat?: (chatId: number) => void }): React.ReactElement | null {
   const display = splitMessageContent(message);
   const usageLabel = tokenUsageLabel(message.tokenUsage);
   if (!display.primary && !display.details.length) return null;
@@ -83,7 +83,7 @@ function MessageCard({ message, showDetails, project, chat, onOpenProjectFile, o
         diff가 많은 대화에서 스크롤이 감당 안 돼서, 각 항목은 기본 접힘 상태로 두고 클릭해서
         개별로 펼치게 한다(<details>는 비제어 요소라 클릭 상태를 브라우저가 알아서 기억한다). */}
     {showDetails && display.details.map((detail, index) => <details className="message-details" key={`${message.id}:detail:${index}`}><summary>{display.detailLabel}</summary>{looksLikeDiff(detail) ? <DiffView diff={detail} /> : <pre>{detail}</pre>}</details>)}
-    {usageLabel && <div className="message-token-usage" title="이 응답의 공급자 JSONL 토큰 사용량">{usageLabel}</div>}
+    {usageLabel && <div className="message-token-usage" title="이 턴 전체의 토큰 사용량(모델 호출 합계)">{usageLabel}</div>}
   </article>;
 }
 
@@ -170,8 +170,10 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
   }, [composerPrefill, clearComposerPrefill]);
   useEffect(() => {
     let active = true;
-    const params = project?.id ? `?projectId=${project.id}` : "";
-    void api(`/tools/catalog${params}`).then((data) => {
+    // 자동완성은 명령어·스킬만 쓰므로 느린 MCP 상태 점검(claude mcp list)을 부르지 않게 종류를 한정한다(#123).
+    const params = new URLSearchParams({ kinds: "commands,skills" });
+    if (project?.id) params.set("projectId", String(project.id));
+    void api(`/tools/catalog?${params}`).then((data) => {
       if (active) setCommandItems((data.items || []).filter((item: Json) => ["commands", "skills"].includes(item.kind) && item.command));
     }).catch(() => { if (active) setCommandItems([]); });
     return () => { active = false; };
@@ -343,7 +345,13 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
     }
   }
 
-  const pendingApprovals = approvals.filter((item: Json) => item.status === "pending" && projectChatIds.has(item.chat_id));
+  // 위임으로 만든 자식 채팅은 채팅 목록에서 빠지므로, 목록이 아니라 승인이 속한 프로젝트(chat_project_id)나
+  // 지금 연 채팅으로 거른다. 목록 기준이면 자식 채팅의 승인이 자식·부모 화면 모두에서 사라졌다(#150).
+  const pendingApprovals = approvals.filter((item: Json) => item.status === "pending" && (
+    projectChatIds.has(item.chat_id)
+    || (project?.id != null && Number(item.chat_project_id) === Number(project.id))
+    || item.chat_id === selectedChat?.id
+  ));
   const selectedApprovals = pendingApprovals.filter((item: Json) => item.chat_id === selectedChat?.id);
   // delegate로 만든 자식 채팅의 승인은 부모가 결과를 기다리는 동안 바로 처리할 수 있어야 한다.
   // 모바일에서는 프로젝트 전체 approval-list가 숨겨지므로 API가 제공한 최신 위임 source 연결을
@@ -1089,7 +1097,9 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
           </form>
         : <h2><span className="title-text">{selectedChat?.title || "에이전트 채팅"}</span>{selectedChat && !structuredChat && selectedProvider.supportsSessionRename && <button type="button" className="title-edit-button" aria-label="채팅 이름 변경" title="이름 변경 (CLI /rename)" onClick={() => { setRenameValue(selectedChat.title || ""); setEditingTitle(true); }}>✎</button>}</h2>}
       <div className="workspace-meta"><span>{selectedChat ? `${selectedProvider.label}${accountLabel(selectedChat) ? ` · ${accountLabel(selectedChat)}` : ""} · ${selectedActivity?.label ?? selectedChat.status}` : ""}</span>
-      {structuredChat && <span className="transport-badge" title={`limited cohort: ${selectedChat.transport_cohort || "미상"}`}>app-server 후보</span>}
+      {structuredChat && (selectedChat.transport_cohort === "app-server-only"
+        ? <span className="transport-badge" title="이 컴퓨터는 tmux 없이 Codex app-server로 채팅합니다(Windows 노드).">app-server</span>
+        : <span className="transport-badge" title={`limited cohort: ${selectedChat.transport_cohort || "미상"}`}>app-server 후보</span>)}
       {selectedChat && !structuredChat && user?.role === "admin" && accountList.filter((account: Json) => account.provider === selectedChat.provider).length > 1 && ["stopped", "error"].includes(selectedChat.status)
         && <select className="chat-account-select" aria-label="이 채팅의 인증 계정" value={selectedChat.account_id ?? ""} onChange={(event) => void changeAccount(Number(event.target.value))}>
           {accountList.filter((account: Json) => account.provider === selectedChat.provider).map((account: Json) => <option key={account.id} value={account.id}>{account.label}</option>)}
@@ -1157,6 +1167,8 @@ export function ChatView({ user, chatViewMode, changeChatViewMode, providers, ac
           </div>
         </div>
         {busy && <div className="busy-indicator"><span className="busy-dots"><i /><i /><i /></span>작업중…</div>}
+        {/* app-server 채팅은 터미널이 없어 연결·응답 실패 사유를 여기서만 볼 수 있다(#143). */}
+        {selectedChat && structuredChat && selectedChat.last_error && <div className="error compact structured-chat-error" role="alert">{selectedChat.last_error}</div>}
         {selectedChat && testOnly && <div className="composer test-only-notice" role="note">테스트 전용 계정에서는 채팅 입력과 운영 제어를 사용할 수 없습니다.</div>}
         {selectedChat && !testOnly && <form className="composer" onDragOver={(event) => event.preventDefault()} onDrop={handleDrop} onSubmit={(event) => {
           event.preventDefault();

@@ -163,6 +163,15 @@ export class CodexStructuredSessionAdapter {
     return this.handle ?? null;
   }
 
+  private readonly turnErrors = new Map<number, string>();
+
+  // 마지막으로 실패한 턴의 사유를 한 번만 꺼낸다(없으면 빈 문자열이나 undefined).
+  takeTurnError(chatId: number): string | undefined {
+    const message = this.turnErrors.get(chatId);
+    this.turnErrors.delete(chatId);
+    return message;
+  }
+
   private observe(chatId: number, notification: CodexAppServerNotification): void {
     const params = object(notification.params);
     if (!params) return;
@@ -188,6 +197,11 @@ export class CodexStructuredSessionAdapter {
       }
     }
     if (!type) return;
+    // 실패 사유(예: 401 인증 없음)는 공통 이벤트·저널에 넣지 않고 따로 보관해, 전송 계층이 채팅 오류로만 쓴다(#143).
+    if (type === "turn.failed") {
+      const message = object(turn?.error)?.message;
+      this.turnErrors.set(chatId, typeof message === "string" ? message.slice(0, 500) : "");
+    }
     this.onEvent?.({
       schemaVersion: 1,
       id: crypto.randomUUID(),

@@ -175,6 +175,8 @@ nav button.active { color: #fff; border-bottom-color: #d6f56f; }
 .schedule-actions { display: flex; flex-wrap: wrap; gap: 6px; }
 .schedule-actions button, .schedule-editor .dialog-actions button { display: inline-flex; align-items: center; gap: 5px; }
 .error.compact { padding: 7px 9px; font-size: 11px; }
+/* app-server 채팅의 연결·응답 실패 안내(#143) */
+.structured-chat-error { margin: 0 12px 8px; overflow-wrap: anywhere; }
 .project-form label { display: flex; flex-direction: column; gap: 5px; min-width: 0; color: #4a5a51; font-size: 12px; }
 .project-form input, .project-form select, .repository-toolbar input, .repository-toolbar select { width: 100%; min-width: 0; height: 38px; padding: 0 10px; border: 1px solid var(--border-strong); border-radius: 7px; background: #fff; }
 .project-form .check-row { flex-direction: row; align-items: center; gap: 8px; }
@@ -447,6 +449,8 @@ nav button.active { color: #fff; border-bottom-color: #d6f56f; }
 .activity-chip.rate-limited, .activity-text.rate-limited { color: #7a3c8b; background: #f1e4f6; }
 .activity-chip.needs-approval, .activity-text.needs-approval { color: #9a4a13; background: #ffe2c5; }
 .activity-chip.error, .activity-text.error { color: #9a2525; background: #ffe2e2; }
+/* 뒤쪽 범용 .error(오류 박스, padding 10px)가 칩 여백을 덮어써 "오류" 칩만 커지던 문제를 막는다. */
+.activity-chip.error { padding: 2px 7px; border-radius: 999px; }
 .activity-chip.stopped, .activity-text.stopped { color: #66726b; background: #eef1ee; }
 .activity-text { padding: 2px 6px; border-radius: 999px; }
 
@@ -1340,6 +1344,11 @@ nav button.active { color: #fff; border-bottom-color: #d6f56f; }
   .chat-layout { display: block; height: calc(100dvh - var(--mobile-tabbar-h)); min-height: 0; }
   .chat-list, .approval-list { display: none; }
   .workspace { height: calc(100dvh - var(--mobile-tabbar-h)); border: 0; border-radius: 0; box-shadow: none; }
+  /* 채팅 탭 위에 연동 안내·전역 오류가 끼면 고정 높이(100dvh - 탭바)가 그만큼 넘쳐 입력창이 탭바 아래로
+     밀렸다(#149). 채팅 탭은 화면을 세로 flex로 두고 대화 영역이 남은 높이만 채운다. */
+  .app-shell.tab-chat { display: flex; flex-direction: column; height: 100dvh; }
+  .app-shell.tab-chat > .main-chat { flex: 1 1 auto; min-height: 0; padding-bottom: var(--mobile-tabbar-h); }
+  .app-shell.tab-chat .chat-layout, .app-shell.tab-chat .workspace { height: 100%; }
   .workspace-head { grid-template-columns: 40px minmax(0, 1fr) auto; min-height: 58px; padding: 8px 10px; background: #fff; }
   .workspace-head .mobile-menu-button { display: grid; width: 36px; height: 36px; place-items: center; padding: 0; border: 0; background: transparent; font-size: 22px; }
   .workspace-head .danger, .workspace-head .primary { min-height: 34px; padding: 6px 8px; font-size: 11px; }
@@ -2360,3 +2369,114 @@ input, select, textarea { border-radius: 10px !important; }
 .task-live-preview { width: 100%; height: 220px; margin-top: 8px; border: 1px solid var(--border); border-radius: 7px; background: #fff; }
 .task-preview-panel a { display: inline-flex; align-items: center; color: var(--accent); font-size: .78rem; }
 .task-preview-evidence { display: grid; gap: 4px; margin-top: 8px; }.task-preview-evidence img { display: block; width: 100%; border: 1px solid var(--border); border-radius: 7px; }.task-preview-evidence code { display: block; overflow-wrap: anywhere; white-space: pre-wrap; font-size: .68rem; }
+.tab-computers > .main:not(.federation-view-main) { display: none; }
+.federation-settings-section { padding-top: 0; }
+.federation-settings-section .settings-grid { max-width: 100%; }
+/* 컴퓨터 탭: 머리글 한 줄(컴퓨터·상태·주소·새로고침), 왼쪽 채팅 목록(메인 chat-item 재사용), 오른쪽 대화·사용량. */
+.federation-head { display: flex; align-items: flex-end; justify-content: space-between; flex-wrap: wrap; gap: 12px 20px; margin-bottom: 16px; }
+.federation-head-title h2 { margin: 2px 0 0; }
+.federation-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 10px; min-width: 0; }
+.federation-page select { min-width: 0; height: 38px; padding: 0 10px; border: 1px solid var(--border-strong); border-radius: 7px; background: #fff; font: inherit; }
+.federation-toolbar select { width: 220px; max-width: 100%; font-weight: 600; }
+.federation-node-url { color: var(--muted); font: 11px var(--font-code); overflow-wrap: anywhere; }
+.federation-layout { display: grid; grid-template-columns: minmax(240px, 300px) minmax(0, 1fr); gap: 16px; align-items: start; }
+.federation-sidebar { display: grid; gap: 10px; min-width: 0; }
+.federation-sidebar > select { width: 100%; }
+.federation-new-chat { display: flex; gap: 6px; }
+.federation-new-chat select { flex: 1; }
+.federation-chat-list { display: flex; flex-direction: column; gap: 4px; max-height: calc(100vh - 300px); min-height: 120px; overflow: auto; }
+.federation-chat-list .chat-item { flex-shrink: 0; width: 100%; min-height: 0; margin: 0; padding: 8px 10px; gap: 4px 8px; }
+.federation-main { display: grid; gap: 12px; min-width: 0; }
+.federation-conversation { display: flex; flex-direction: column; min-width: 0; min-height: calc(100vh - 330px); }
+.federation-conversation-head { display: flex; align-items: center; gap: 8px; min-width: 0; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
+.federation-conversation-head > strong { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.federation-conversation-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.federation-messages { flex: 1; display: grid; align-content: start; gap: 10px; min-height: 200px; max-height: calc(100vh - 430px); overflow: auto; padding: 12px 2px; }
+.federation-messages .message { max-width: 100%; }
+.federation-conversation .composer { flex-direction: row; align-items: flex-end; gap: 8px; margin-top: auto; padding: 10px 0 0; background: transparent; }
+.federation-conversation .composer .primary { flex-shrink: 0; min-width: 72px; }
+.federation-conversation .composer textarea { flex: 1; min-width: 0; min-height: 64px; resize: vertical; }
+.federation-usage { display: flex; align-items: flex-start; flex-wrap: wrap; gap: 8px 20px; padding-top: 12px; padding-bottom: 12px; }
+.federation-usage > strong { font-size: 13px; }
+.federation-usage > div { display: flex; flex-wrap: wrap; gap: 8px 24px; }
+.federation-usage > div > div { display: grid; gap: 2px; min-width: 0; }
+.federation-usage b { font-size: 12px; }
+.federation-usage span { display: block; color: var(--muted); font-size: 12px; }
+.federation-settings-card .mfa-secret code { overflow-wrap: anywhere; }
+@media (max-width: 700px) {
+  .federation-head { align-items: stretch; margin-bottom: 10px; }
+  .federation-toolbar { width: 100%; }
+  .federation-toolbar select { flex: 1; width: auto; }
+  .federation-node-url { order: 5; width: 100%; }
+  .federation-layout { grid-template-columns: 1fr; gap: 10px; }
+  .federation-chat-list { max-height: 34vh; }
+  .federation-conversation { min-height: 0; }
+  .federation-conversation-head { flex-wrap: wrap; }
+  .federation-conversation-head > strong { flex-basis: 100%; }
+  .federation-messages { max-height: 55vh; }
+}
+
+/* 파일 탭의 HTML·PDF·이미지·텍스트 미리보기를 화면 전체로 확장한다. 모바일 기본 미리보기보다
+   명시도가 높아 하단 탭바까지 덮고, iframe sandbox와 서버 CSP는 그대로 유지된다. */
+.file-preview.is-fullscreen {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  width: 100vw;
+  height: 100dvh;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 12px;
+  border: 0;
+  border-radius: 0;
+  background: #fff;
+  box-shadow: none;
+}
+.file-preview.is-fullscreen > .git-box-head {
+  position: static;
+  flex: 0 0 auto;
+  margin: 0 0 8px;
+  padding: 0 0 8px;
+  border-bottom: 1px solid var(--border);
+}
+.file-preview.is-fullscreen > strong { flex: 0 0 auto; }
+.file-preview.is-fullscreen > .file-preview-frame {
+  min-height: 0;
+  height: auto;
+  flex: 1 1 auto;
+}
+.file-preview.is-fullscreen > .file-preview-media {
+  min-height: 0;
+  max-height: none;
+  flex: 1 1 auto;
+}
+.file-preview.is-fullscreen > .file-preview-markdown,
+.file-preview.is-fullscreen > .file-preview-lines,
+.file-preview.is-fullscreen > pre,
+.file-preview.is-fullscreen > .file-preview-editor {
+  min-height: 0;
+  max-height: none;
+  height: auto;
+  flex: 1 1 auto;
+  overflow: auto;
+}
+
+/* 서버 로그 조회 카드(#116): 로그 줄이 길어 설정 그리드 한 줄 전체를 쓴다. */
+.server-log-card { grid-column: 1 / -1; min-width: 0; }
+.server-log-filters { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; }
+.server-log-filters label { display: grid; gap: 4px; font-size: 13px; color: var(--muted); }
+.server-log-filters .server-log-search { flex: 1 1 200px; }
+.server-log-filters .slack-settings-actions { margin: 0; }
+.server-log-summary, .server-log-status, .server-log-empty { margin: 10px 0 0; font-size: 13px; color: var(--muted); }
+.server-log-status { color: var(--danger); }
+.server-log-lines { margin-top: 10px; max-height: 60vh; overflow: auto; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-muted); padding: 8px; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.server-log-line { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text); }
+.server-log-line.level-debug { color: var(--muted); }
+.server-log-line.level-warn { color: var(--warning); }
+.server-log-line.level-error { color: var(--danger); }
+@media (max-width: 720px) {
+  .server-log-filters label { flex: 1 1 45%; }
+  .server-log-lines { max-height: 55vh; font-size: 11px; }
+}

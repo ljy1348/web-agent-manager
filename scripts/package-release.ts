@@ -16,6 +16,7 @@ const targets: ReleaseTarget[] = [
   { id: "macos-x64", description: "macOS Intel x64" },
   { id: "macos-arm64", description: "macOS Apple Silicon arm64" },
   { id: "windows-wsl-x64", description: "Windows x64 / WSL2" },
+  { id: "windows-x64", description: "Windows x64 네이티브 노드(setup-windows-native.cmd)" },
 ];
 
 // 한 대상의 production 빌드와 설치 진입점을 ZIP 배포 파일로 묶는다.

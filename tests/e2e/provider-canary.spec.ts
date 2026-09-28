@@ -124,7 +124,7 @@ test("테스트 전용 계정은 canary·verification UI만 조작하고 운영 
       "/api/chats": { chats: [chat] },
       "/api/chats/1": { chat },
       "/api/chats/1/messages": { messages: [], hasMore: false },
-      "/api/chats/1/current-task": { task: { id: "task-test-only", state: "running", profile_name: "QA", profile_version: 1 }, verifications: [] },
+      "/api/chats/1/current-task": { task: { id: "task-test-only", state: "running", profile_version_id: "profile-version-qa-1", profile_name: "QA", profile_version: 1 }, verifications: [] },
       "/api/usage": { usage: [] },
       "/api/system": { latest: null },
       "/api/runtime": { codex: "codex 1.0.0" },

@@ -1,0 +1,39 @@
+/* 설정 화면 단계 구조(#131): 1단계 그룹 목록, 2단계 선택 항목 상세, 3단계 접이식 폼.
+   styles.css의 디자인 토큰을 그대로 쓰고 설정 전용 배치만 여기 둔다. */
+.settings-layout { display: grid; grid-template-columns: minmax(260px, 320px) minmax(0, 1fr); gap: 20px; align-items: start; }
+.settings-menu { position: sticky; top: 12px; display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.settings-menu-group h3 { margin: 0 0 6px 6px; color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .04em; }
+.settings-menu-group ul { display: flex; flex-direction: column; gap: 2px; margin: 0; padding: 4px; list-style: none; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); box-shadow: var(--shadow); }
+.settings-menu-item { display: grid; grid-template-columns: 32px minmax(0, 1fr) auto 16px; align-items: center; gap: 10px; width: 100%; min-height: 54px; padding: 8px 10px; border: 0; border-radius: 10px; background: transparent; color: var(--text); text-align: left; cursor: pointer; }
+/* 전역 button:hover:not(:disabled)보다 우선하도록 목록 컨테이너까지 묶는다. */
+.settings-menu .settings-menu-item:hover:not(:disabled) { border: 0; background: var(--surface-muted); }
+.settings-menu .settings-menu-item[aria-current="true"], .settings-menu .settings-menu-item[aria-current="true"]:hover { background: var(--accent-soft); }
+.settings-menu-item:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.settings-menu-icon { display: grid; place-items: center; width: 32px; height: 32px; border-radius: 9px; background: var(--accent-soft); color: var(--accent); }
+.settings-menu-item[aria-current="true"] .settings-menu-icon { background: var(--accent); color: #fff; }
+.settings-menu-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.settings-menu-text b { font-size: 13px; font-weight: 650; }
+.settings-menu-text small { overflow: hidden; color: var(--muted); font-size: 11px; white-space: nowrap; text-overflow: ellipsis; }
+.settings-menu-item .settings-status { margin-left: 0; white-space: nowrap; }
+.settings-menu-chevron { color: var(--muted); }
+
+.settings-detail { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.settings-detail > .card { margin: 0; }
+.settings-back { display: inline-flex; align-self: flex-start; align-items: center; gap: 2px; min-height: 40px; padding: 0 8px 0 2px; border: 0; background: transparent; color: var(--accent); font-weight: 650; cursor: pointer; }
+
+/* 3단계: 카드 안의 부가 폼은 제목·설명만 보이다가 눌렀을 때 펼친다. */
+.settings-disclosure { border-top: 1px solid var(--border); }
+.settings-disclosure > summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 52px; padding: 6px 2px; list-style: none; cursor: pointer; }
+.settings-disclosure > summary::-webkit-details-marker { display: none; }
+.settings-disclosure > summary > span { display: flex; flex-direction: column; gap: 2px; }
+.settings-disclosure > summary strong { font-size: 13px; }
+.settings-disclosure > summary small { color: var(--muted); font-size: 11px; }
+.settings-disclosure > summary::after { content: "›"; color: var(--muted); font-size: 20px; line-height: 1; transition: transform .15s ease; }
+.settings-disclosure[open] > summary::after { transform: rotate(90deg); }
+.settings-disclosure > form { padding-bottom: 12px; }
+
+@media (max-width: 700px) {
+  .settings-layout { grid-template-columns: minmax(0, 1fr); }
+  .settings-menu { position: static; }
+  .settings-menu-item { min-height: 58px; }
+}

@@ -100,7 +100,7 @@ function groupDimension(groupBy: TokenUsageGroup, timezoneOffsetMinutes: number)
 export class TokenUsageLedger {
   constructor(private readonly database: AppDatabase) {}
 
-  // 파싱된 세션의 usage가 있는 assistant 메시지만 안정 키로 멱등 저장한다.
+  // 파싱된 세션의 과금 단위 토큰 이벤트(없으면 메시지 usage)를 안정 키로 멱등 저장한다.
   recordSession(session: HistorySession, snapshot: TokenUsageSnapshot): number {
     const statement = this.database.prepare(`
       INSERT INTO token_usage_events(
@@ -129,18 +129,29 @@ export class TokenUsageLedger {
         chat_deleted = excluded.chat_deleted,
         updated_at = CURRENT_TIMESTAMP
     `);
+    // 공급자가 과금 단위 이벤트를 내면 그것을 기록한다. 화면 메시지에 붙은 usage는 단위가 달라
+    // 중복(Claude 분할 레코드)·누락(Codex 도구 단계 호출)·시각 오류(Grok)가 생겼다(#134).
+    const events = session.tokenEvents ?? session.messages.flatMap((message) => message.tokenUsage
+      ? [{ ...message.tokenUsage, key: message.id, occurredAt: message.createdAt || session.updatedAt, model: null }]
+      : []);
     let recorded = 0;
     this.database.transaction(() => {
-      for (const message of session.messages) {
-        const usage = message.tokenUsage;
-        if (!usage || tokenCount(usage.totalTokens) < 1) continue;
+      if (session.tokenEvents?.length) {
+        // 새 키는 "{provider}:"로 시작한다. 예전 메시지 키 행만 지워, 이벤트 일부만 담은 오래된 백업을
+        // 기록해도 이미 저장된 새 키 행은 지워지지 않는다.
+        this.database.prepare(`
+          DELETE FROM token_usage_events WHERE provider = ? AND session_id = ? AND substr(message_id, 1, ?) <> ?
+        `).run(session.provider, session.sessionId, session.provider.length + 1, `${session.provider}:`);
+      }
+      for (const event of events) {
+        if (tokenCount(event.totalTokens) < 1) continue;
         statement.run(
-          session.provider, session.sessionId, message.id, message.createdAt || session.updatedAt,
+          session.provider, session.sessionId, event.key, event.occurredAt,
           snapshot.accountId, snapshot.accountLabel, snapshot.projectId, snapshot.projectName, snapshot.projectPath,
-          snapshot.chatId, snapshot.chatTitle, session.model ?? snapshot.model ?? null,
-          tokenCount(usage.inputTokens), tokenCount(usage.cachedInputTokens), tokenCount(usage.cacheCreationInputTokens),
-          tokenCount(usage.cacheReadInputTokens), tokenCount(usage.outputTokens), tokenCount(usage.reasoningOutputTokens),
-          tokenCount(usage.totalTokens), snapshot.chatDeleted ? 1 : 0,
+          snapshot.chatId, snapshot.chatTitle, event.model ?? session.model ?? snapshot.model ?? null,
+          tokenCount(event.inputTokens), tokenCount(event.cachedInputTokens), tokenCount(event.cacheCreationInputTokens),
+          tokenCount(event.cacheReadInputTokens), tokenCount(event.outputTokens), tokenCount(event.reasoningOutputTokens),
+          tokenCount(event.totalTokens), snapshot.chatDeleted ? 1 : 0,
         );
         recorded += 1;
       }

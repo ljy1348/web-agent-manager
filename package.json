@@ -16,7 +16,7 @@
     "url": "https://github.com/ljy1348/web-agent-manager/issues"
   },
   "homepage": "https://github.com/ljy1348/web-agent-manager#readme",
-  "version": "0.7.0",
+  "version": "0.7.2",
   "private": true,
   "type": "module",
   "bin": {
@@ -55,6 +55,8 @@
     "test:watch": "vitest",
     "verify": "npm run typecheck && npm run test && npm run build",
     "test:tui": "tsx scripts/check-usage-tui.ts",
+    "test:desktop": "tsx scripts/check-desktop-relay.ts",
+    "test:desktop-local": "tsx scripts/check-desktop-local.ts",
     "test:ui": "playwright test",
     "test:resources": "tsx scripts/check-browser-resources.ts",
     "test:lifecycle": "tsx scripts/check-session-lifecycle.ts",
@@ -152,7 +154,17 @@
     "win": {
       "target": [
         "nsis",
-        "portable"
+        "zip"
+      ],
+      "icon": "electron/icon.png",
+      "extraResources": [
+        {
+          "from": "build-resources/win-node",
+          "to": "node",
+          "filter": [
+            "node.exe"
+          ]
+        }
       ]
     },
     "nsis": {

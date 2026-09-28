@@ -301,7 +301,8 @@ export function createAuthRouter(database: AppDatabase, config: AppConfig): Rout
       if (!valid) {
         const failure = loginRateLimiter.recordFailure(clientAddress, limiterKey);
         writeAudit(database, request.authUser!.id, "auth.reauthenticate.failed", "web_session", request.authSession!.id, { ...failure, ...loginRequestIdentifiers(request) });
-        return response.status(401).json({ error: "비밀번호 또는 인증 코드가 올바르지 않습니다." });
+        // 로그인 세션은 유효하므로 401(세션 만료로 해석돼 로그인 화면으로 이동)이 아닌 403으로 알린다.
+        return response.status(403).json({ error: "비밀번호 또는 인증 코드가 올바르지 않습니다." });
       }
       loginRateLimiter.resetAccount(clientAddress, limiterKey);
       database.prepare("UPDATE web_sessions SET reauthenticated_at = CURRENT_TIMESTAMP WHERE id = ?").run(request.authSession!.id);

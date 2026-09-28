@@ -48,6 +48,22 @@ afterEach(() => {
   while (temporaryDirs.length) fs.rmSync(temporaryDirs.pop()!, { recursive: true, force: true });
 });
 
+describe("history-sync 외부 대화 표시 (#142)", () => {
+  // WAM 밖(Claude 앱·Codex 앱·터미널)에서 한 대화는 기본적으로 목록에서 숨기고(#61), Windows 노드에서만 일반 채팅으로 보인다.
+  for (const [showExternalChats, origin] of [[undefined, "delegation"], [false, "delegation"], [true, "user"]] as const) {
+    it(`showExternalChats=${showExternalChats}이면 새로 발견한 외부 대화를 origin=${origin}으로 등록한다`, () => {
+      const projectDir = makeDir("wam-project-");
+      const historyRoot = makeDir("wam-history-");
+      const dataDir = makeDir("wam-data-");
+      const config = { dataDir, allowedRoots: [projectDir], showExternalChats } as unknown as AppConfig;
+      writeSession(historyRoot, `external-${origin}`, projectDir, "2026-09-27T00:00:00.000Z");
+      const { database, sync } = buildSynchronizer(config, historyRoot);
+      sync.syncAll(false);
+      expect(database.prepare("SELECT origin, status FROM chats").all()).toEqual([{ origin, status: "stopped" }]);
+    });
+  }
+});
+
 describe("history-sync 프로젝트 귀속", () => {
   it("작업 중 cwd가 하위 디렉터리로 바뀌어도 채팅이 원래 프로젝트에 남고 새 프로젝트를 만들지 않는다", () => {
     const projectDir = makeDir("wam-project-");

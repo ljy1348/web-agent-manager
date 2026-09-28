@@ -3,13 +3,15 @@ import { createRoot } from "react-dom/client";
 import "@xterm/xterm/css/xterm.css";
 import "./styles.css";
 import { mergeMessages, reconcileOptimisticMessages } from "./message-display";
-import { api, ApiError, AUTHENTICATION_REQUIRED_EVENT, setCsrfToken } from "./api";
+import { api, ApiError, AUTHENTICATION_REQUIRED_EVENT, setCsrfToken, setSecurityBlockHandler } from "./api";
 import { Login } from "./components/Login";
 import { AgentIntegrationNotice } from "./components/AgentIntegrationNotice";
 import { CliAuthPanel } from "./components/CliAuthPanel";
 import { ProjectDialog } from "./components/ProjectDialog";
+import { BrandMark, brandMarkSlotStyle } from "./components/BrandMark";
+import { SecurityBlockDialog, type SecurityBlockRequest } from "./components/SecurityBlockDialog";
 import {
-  CalendarClock, Files, FlaskConical, FolderPlus, Gauge, GitPullRequest, ListTodo, Menu, MessageSquareText, ScrollText, Settings2, Trash2, Wrench, X,
+  CalendarClock, Files, FlaskConical, FolderPlus, Gauge, GitPullRequest, ListTodo, Menu, MessageSquareText, Monitor, ScrollText, Settings2, Trash2, Wrench, X,
 } from "lucide-react";
 import { Overview } from "./features/overview/Overview";
 import { ChatView } from "./features/chat/ChatView";
@@ -21,6 +23,8 @@ import { ExperimentsView } from "./features/experiments/ExperimentsView";
 import { SchedulesView } from "./features/schedules/SchedulesView";
 import { SettingsView } from "./features/settings/SettingsView";
 import { TaskBoardView } from "./features/tasks/TaskBoardView";
+import { ConnectedComputersView } from "./features/federation/ConnectedComputersView";
+import type { ConnectedComputer } from "./features/federation/FederationSettingsCard";
 import { notificationPermission, requestNotificationPermission, showNotification } from "./lib/notifications";
 import { initClientLogging } from "./lib/logger";
 import { effectiveChatViewMode } from "./lib/chat-view-mode";
@@ -33,16 +37,17 @@ import type { Json, Tab } from "./types";
 initClientLogging();
 
 // 데스크톱은 전체 탭을 그대로 노출하고, 모바일 하단은 자주 쓰는 화면만 남긴다.
-const TABS: Tab[] = ["overview", "tasks", "chat", "files", "instructions", "git", "schedules", "experiments", "tools", "settings"];
+const TABS: Tab[] = ["overview", "tasks", "chat", "files", "instructions", "git", "schedules", "experiments", "tools", "computers", "settings"];
 const MOBILE_PRIMARY_TABS: Tab[] = ["overview", "chat", "files", "git"];
-const MOBILE_MORE_TABS: Tab[] = ["tasks", "instructions", "schedules", "experiments", "tools", "settings"];
-const TAB_LABELS: Record<Tab, string> = { overview: "대시보드", tasks: "작업", chat: "채팅", files: "파일", instructions: "지침", git: "GitHub", schedules: "예약", experiments: "실험실", tools: "도구", settings: "설정" };
+const MOBILE_MORE_TABS: Tab[] = ["tasks", "instructions", "schedules", "experiments", "tools", "computers", "settings"];
+const TAB_LABELS: Record<Tab, string> = { overview: "대시보드", tasks: "작업", chat: "채팅", files: "파일", instructions: "지침", git: "GitHub", schedules: "예약", experiments: "실험실", tools: "도구", computers: "컴퓨터", settings: "설정" };
 const MOBILE_MORE_DESCRIPTIONS: Partial<Record<Tab, string>> = {
   tasks: "목표·검증·queue",
   instructions: "프로젝트 규칙",
   schedules: "매일·지정일 자동 입력",
   experiments: "모델·스킬 비교",
   tools: "명령·스킬·MCP",
+  computers: "연결된 WAM 관리",
   settings: "알림·계정·운영",
 };
 const TAB_ICONS: Record<Tab, typeof Gauge> = {
@@ -55,6 +60,7 @@ const TAB_ICONS: Record<Tab, typeof Gauge> = {
   schedules: CalendarClock,
   experiments: FlaskConical,
   tools: Wrench,
+  computers: Monitor,
   settings: Settings2,
 };
 
@@ -118,6 +124,8 @@ function writeNavigation(location: NavigationLocation, mode: "push" | "replace")
 declare global {
   interface Window {
     __webAgentManagerResume__?: () => void;
+    // Android 앱이 알림을 눌렀을 때 페이지를 다시 불러오지 않고 채팅만 바꾸는 진입점(#151).
+    __webAgentManagerOpenChat__?: (chatId: number) => void;
   }
 }
 
@@ -189,6 +197,7 @@ function createForegroundResume(options: {
 // 전체 관리 화면 상태와 실시간 갱신을 조정한다.
 function App(): React.ReactElement {
   const initialNavigation = useRef<NavigationLocation>(navigationFromLocation());
+  const [securityBlock, setSecurityBlock] = useState<SecurityBlockRequest | null>(null); const securityBlockResolveRef = useRef<((reauthenticated: boolean) => void) | null>(null);
   const [user, setUser] = useState<Json | null>(null); const [temporary, setTemporary] = useState(false); const [loading, setLoading] = useState(true); const [tab, setTab] = useState<Tab>(initialNavigation.current.tab);
   const [projects, setProjects] = useState<Json[]>([]); const [project, setProject] = useState<Json | null>(null); const [defaultProjectPath, setDefaultProjectPath] = useState(""); const [defaultWorkspacePath, setDefaultWorkspacePath] = useState(""); const [providers, setProviders] = useState<Json[]>([]); const [accounts, setAccounts] = useState<Json[]>([]); const [chats, setChats] = useState<Json[]>([]); const [allProjectActiveChats, setAllProjectActiveChats] = useState<Json[]>([]); const activeChatsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null); const [chat, setChat] = useState<Json | null>(null); const [messages, setMessages] = useState<Json[]>([]); const [hasMoreMessages, setHasMoreMessages] = useState(false);
   const [targetChatId, setTargetChatId] = useState<number | null>(initialNavigation.current.chatId);
@@ -199,6 +208,7 @@ function App(): React.ReactElement {
   const [providerRollouts, setProviderRollouts] = useState<Json[]>([]);
   const [providerRolloutConfigured, setProviderRolloutConfigured] = useState(false);
   const [deploymentSecurity, setDeploymentSecurity] = useState<Json>({ issues: [] });
+  const [connectedComputers, setConnectedComputers] = useState<ConnectedComputer[]>([]);
   const [showProjectDialog, setShowProjectDialog] = useState(false);
   const [showCliAuth, setShowCliAuth] = useState(false);
   const [cliAuthPending, setCliAuthPending] = useState(false);
@@ -260,6 +270,7 @@ function App(): React.ReactElement {
   // 세션이 서버에서 무효라고 확인된 순간 현재 계정의 메모리 상태를 지우고 Login을 렌더링한다.
   // URL은 유지해 다시 로그인한 뒤 원래 작업 위치를 복원할 수 있게 한다.
   function requireLogin(): void {
+    closeSecurityBlock(false);
     selectionVersionRef.current += 1;
     chatListRequestRef.current += 1;
     setCsrfToken("");
@@ -276,6 +287,7 @@ function App(): React.ReactElement {
     setMessages([]);
     setHasMoreMessages(false);
     setAccounts([]);
+    setConnectedComputers([]);
     setApprovals([]);
     setSessionBackups([]);
     setSocket(null);
@@ -285,6 +297,15 @@ function App(): React.ReactElement {
     setError("");
     setUser(null);
   }
+
+  async function refreshConnectedComputers(): Promise<void> {
+    const data = await api("/federation/nodes");
+    setConnectedComputers(data.nodes || []);
+  }
+  useEffect(() => {
+    if (user?.role !== "admin" || temporary) { setConnectedComputers([]); return; }
+    void refreshConnectedComputers().catch(() => undefined);
+  }, [user?.id, user?.role, temporary]);
 
   // 현재 선택 ref를 기준으로 URL 상태를 추가하거나 교체한다.
   function syncNavigation(mode: "push" | "replace", overrides: Partial<NavigationLocation> = {}): void {
@@ -360,6 +381,22 @@ function App(): React.ReactElement {
     }
     setUsage(usageData.usage); setSystem(systemData); setRuntime(runtimeData); setSlack(slackData); setNtfy(ntfyData); setApprovals(approvalData.approvals);
   }
+  // 떠 있는 차단 안내창을 닫고 기다리던 요청에 재인증 여부를 알린다.
+  function closeSecurityBlock(reauthenticated: boolean): void {
+    const resolve = securityBlockResolveRef.current;
+    securityBlockResolveRef.current = null;
+    setSecurityBlock(null);
+    resolve?.(reauthenticated);
+  }
+  useEffect(() => {
+    // 새 차단이 오면 이전 안내창을 대체하되, 기다리던 요청은 재인증 실패로 끝내 멈춘 채 남지 않게 한다.
+    setSecurityBlockHandler((reason, message) => new Promise<boolean>((resolve) => {
+      securityBlockResolveRef.current?.(false);
+      securityBlockResolveRef.current = resolve;
+      setSecurityBlock({ reason, message });
+    }));
+    return () => setSecurityBlockHandler(null);
+  }, []);
   useEffect(() => {
     window.addEventListener(AUTHENTICATION_REQUIRED_EVENT, requireLogin);
     return () => window.removeEventListener(AUTHENTICATION_REQUIRED_EVENT, requireLogin);
@@ -880,6 +917,12 @@ function App(): React.ReactElement {
       window.alert(error?.message || "채팅을 찾을 수 없습니다.");
     }
   }
+  // 알림을 누른 Android 앱이 이 함수로 채팅을 연다. 매 렌더의 최신 openChatById를 가리키게 다시 등록한다(#151).
+  useEffect(() => {
+    const open = (chatId: number): void => { if (Number.isInteger(chatId) && chatId > 0) void openChatById(chatId); };
+    window.__webAgentManagerOpenChat__ = open;
+    return () => { if (window.__webAgentManagerOpenChat__ === open) delete window.__webAgentManagerOpenChat__; };
+  });
   // 채팅의 프로젝트 파일 링크를 파일 탭의 정확한 경로 탐색 요청으로 변환한다. line이 있으면(파일
   // 미리보기의 줄 링크로 채팅에 걸어둔 참조) 그 줄로 스크롤·강조까지 이어간다.
   function openProjectFile(path: string, line?: number): void {
@@ -921,18 +964,20 @@ function App(): React.ReactElement {
   const visibleChatViewMode = chat?.interactive_transport === "app_server"
     ? "chat"
     : effectiveChatViewMode(user.role, user.chat_view_mode);
-  return <div className={`app-shell tab-${tab}`}><header><div className="brand"><span>W</span><div><b>web-agent-manager</b><small>Agent workspace</small></div></div><nav>{TABS.map((item) => <button key={item} className={tab === item ? "active" : ""} onClick={() => selectTab(item)}>{React.createElement(TAB_ICONS[item], { size: 16, "aria-hidden": true })}<span>{TAB_LABELS[item]}</span></button>)}</nav><div className="header-meta"><span className="live"><i />{activeChats} 실행 중</span>{testOnly && <span className="test-only-badge">테스트 전용</span>}<span className="header-user">{user.username}</span></div></header>
-    <div className="project-bar"><span className="project-bar-label">작업 프로젝트</span><select aria-label="작업 프로젝트" disabled={testOnly} value={project?.id || ""} onChange={(event) => selectProject(projects.find((item) => item.id === Number(event.target.value)) || null)}><option value="">프로젝트 없음</option>{projects.map((item) => <option value={item.id} key={item.id}>{item.name} · {shortProjectPath(item.path, defaultProjectPath)}</option>)}</select>{!testOnly && <button className="project-add" aria-label="프로젝트" onClick={addProject}><FolderPlus size={16} /><span>프로젝트 추가</span></button>}{project && !testOnly && <button type="button" className="project-delete" title="목록에서 프로젝트 삭제" aria-label="목록에서 프로젝트 삭제" onClick={() => void deleteProject(project)}><Trash2 size={16} /></button>}</div>
+  return <div className={`app-shell tab-${tab}`}><header><div className="brand"><span style={brandMarkSlotStyle}><BrandMark /></span><div><b>web-agent-manager</b><small>Agent workspace</small></div></div><nav>{TABS.filter((item) => item !== "computers" || connectedComputers.length > 0).map((item) => <button key={item} className={tab === item ? "active" : ""} onClick={() => selectTab(item)}>{React.createElement(TAB_ICONS[item], { size: 16, "aria-hidden": true })}<span>{TAB_LABELS[item]}</span></button>)}</nav><div className="header-meta"><span className="live"><i />{activeChats} 실행 중</span>{testOnly && <span className="test-only-badge">테스트 전용</span>}<span className="header-user">{user.username}</span></div></header>
+    {tab !== "computers" && <div className="project-bar"><span className="project-bar-label">작업 프로젝트</span><select aria-label="작업 프로젝트" disabled={testOnly} value={project?.id || ""} onChange={(event) => selectProject(projects.find((item) => item.id === Number(event.target.value)) || null)}><option value="">프로젝트 없음</option>{projects.map((item) => <option value={item.id} key={item.id}>{item.name} · {shortProjectPath(item.path, defaultProjectPath)}</option>)}</select>{!testOnly && <button className="project-add" aria-label="프로젝트" onClick={addProject}><FolderPlus size={16} /><span>프로젝트 추가</span></button>}{project && !testOnly && <button type="button" className="project-delete" title="목록에서 프로젝트 삭제" aria-label="프로젝트 삭제" onClick={() => void deleteProject(project)}><Trash2 size={16} /></button>}</div>}
     <AgentIntegrationNotice user={user} />
     {error && <div className="global-error" onClick={() => setError("")}>{error}</div>}
-    <main className={`main${tab === "chat" ? " main-chat" : ""}${tab === "chat" && visibleChatViewMode === "terminal" ? " main-chat-terminal" : ""}`}>{tab === "overview" && <Overview user={user} deploymentSecurity={deploymentSecurity} providers={providers} providerCapabilities={providerCapabilities} providerCanaries={providerCanaries} providerUpdates={providerUpdates} providerRollouts={providerRollouts} providerRolloutConfigured={providerRolloutConfigured} accounts={accounts} usage={usage} system={system} runtime={runtime} chats={chats} approvals={approvals} cliAuthPending={cliAuthPending} onOpenTab={selectTab} refresh={loadCore} />}{tab === "tasks" && <TaskBoardView user={user} onOpenChat={(id) => void openChatById(id)} />}{tab === "chat" && <ChatView user={user} chatViewMode={visibleChatViewMode} changeChatViewMode={changeChatViewMode} providers={providers} accounts={accounts} project={project} projects={projects} setProject={selectProject} addProject={addProject} deleteProject={deleteProject} chats={chats} activeChats={allProjectActiveChats} selectedChat={chat} setSelectedChat={selectChat} refreshChats={refetchChats} createChat={createChat} send={send} stop={stop} interrupt={interrupt} cycleMode={cycleMode} startChat={startChat} messages={messages} hasMoreMessages={hasMoreMessages} loadMoreMessages={loadMoreMessages} usage={usage} busy={!!chat?.busy} socket={socket} approvals={approvals} decide={decide} scrollState={chatScrollStateRef.current} sessionBackups={sessionBackups} backupChat={backupChat} deleteChat={deleteChat} restoreBackup={restoreBackup} deleteBackup={deleteBackup} onOpenProjectFile={openProjectFile} onOpenChat={openChatById} composerPrefill={composerPrefill} clearComposerPrefill={() => setComposerPrefill(null)} composerDrafts={composerDrafts} setComposerDraft={setComposerDraft} />}{tab === "files" && <FilesView project={project} chat={chat} target={fileTarget} onNavigate={navigateFile} providers={providers} projects={projects} onLinkFileLine={linkFileLineToChat} />}{tab === "instructions" && <InstructionsView project={project} chat={chat} />}{tab === "git" && <GitView project={project} user={user} chat={chat} providers={providers} refreshChats={refetchChats} onOpenProject={(next) => void openProject(next)} onOpenChat={(next) => { selectChat(next); setTab("chat"); }} />}{tab === "schedules" && <SchedulesView user={user} project={project} projects={projects} providers={providers} accounts={accounts} onOpenChat={(id: number) => void openChatById(id)} />}{tab === "experiments" && <ExperimentsView project={project} />}{tab === "tools" && <ToolsView project={project} />}{tab === "settings" && <SettingsView user={user} slack={slack} ntfy={ntfy} temporary={temporary} notificationPermission={notifPermission} notificationsSupported={typeof Notification !== "undefined"} onEnableNotifications={enableNotifications} onOpenCliAuth={() => setShowCliAuth(true)} onSignedOut={requireLogin} />}</main>
+    <main className={`main${tab === "chat" ? " main-chat" : ""}${tab === "chat" && visibleChatViewMode === "terminal" ? " main-chat-terminal" : ""}`}>{tab === "overview" && <Overview user={user} deploymentSecurity={deploymentSecurity} providers={providers} providerCapabilities={providerCapabilities} providerCanaries={providerCanaries} providerUpdates={providerUpdates} providerRollouts={providerRollouts} providerRolloutConfigured={providerRolloutConfigured} accounts={accounts} usage={usage} system={system} runtime={runtime} chats={chats} approvals={approvals} cliAuthPending={cliAuthPending} onOpenTab={selectTab} refresh={loadCore} />}{tab === "tasks" && <TaskBoardView user={user} onOpenChat={(id) => void openChatById(id)} />}{tab === "chat" && <ChatView user={user} chatViewMode={visibleChatViewMode} changeChatViewMode={changeChatViewMode} providers={providers} accounts={accounts} project={project} projects={projects} setProject={selectProject} addProject={addProject} deleteProject={deleteProject} chats={chats} activeChats={allProjectActiveChats} selectedChat={chat} setSelectedChat={selectChat} refreshChats={refetchChats} createChat={createChat} send={send} stop={stop} interrupt={interrupt} cycleMode={cycleMode} startChat={startChat} messages={messages} hasMoreMessages={hasMoreMessages} loadMoreMessages={loadMoreMessages} usage={usage} busy={!!chat?.busy} socket={socket} approvals={approvals} decide={decide} scrollState={chatScrollStateRef.current} sessionBackups={sessionBackups} backupChat={backupChat} deleteChat={deleteChat} restoreBackup={restoreBackup} deleteBackup={deleteBackup} onOpenProjectFile={openProjectFile} onOpenChat={openChatById} composerPrefill={composerPrefill} clearComposerPrefill={() => setComposerPrefill(null)} composerDrafts={composerDrafts} setComposerDraft={setComposerDraft} />}{tab === "files" && <FilesView project={project} chat={chat} target={fileTarget} onNavigate={navigateFile} providers={providers} projects={projects} onLinkFileLine={linkFileLineToChat} />}{tab === "instructions" && <InstructionsView project={project} chat={chat} />}{tab === "git" && <GitView project={project} user={user} chat={chat} providers={providers} refreshChats={refetchChats} onOpenProject={(next) => void openProject(next)} onOpenChat={(next) => { selectChat(next); setTab("chat"); }} />}{tab === "schedules" && <SchedulesView user={user} project={project} projects={projects} providers={providers} accounts={accounts} onOpenChat={(id: number) => void openChatById(id)} />}{tab === "experiments" && <ExperimentsView project={project} />}{tab === "tools" && <ToolsView project={project} />}{tab === "settings" && <SettingsView user={user} slack={slack} ntfy={ntfy} temporary={temporary} notificationPermission={notifPermission} notificationsSupported={typeof Notification !== "undefined"} onEnableNotifications={enableNotifications} onOpenCliAuth={() => setShowCliAuth(true)} onSignedOut={requireLogin} connectedComputers={connectedComputers} refreshConnectedComputers={refreshConnectedComputers} />}</main>
+    {tab === "computers" && connectedComputers.length > 0 && <main className="main federation-view-main"><ConnectedComputersView nodes={connectedComputers} /></main>}
+    {securityBlock && <SecurityBlockDialog key={`${securityBlock.reason}:${securityBlock.message}`} request={securityBlock} temporary={temporary} onClose={closeSecurityBlock} />}
     <ProjectDialog open={showProjectDialog} defaultPath={defaultProjectPath} defaultWorkspacePath={defaultWorkspacePath || defaultProjectPath} onClose={() => setShowProjectDialog(false)} onProject={(next) => void openProject(next)} />
     <CliAuthPanel open={showCliAuth} user={user} socket={socket} onClose={() => setShowCliAuth(false)} onRequireOpen={() => setShowCliAuth(true)} onPendingChange={setCliAuthPending} />
     {showMobileMore && <>
       <button type="button" className="mobile-more-backdrop" aria-label="더보기 닫기" onClick={() => dismissMobileMore()} />
       <section id="mobile-more-menu" className="mobile-more-sheet" role="dialog" aria-modal="true" aria-label="더보기">
         <div className="mobile-more-head"><div><strong>더보기</strong><small>관리 화면과 설정</small></div><button type="button" aria-label="더보기 닫기" onClick={() => dismissMobileMore()}><X size={20} /></button></div>
-        <div className="mobile-more-grid">{MOBILE_MORE_TABS.map((item) => <button type="button" key={item} className={`${tab === item ? "active" : ""}${item === "settings" && cliAuthPending ? " pending" : ""}`.trim()} onClick={() => dismissMobileMore(() => selectTab(item))}>{React.createElement(TAB_ICONS[item], { size: 20, "aria-hidden": true })}<span><b>{TAB_LABELS[item]}</b><small>{item === "settings" && cliAuthPending ? "CLI 로그인 필요" : MOBILE_MORE_DESCRIPTIONS[item]}</small></span>{item === "settings" && cliAuthPending && <i aria-hidden="true" />}</button>)}</div>
+        <div className="mobile-more-grid">{MOBILE_MORE_TABS.filter((item) => item !== "computers" || connectedComputers.length > 0).map((item) => <button type="button" key={item} className={`${tab === item ? "active" : ""}${item === "settings" && cliAuthPending ? " pending" : ""}`.trim()} onClick={() => dismissMobileMore(() => selectTab(item))}>{React.createElement(TAB_ICONS[item], { size: 20, "aria-hidden": true })}<span><b>{TAB_LABELS[item]}</b><small>{item === "settings" && cliAuthPending ? "CLI 로그인 필요" : MOBILE_MORE_DESCRIPTIONS[item]}</small></span>{item === "settings" && cliAuthPending && <i aria-hidden="true" />}</button>)}</div>
       </section>
     </>}
     {/* 모바일은 핵심 3개와 더보기만 고정한다. 나머지는 위 시트에서 같은 탭 상태로 이동한다. */}

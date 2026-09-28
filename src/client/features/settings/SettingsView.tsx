@@ -1,7 +1,15 @@
-import React, { useEffect, useState } from "react";
-import { Bell, KeyRound, ShieldCheck } from "lucide-react";
+import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { Bell, ChevronLeft, ChevronRight, DatabaseBackup, Fingerprint, FlaskConical, FolderInput, FolderSync, KeyRound, LockKeyhole, MessageSquare, Network, Radio, ScrollText, Server, ShieldCheck, SlidersHorizontal, Smartphone, SquareTerminal, Ticket, Timer, Webhook, type LucideIcon } from "lucide-react";
 import { api } from "../../api";
 import { copyText } from "../../lib/clipboard";
+import { biometricStatus, enrollBiometric, removeBiometric } from "../../lib/biometric";
+import { useDialogHistory } from "../../lib/dialog-history";
+import { FederationSettingsCard, type ConnectedComputer } from "../federation/FederationSettingsCard";
+import { ServerLogCard } from "./ServerLogCard";
+import { ProviderSettingsCard } from "./ProviderSettingsCard";
+import { ProjectTransferCard } from "./ProjectTransferCard";
+import { CredentialSyncCard } from "./CredentialSyncCard";
+import "./settings-layout.css";
 import type { Json } from "../../types";
 
 interface SettingsViewProps {
@@ -14,6 +22,35 @@ interface SettingsViewProps {
   onEnableNotifications(): Promise<void>;
   onOpenCliAuth(): void;
   onSignedOut(): void;
+  connectedComputers: ConnectedComputer[];
+  refreshConnectedComputers(): Promise<void>;
+}
+
+// 설정 1단계 목록의 항목. render가 있으면 2단계 상세로 열고, onOpen만 있으면 바로 실행한다.
+interface SettingsItem {
+  id: string;
+  group: "계정·보안" | "알림" | "운영" | "고급";
+  title: string;
+  description: string;
+  icon: LucideIcon;
+  status?: { label: string; ready: boolean };
+  render?: () => React.ReactElement;
+  onOpen?: () => void;
+}
+
+const SETTINGS_GROUPS: SettingsItem["group"][] = ["계정·보안", "알림", "운영", "고급"];
+
+// 설정이 목록↔상세 전환 방식(모바일 폭)인지 화면 크기 변화에 맞춰 알려준다.
+function useNarrowSettings(): boolean {
+  const query = "(max-width: 700px)";
+  const [narrow, setNarrow] = useState(() => typeof window !== "undefined" && window.matchMedia(query).matches);
+  useEffect(() => {
+    const media = window.matchMedia(query);
+    const update = () => setNarrow(media.matches);
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+  return narrow;
 }
 
 interface WebSession {
@@ -29,6 +66,31 @@ function sessionTime(value: string): string {
   const normalized = /(?:Z|[+-]\d\d:\d\d)$/.test(value) ? value : `${value.replace(" ", "T")}Z`;
   const parsed = Date.parse(normalized);
   return Number.isFinite(parsed) ? new Intl.DateTimeFormat("ko-KR", { dateStyle: "short", timeStyle: "short" }).format(parsed) : value;
+}
+
+// Android 앱에서 이 기기의 지문 본인 확인을 등록·해제한다. 브리지가 없는 브라우저에서는 그리지 않는다.
+function BiometricSettings(): React.ReactElement | null {
+  const [state, setState] = useState<{ deviceBound: boolean; enrolled: boolean } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
+  useEffect(() => { void biometricStatus().then(setState); }, []);
+  if (!state) return null;
+  async function run(action: () => Promise<void>, done: string, enrolled: boolean): Promise<void> {
+    setBusy(true); setMessage("");
+    try { await action(); setState((current) => current && { ...current, enrolled }); setMessage(done); }
+    catch (error: any) { setMessage(error?.message || "지문 본인 확인 설정에 실패했습니다."); }
+    finally { setBusy(false); }
+  }
+  return <div className="slack-settings-form password-change-form">
+    <strong><Fingerprint size={15} aria-hidden="true" /> 지문 본인 확인</strong>
+    <span className="muted idle-note">{!state.deviceBound
+      ? "앱 기기 인증으로 연결된 세션에서만 등록할 수 있습니다. 설정 톱니의 이 기기 앱 인증을 먼저 해주세요."
+      : state.enrolled ? "등록됨 · 중요 작업 본인 확인을 비밀번호 대신 지문으로 할 수 있습니다." : "등록하면 중요 작업 본인 확인을 지문으로 할 수 있습니다. 등록할 때 비밀번호로 한 번 확인합니다."}</span>
+    {state.deviceBound && <div className="slack-settings-actions">{state.enrolled
+      ? <button type="button" disabled={busy} onClick={() => void run(removeBiometric, "지문 본인 확인을 해제했습니다.", false)}>{busy ? "해제 중…" : "지문 해제"}</button>
+      : <button type="button" className="primary" disabled={busy} onClick={() => void run(enrollBiometric, "지문 본인 확인을 등록했습니다.", true)}>{busy ? "등록 중…" : "지문 등록"}</button>}</div>}
+    {message && <span className="muted idle-note" role="status">{message}</span>}
+  </div>;
 }
 
 // 현재 계정의 로그인 세션과 비밀번호를 운영 권한과 독립적으로 관리한다.
@@ -94,19 +156,21 @@ function SessionSecurityCard({ temporary, onSignedOut }: { temporary: boolean; o
       {hasMore && <small className="muted">최근 세션 100개만 표시합니다.</small>}
     </div>
     {!temporary && <><div className="slack-settings-actions"><button type="button" disabled={revoking || otherCount === 0} onClick={() => void revokeOthers()}>{revoking ? "로그아웃 중…" : `다른 세션 로그아웃${otherCount ? ` (${otherCount})` : ""}`}</button></div>
+      <BiometricSettings />
+      <details className="settings-disclosure"><summary><span><strong>중요 작업 본인 확인</strong><small>삭제·CLI 업데이트·프로세스 종료 전에 미리 확인해 둡니다.</small></span></summary>
       <form className="slack-settings-form password-change-form" onSubmit={reauthenticate}>
-        <strong>중요 작업 본인 확인</strong><span className="muted idle-note">삭제·CLI 업데이트·프로세스 종료 전에 필요합니다. MFA를 사용 중이면 코드도 입력하세요.</span>
+        <span className="muted idle-note">MFA를 사용 중이면 코드도 입력하세요.</span>
         <label>재인증 비밀번호<input type="password" autoComplete="current-password" value={reauthPassword} onChange={(event) => setReauthPassword(event.target.value)} required /></label>
         <label>재인증 MFA 코드 (사용 중인 경우)<input autoComplete="one-time-code" maxLength={64} value={reauthCode} onChange={(event) => setReauthCode(event.target.value.slice(0, 64))} /></label>
         <div className="slack-settings-actions"><button className="primary" disabled={reauthenticating}>{reauthenticating ? "확인 중…" : "중요 작업 본인 확인"}</button></div>
-      </form>
+      </form></details>
+      <details className="settings-disclosure"><summary><span><strong>비밀번호 변경</strong><small>변경하면 모든 기기에서 로그아웃됩니다.</small></span></summary>
       <form className="slack-settings-form password-change-form" onSubmit={changePassword}>
-        <strong>비밀번호 변경</strong>
         <label>현재 비밀번호<input type="password" autoComplete="current-password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} required /></label>
         <label>새 비밀번호<input type="password" autoComplete="new-password" minLength={12} maxLength={256} value={newPassword} onChange={(event) => setNewPassword(event.target.value)} required /></label>
         <label>새 비밀번호 확인<input type="password" autoComplete="new-password" minLength={12} maxLength={256} value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} required /></label>
         <div className="slack-settings-actions"><button className="primary" disabled={changing}>{changing ? "변경 중…" : "비밀번호 변경·전체 로그아웃"}</button></div>
-      </form></>}
+      </form></details></>}
     {temporary && <p className="muted idle-note">임시 로그인에서는 세션과 비밀번호를 변경할 수 없습니다.</p>}
     {status && <span className="attachment-status" aria-live="polite">{status}</span>}
   </article>;
@@ -578,23 +642,109 @@ function FullBackupCard(): React.ReactElement {
   </article>;
 }
 
-export function SettingsView({ user, slack, ntfy, notificationPermission, notificationsSupported, temporary, onEnableNotifications, onOpenCliAuth, onSignedOut }: SettingsViewProps): React.ReactElement {
-  return <section className="content-grid settings-page">
-    <div className="section-head"><div><span className="eyebrow">환경과 연결</span><h2>설정</h2><p>알림 채널, 계정 인증과 운영 정책을 한곳에서 관리합니다.</p></div></div>
-    <div className="settings-grid">
-      <BrowserNotificationCard permission={notificationPermission} supported={notificationsSupported} onEnable={onEnableNotifications} />
-      <SessionSecurityCard temporary={temporary} onSignedOut={onSignedOut} />
-      {!temporary && <MfaSettingsCard onSignedOut={onSignedOut} />}
-      {user.role === "admin" && <article className="card cli-settings-card"><div className="card-top">CLI 계정·인증</div><div className="settings-card-copy"><KeyRound size={22} aria-hidden="true" /><p>Codex·Claude·Grok·GitHub 로그인과 공급자별 계정 슬롯, 사용량 조회 범위를 관리합니다.</p></div><div className="slack-settings-actions"><button type="button" className="primary" onClick={onOpenCliAuth}>CLI 인증 관리</button></div></article>}
-      {user.role === "admin" && <SlackSettingsCard connected={!!slack?.enabled} />}
-      {user.role === "admin" && <NtfySettingsCard connected={!!ntfy?.enabled} />}
-      {user.role === "admin" && <WebhookSettingsCard />}
-      {user.role === "admin" && <IdleChatSettingsCard />}
-      {user.role === "admin" && <OneTimeLoginCard />}
-      {user.role === "admin" && <FullBackupCard />}
-      {user.role === "admin" && <ProjectProfileSettingsCard />}
-      {user.role === "admin" && <StructuredShadowReadinessCard />}
-      {user.role === "admin" && <RemoteWorkerSettingsCard />}
+interface MobilePushStatus {
+  enabled: boolean;
+  projectConfigured: boolean;
+  registeredDevices: number;
+}
+
+function MobilePushSettingsCard(): React.ReactElement {
+  const [info, setInfo] = useState<MobilePushStatus | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
+  async function refresh(): Promise<void> {
+    try {
+      const status = await api("/mobile/push") as Partial<MobilePushStatus> | null;
+      // 구버전 WAM이나 테스트 응답의 누락 필드가 설정 화면 전체를 무너뜨리지 않게 한다.
+      setInfo({
+        enabled: status?.enabled === true,
+        projectConfigured: status?.projectConfigured === true,
+        registeredDevices: typeof status?.registeredDevices === "number" && Number.isSafeInteger(status.registeredDevices) && status.registeredDevices >= 0 ? status.registeredDevices : 0,
+      });
+    }
+    catch (error: any) { setMessage(error?.message || "푸시 상태를 읽지 못했습니다."); }
+  }
+  useEffect(() => { void refresh(); }, []);
+  async function testPush(): Promise<void> {
+    setBusy(true); setMessage("");
+    try { await api("/mobile/push/test", { method: "POST" }); setMessage("테스트 요청을 보냈습니다. 실제 휴대폰 수신을 확인하세요."); await refresh(); }
+    catch (error: any) { setMessage(error?.message || "푸시 요청에 실패했습니다."); }
+    finally { setBusy(false); }
+  }
+  return <article className="card"><div className="card-top"><span>Android 앱 푸시</span><span className={`settings-status ${info?.enabled ? "ready" : ""}`}>{info === null ? "확인 중" : info.enabled ? "활성" : "꺼짐"}</span></div>
+    <p className="muted idle-note">본인 Firebase 프로젝트로 앱을 빌드하고 중앙 WAM에 같은 프로젝트의 서버 발송 자격증명을 설정합니다. 원격 컴퓨터 알림도 중앙에서 모아 보냅니다.</p>
+    {info && <p>프로젝트 ID {info.projectConfigured ? "설정됨" : "미설정"} · 등록 기기 {info.registeredDevices}대</p>}
+    <div className="slack-settings-actions">
+      <button type="button" disabled={busy || !info?.enabled || info.registeredDevices === 0} onClick={() => void testPush()}>테스트 알림</button>
+    </div>
+    {message && <span className="attachment-status" aria-live="polite">{message}</span>}
+  </article>;
+}
+
+// 설정 화면: 1단계 그룹 목록과 2단계 선택 항목 상세. 데스크톱은 2단, 모바일은 목록↔상세 전환.
+export function SettingsView({ user, slack, ntfy, notificationPermission, notificationsSupported, temporary, onEnableNotifications, onOpenCliAuth, onSignedOut, connectedComputers, refreshConnectedComputers }: SettingsViewProps): React.ReactElement {
+  const admin = user.role === "admin";
+  const browserStatus = !notificationsSupported ? { label: "미지원", ready: false }
+    : notificationPermission === "granted" ? { label: "허용됨", ready: true }
+      : notificationPermission === "denied" ? { label: "차단됨", ready: false } : { label: "허용 필요", ready: false };
+  const items: SettingsItem[] = [
+    { id: "security", group: "계정·보안", title: "로그인 보안", description: "로그인 세션, 지문·본인 확인, 비밀번호", icon: ShieldCheck, render: () => <SessionSecurityCard temporary={temporary} onSignedOut={onSignedOut} /> },
+    ...(!temporary ? [{ id: "mfa", group: "계정·보안", title: "2단계 인증", description: "인증 앱 코드(TOTP)와 복구 코드", icon: LockKeyhole, render: () => <MfaSettingsCard onSignedOut={onSignedOut} /> } as SettingsItem] : []),
+    ...(admin ? [
+      { id: "cli", group: "계정·보안", title: "CLI 계정·인증", description: "Codex·Claude·Grok·GitHub 로그인과 계정 슬롯", icon: SquareTerminal, onOpen: onOpenCliAuth },
+      { id: "one-time", group: "계정·보안", title: "일회용 임시 로그인", description: "다른 기기용 8자리 1회 코드 발급", icon: Ticket, render: () => <OneTimeLoginCard /> },
+    ] as SettingsItem[] : []),
+    { id: "browser", group: "알림", title: "브라우저 알림", description: "이 기기에서 작업 완료 알림 받기", icon: Bell, status: browserStatus, render: () => <BrowserNotificationCard permission={notificationPermission} supported={notificationsSupported} onEnable={onEnableNotifications} /> },
+    ...(admin ? [
+      { id: "push", group: "알림", title: "Android 앱 푸시", description: "FCM 등록 기기와 테스트 알림", icon: Smartphone, render: () => <MobilePushSettingsCard /> },
+      { id: "slack", group: "알림", title: "Slack 알림", description: "봇 토큰과 알림 채널", icon: MessageSquare, status: { label: slack?.enabled ? "연결됨" : "미설정", ready: !!slack?.enabled }, render: () => <SlackSettingsCard connected={!!slack?.enabled} /> },
+      { id: "ntfy", group: "알림", title: "ntfy 알림", description: "ntfy 토픽 푸시", icon: Radio, status: { label: ntfy?.enabled ? "연결됨" : "미설정", ready: !!ntfy?.enabled }, render: () => <NtfySettingsCard connected={!!ntfy?.enabled} /> },
+      { id: "webhook", group: "알림", title: "Webhook", description: "서명된 외부 webhook 전송", icon: Webhook, render: () => <WebhookSettingsCard /> },
+      { id: "idle", group: "운영", title: "유휴 채팅 자동 종료", description: "오래 쉬는 채팅의 터미널 정리", icon: Timer, render: () => <IdleChatSettingsCard /> },
+      { id: "backup", group: "운영", title: "전체 암호화 백업", description: "데이터 전체 백업 생성·다운로드", icon: DatabaseBackup, render: () => <FullBackupCard /> },
+      ...(!temporary ? [
+        { id: "computers", group: "운영", title: "컴퓨터 연결", description: "다른 컴퓨터의 WAM 연결", icon: Network, status: connectedComputers.length ? { label: `${connectedComputers.length}대`, ready: true } : undefined, render: () => <FederationSettingsCard nodes={connectedComputers} refresh={refreshConnectedComputers} /> },
+        { id: "logs", group: "운영", title: "서버 로그", description: "이 WAM·연결 컴퓨터 로그 조회", icon: ScrollText, render: () => <ServerLogCard nodes={connectedComputers} /> },
+        { id: "provider-settings", group: "운영", title: "공급자 설정 백업·동기화", description: "전역 지침·스킬·훅 백업·복원, 연결 컴퓨터로 보내기", icon: FolderSync, render: () => <ProviderSettingsCard nodes={connectedComputers} refresh={refreshConnectedComputers} /> },
+        ...(connectedComputers.length ? [{ id: "project-transfer", group: "운영", title: "프로젝트 이동", description: "프로젝트를 연결 컴퓨터로 복사하고 실행 환경 재설치", icon: FolderInput, render: () => <ProjectTransferCard nodes={connectedComputers} /> } as SettingsItem,
+          { id: "credential-sync", group: "운영", title: "인증 동기화", description: "연결 컴퓨터에 gh·Codex 로그인 복사, Claude 원격 로그인", icon: KeyRound, render: () => <CredentialSyncCard nodes={connectedComputers} /> } as SettingsItem] : []),
+      ] as SettingsItem[] : []),
+      { id: "remote-worker", group: "운영", title: "원격 worker", description: "SSH host와 프로젝트 매핑", icon: Server, render: () => <RemoteWorkerSettingsCard /> },
+      { id: "profile", group: "고급", title: "프로젝트 Agent profile", description: "공급자·작업별 profile 버전 관리", icon: SlidersHorizontal, render: () => <ProjectProfileSettingsCard /> },
+      { id: "shadow", group: "고급", title: "Codex structured shadow", description: "구조화 전송 전환 준비 상태", icon: FlaskConical, render: () => <StructuredShadowReadinessCard /> },
+    ] as SettingsItem[] : []),
+  ];
+  const narrow = useNarrowSettings();
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  // 데스크톱은 항상 한 항목을 보여주고, 모바일은 목록에서 고를 때만 상세로 들어간다.
+  const selected = items.find((item) => item.id === selectedId && item.render) ?? (narrow ? null : items.find((item) => item.render) ?? null);
+  const detailOpenOnMobile = narrow && selected !== null;
+  const dismiss = useDialogHistory(detailOpenOnMobile, () => setSelectedId(null), "settings-detail");
+  const pageRef = useRef<HTMLElement>(null);
+  useLayoutEffect(() => { if (narrow) pageRef.current?.scrollIntoView({ block: "start" }); }, [narrow, selectedId]);
+
+  return <section className="content-grid settings-page" ref={pageRef}>
+    {!detailOpenOnMobile && <div className="section-head"><div><span className="eyebrow">환경과 연결</span><h2>설정</h2><p>알림 채널, 계정 인증과 운영 정책을 한곳에서 관리합니다.</p></div></div>}
+    <div className="settings-layout">
+      {/* <nav>이면 헤더 탭용 전역 `nav button` 스타일(hover 흰 글자 등)이 새므로 역할만 부여한다. */}
+      {!detailOpenOnMobile && <div className="settings-menu" role="navigation" aria-label="설정 항목">
+        {SETTINGS_GROUPS.map((group) => {
+          const groupItems = items.filter((item) => item.group === group);
+          if (!groupItems.length) return null;
+          return <div className="settings-menu-group" key={group}><h3>{group}</h3><ul>
+            {groupItems.map((item) => <li key={item.id}><button type="button" className="settings-menu-item" aria-current={selected?.id === item.id ? "true" : undefined} onClick={() => (item.render ? setSelectedId(item.id) : item.onOpen?.())}>
+              <span className="settings-menu-icon">{React.createElement(item.icon, { size: 17, "aria-hidden": true })}</span>
+              <span className="settings-menu-text"><b>{item.title}</b><small>{item.description}</small></span>
+              {item.status ? <span className={`settings-status${item.status.ready ? " ready" : ""}`}>{item.status.label}</span> : <span />}
+              <ChevronRight className="settings-menu-chevron" size={16} aria-hidden="true" />
+            </button></li>)}
+          </ul></div>;
+        })}
+      </div>}
+      {selected?.render && <div className="settings-detail" aria-label={selected.title}>
+        {narrow && <button type="button" className="settings-back" onClick={() => dismiss()}><ChevronLeft size={18} aria-hidden="true" />설정</button>}
+        <React.Fragment key={selected.id}>{selected.render()}</React.Fragment>
+      </div>}
     </div>
   </section>;
 }

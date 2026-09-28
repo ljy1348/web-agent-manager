@@ -15,6 +15,25 @@ export function notifyAuthenticationRequired(): void {
   if (typeof window !== "undefined") window.dispatchEvent(new Event(AUTHENTICATION_REQUIRED_EVENT));
 }
 
+// 서버가 403으로 막은 원인. reauth=최근 본인 확인 필요, network=외부망이라 내부망 전용 작업 차단.
+export type SecurityBlockReason = "reauth" | "network";
+// 원인 안내창을 띄우는 App 처리기. 재인증을 마치면 true를 돌려 원래 요청을 재시도하게 한다.
+export type SecurityBlockHandler = (reason: SecurityBlockReason, message: string) => Promise<boolean>;
+let securityBlockHandler: SecurityBlockHandler | null = null;
+let pendingReauthentication: Promise<boolean> | null = null;
+
+// App이 공통 차단 안내창 처리기를 등록·해제한다.
+export function setSecurityBlockHandler(handler: SecurityBlockHandler | null): void {
+  securityBlockHandler = handler;
+}
+
+// 여러 요청이 동시에 재인증에 걸려도 안내창은 하나만 띄우고 그 결과를 함께 쓴다.
+function requestReauthentication(message: string): Promise<boolean> {
+  if (!securityBlockHandler) return Promise.resolve(false);
+  pendingReauthentication ??= securityBlockHandler("reauth", message).catch(() => false).finally(() => { pendingReauthentication = null; });
+  return pendingReauthentication;
+}
+
 // 후속 쓰기 API 요청에 붙일 CSRF 토큰을 갱신한다.
 export function setCsrfToken(token: string): void {
   csrfToken = token;
@@ -39,7 +58,12 @@ function maskForLog(value: unknown): string {
 }
 
 // 인증·CSRF를 포함해 JSON API를 호출한다.
-export async function api(path: string, options: RequestInit = {}): Promise<any> {
+export function api(path: string, options: RequestInit = {}): Promise<any> {
+  return requestApi(path, options, false);
+}
+
+// 재인증 후 재시도는 1회만 하도록 retried로 구분한다. 재인증 가드는 라우트 실행 전에 막으므로 재시도해도 작업이 두 번 실행되지 않는다.
+async function requestApi(path: string, options: RequestInit, retried: boolean): Promise<any> {
   const headers = new Headers(options.headers);
   if (options.body && !(options.body instanceof FormData)) headers.set("Content-Type", "application/json");
   if (options.method && !["GET", "HEAD"].includes(options.method)) headers.set("x-csrf-token", csrfToken);
@@ -60,8 +84,16 @@ export async function api(path: string, options: RequestInit = {}): Promise<any>
   const data = await response.json().catch(() => ({}));
   console.debug("[web-agent-manager:api]", method, path, response.status, { ms: Date.now() - startedAt, in: requestBody, out: maskForLog(data) });
   if (!response.ok) {
-    if (response.status === 401) notifyAuthenticationRequired();
-    throw new ApiError(data.error || `HTTP ${response.status}`, response.status);
+    const message = data.error || `HTTP ${response.status}`;
+    // 원격 WAM이 중계한 응답은 이 WAM의 세션·네트워크로 해결할 수 없으므로 전역 처리하지 않는다.
+    const upstream = response.headers.get("x-wam-federation-upstream") === "1";
+    if (response.status === 401 && !upstream) notifyAuthenticationRequired();
+    if (response.status === 403 && !upstream) {
+      if (data.reauthRequired === true && !retried) {
+        if (await requestReauthentication(message)) return requestApi(path, options, true);
+      } else if (data.networkRestricted === true) void securityBlockHandler?.("network", message);
+    }
+    throw new ApiError(message, response.status);
   }
   return data;
 }

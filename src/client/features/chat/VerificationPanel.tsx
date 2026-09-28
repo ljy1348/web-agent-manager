@@ -87,8 +87,11 @@ export function VerificationPanel({ chatId, isAdmin, canRunTests, refreshKey }: 
     if (task?.state === "needs_input" || task?.state === "failed") setExpanded(true);
   }, [task?.state]);
 
-  if (data === null && !error) return <div className="verification-panel loading" role="status">검증 정보 불러오는 중…</div>;
+  // 로딩 중에는 profile 여부를 몰라 아무것도 그리지 않는다(채팅을 열 때마다 깜빡이지 않게).
+  if (data === null && !error) return null;
   if (!task && !error) return null;
+  // profile이 없으면 검증 recipe가 없어 실행해도 의미가 없으므로 숨긴다. 과거 실행 기록이 있으면 결과 확인용으로 유지.
+  if (task && !task.profile_version_id && !runs.length && !error) return null;
 
   const act = async (name: string, request: () => Promise<unknown>): Promise<void> => {
     setActing(name);

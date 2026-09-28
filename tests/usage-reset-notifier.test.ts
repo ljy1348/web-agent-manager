@@ -7,7 +7,7 @@ import { openDatabase } from "../src/server/core/database";
 import type { ProviderAdapter } from "../src/server/providers/provider";
 import type { NotificationPresentation, Notifier } from "../src/server/services/notifier";
 import type { RealtimeHub } from "../src/server/services/realtime";
-import { parseUsageResetMoment, resetEventKey, UsageResetNotifier } from "../src/server/services/usage-reset-notifier";
+import { formatResetMoment, parseUsageResetMoment, resetEventKey, UsageResetNotifier, usageResetMessage } from "../src/server/services/usage-reset-notifier";
 import { CodexAdapter } from "../src/server/providers/codex";
 
 const temporaryDirectories: string[] = [];
@@ -288,7 +288,10 @@ describe("UsageResetNotifier", () => {
     await Promise.resolve();
 
     expect(notificationsSent).toHaveLength(1);
-    expect(notificationsSent[0].text).toBe("Claude 5시간 사용량 초기화가 확인되었습니다.");
+    // 예정(01:00Z) 전에 감지했으므로 조기 초기화임을 모든 채널 문구에 밝힌다(#133).
+    const scheduled = formatResetMoment("2026-08-05T01:00:00.000Z");
+    expect(notificationsSent[0].text).toBe(`Claude 5시간 사용량이 예정(${scheduled})보다 먼저 초기화된 것을 감지했습니다.`);
+    expect(notificationsSent[0].presentation).toEqual({ title: "Claude 5시간 사용량 조기 초기화" });
     await vi.advanceTimersByTimeAsync(60 * 60_000);
     expect(notificationsSent).toHaveLength(1);
   });
@@ -366,5 +369,13 @@ describe("parseUsageResetMoment", () => {
   it("Claude의 날짜 없는 타임존 표기는 기준 시각과 가장 가까운 발생 시각으로 고른다", () => {
     const now = new Date("2026-08-05T00:00:00.000Z");
     expect(parseUsageResetMoment("9:01am (Asia/Seoul)", now)?.toISOString()).toBe("2026-08-05T00:01:00.000Z");
+  });
+
+  it("조기 감지 여부에 따라 초기화 알림 제목·본문을 나눈다", () => {
+    expect(usageResetMessage("Codex", "주간", "2026-10-03T08:15:00.000Z", false)).toEqual({ title: "Codex 주간 사용량 초기화", body: "Codex 주간 사용량 초기화가 확인되었습니다." });
+    const early = usageResetMessage("Codex", "주간", "2026-10-03T08:15:00.000Z", true);
+    expect(early.title).toBe("Codex 주간 사용량 조기 초기화");
+    expect(early.body).toBe(`Codex 주간 사용량이 예정(${formatResetMoment("2026-10-03T08:15:00.000Z")})보다 먼저 초기화된 것을 감지했습니다.`);
+    expect(formatResetMoment("2026-10-03T08:15:00.000Z")).toMatch(/^10월 3일 \d{2}:\d{2}$/);
   });
 });

@@ -1,4 +1,6 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
+# PowerShell 5.1이 한글 안내를 깨뜨리지 않도록 UTF-8 BOM으로 저장하고 콘솔 출력을 UTF-8로 맞춘다(#147).
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 
 if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
     Write-Error "WSL2가 필요합니다. 관리자 PowerShell에서 'wsl --install'을 실행한 뒤 다시 시도하세요."

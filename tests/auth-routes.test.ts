@@ -257,7 +257,7 @@ describe("인증 라우트 보안", () => {
     const blocked = await fetch(`${baseUrl}/api/protected`, { method: "POST", headers });
     expect(blocked.status).toBe(403);
     expect(await blocked.json()).toMatchObject({ reauthRequired: true });
-    expect((await fetch(`${baseUrl}/api/auth/reauth`, { method: "POST", headers, body: JSON.stringify({ currentPassword: "wrong-password" }) })).status).toBe(401);
+    expect((await fetch(`${baseUrl}/api/auth/reauth`, { method: "POST", headers, body: JSON.stringify({ currentPassword: "wrong-password" }) })).status).toBe(403);
     const reauthenticated = await fetch(`${baseUrl}/api/auth/reauth`, { method: "POST", headers, body: JSON.stringify({ currentPassword: "correct-password" }) });
     expect(reauthenticated.status).toBe(200);
     expect(await reauthenticated.json()).toMatchObject({ reauthenticatedAt: expect.any(String), validUntil: expect.any(String) });
@@ -293,6 +293,11 @@ describe("인증 라우트 보안", () => {
     expect(requiresRecentReauthentication("POST", "/webhook/test")).toBe(true);
     expect(requiresRecentReauthentication("POST", "/projects/1/github/pr/3/auto-merge")).toBe(true);
     expect(requiresRecentReauthentication("POST", "/projects/1/git/hunks/decision")).toBe(true);
+    expect(requiresRecentReauthentication("POST", "/federation/agent-tokens")).toBe(true);
+    expect(requiresRecentReauthentication("POST", "/federation/nodes")).toBe(true);
+    expect(requiresRecentReauthentication("DELETE", "/federation/nodes/node-1")).toBe(true);
+    expect(requiresRecentReauthentication("DELETE", "/federation/nodes/node-1/api/chats/9")).toBe(true);
+    expect(requiresRecentReauthentication("POST", "/federation/nodes/node-1/api/chats/9/messages")).toBe(false);
     expect(requiresRecentReauthentication("POST", "/tasks/task-1/routing/recommend")).toBe(false);
     expect(requiresRecentReauthentication("POST", "/providers/codex/canaries")).toBe(false);
     expect(requiresRecentReauthentication("POST", "/tasks/task-1/verifications")).toBe(false);

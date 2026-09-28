@@ -47,6 +47,9 @@ export interface CodexStructuredTransportOptions {
   readiness: { snapshot(): Record<string, unknown> };
   connector?: CodexStructuredConnector;
   now?: () => Date;
+  // tmux가 없는 Windows 노드처럼 TUI로 되돌릴 수 없는 설치본. 모든 Codex 채팅(기존 대화 포함)을 app-server로
+  // 보내고, 연결 실패는 TUI fallback 대신 다시 시도할 수 있는 오류로 남긴다(#143).
+  appServerOnly?: boolean;
 }
 
 export class CodexStructuredPreDeliveryError extends Error {
@@ -54,6 +57,12 @@ export class CodexStructuredPreDeliveryError extends Error {
     super(message);
     this.name = "CodexStructuredPreDeliveryError";
   }
+}
+
+// chats.model은 화면 표시용이라 Codex 기록에서 "gpt-5.6-sol high"처럼 effort가 붙어 있다. app-server에는 모델 ID만 넘긴다
+// (붙은 채로 보내면 "model is not supported" 400, Windows 실측).
+export function codexModelId(display: string | null | undefined): string | null {
+  return display?.trim().split(/\s+/)[0] || null;
 }
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -133,6 +142,7 @@ export class CodexStructuredTransportService {
   // 신규/무기록 Codex 채팅 조건이 모두 맞을 때만 원자적으로 이루어진다.
   claimOrOwn(chatId: number): boolean {
     const existing = this.row(chatId);
+    if (this.options.appServerOnly) return this.claimAppServerOnly(chatId, existing);
     if (existing) return existing.state !== "fallback_tui";
     if (!this.options.enabled || !this.options.cohort || this.maxNewChats < 1) return false;
     if (!candidateEligible(this.options.readiness.snapshot())) return false;
@@ -150,9 +160,31 @@ export class CodexStructuredTransportService {
     })();
   }
 
+  // app-server 전용 설치본: Codex 채팅이면 기록 유무와 상관없이 배정하고, 예전 TUI fallback 표시도 되돌린다.
+  private claimAppServerOnly(chatId: number, existing: TransportRow | undefined): boolean {
+    const chat = this.database.prepare("SELECT provider FROM chats WHERE id=?").get(chatId) as { provider: string } | undefined;
+    if (!chat || chat.provider !== "codex") return false;
+    const at = this.now().toISOString();
+    if (existing) {
+      if (existing.state === "fallback_tui") {
+        this.database.prepare("UPDATE codex_structured_transports SET state='assigned', fallback_reason=NULL, updated_at=? WHERE chat_id=?").run(at, chatId);
+      }
+      return true;
+    }
+    this.database.prepare(`INSERT OR IGNORE INTO codex_structured_transports(chat_id, cohort, state, assigned_at, updated_at)
+      VALUES (?, 'app-server-only', 'assigned', ?, ?)`).run(chatId, at, at);
+    return true;
+  }
+
   owns(chatId: number): boolean {
     const row = this.row(chatId);
     return Boolean(row && row.state !== "fallback_tui");
+  }
+
+  // 전송 시 구조화 경로를 쓸지 정한다. 앱 서버 전용(Windows)은 아직 배정 안 된 채팅(Codex 앱에서 만든 외부 채팅 등)도
+  // 여기서 배정한다. owns()만 보면 TUI 경로로 가서, start()가 앱 서버를 비동기로 띄운 뒤 없는 터미널을 15초 기다리다 실패했다.
+  ownsForSend(chatId: number): boolean {
+    return this.options.appServerOnly ? this.claimOrOwn(chatId) : this.owns(chatId);
   }
 
   state(chatId: number): { transport: "app_server" | "tui"; state: string; cohort: string | null } {
@@ -174,6 +206,8 @@ export class CodexStructuredTransportService {
       session = this.sessions.get(chatId)!;
     } catch (error) {
       if (error instanceof CodexStructuredPreDeliveryError) throw error;
+      // 앱 서버 전용은 TUI로 되돌릴 수 없으므로 실제 연결 오류를 그대로 알린다(감싸면 없는 TUI를 기다리다 시간 초과로 가려진다).
+      if (this.options.appServerOnly) throw error;
       throw new CodexStructuredPreDeliveryError();
     }
     const existing = this.database.prepare("SELECT state FROM codex_structured_delivery_receipts WHERE command_id=?")
@@ -285,7 +319,7 @@ export class CodexStructuredTransportService {
             chatId,
             cwd: chat.workspace_path,
             environment: { ...accountEnvironment, ...mcpEnvironment, WEB_AGENT_MANAGER_CHAT_ID: String(chatId) },
-            model: profile?.model ?? chat.model,
+            model: profile?.model ?? codexModelId(chat.model),
             approvalPolicy: profile?.approvalMode ?? "on-request" as const,
             sandbox: profile?.sandbox ?? "workspace-write" as const,
           };
@@ -309,6 +343,15 @@ export class CodexStructuredTransportService {
         this.sessions.delete(chatId);
         const current = this.requireRow(chatId);
         const hasDelivery = Boolean(this.database.prepare("SELECT 1 FROM codex_structured_delivery_receipts WHERE chat_id=? LIMIT 1").get(chatId));
+        if (this.options.appServerOnly && !current.current_turn_id) {
+          // TUI로 되돌릴 수 없으므로 배정 상태로 남겨 다음 시작·전송 때 다시 연결을 시도한다.
+          const failedAt = this.now().toISOString();
+          const message = error instanceof Error ? error.message : String(error);
+          this.database.prepare("UPDATE codex_structured_transports SET state='assigned', error_code=?, updated_at=? WHERE chat_id=?")
+            .run(safeErrorCode(error), failedAt, chatId);
+          this.callbacks.onStatus(chatId, "stopped", `Codex app-server에 연결하지 못했습니다: ${message}`);
+          throw new Error(`Codex app-server에 연결하지 못했습니다. Codex CLI 설치·로그인을 확인하세요. (${message})`);
+        }
         if (!hasDelivery && !current.current_turn_id) {
           const failedAt = this.now().toISOString();
           this.database.prepare(`UPDATE codex_structured_transports SET
@@ -352,6 +395,11 @@ export class CodexStructuredTransportService {
       })();
       this.callbacks.onBusy(event.chatId, false);
       this.callbacks.onHistorySignal();
+      // 터미널이 없는 app-server 채팅은 실패 사유를 채팅 오류로 보여주고, 다음 턴이 성공하면 지운다(#143).
+      const reason = event.type === "turn.failed" ? this.sessions.get(event.chatId)?.adapter.takeTurnError(event.chatId) : undefined;
+      const failure = event.type === "turn.failed" ? `Codex 응답 실패: ${reason || "원인을 알 수 없습니다. Codex 로그인과 네트워크를 확인하세요."}` : null;
+      const previous = this.database.prepare("SELECT last_error AS error FROM chats WHERE id=?").get(event.chatId) as { error: string | null } | undefined;
+      if (failure || previous?.error) this.callbacks.onStatus(event.chatId, "running", failure);
     }
     if (event.type === "session.ended") {
       this.callbacks.onStatus(event.chatId, "stopped", null);

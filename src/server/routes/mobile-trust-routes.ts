@@ -1,7 +1,7 @@
 import { Router, type Response } from "express";
 import type { AppConfig } from "../core/config";
 import type { AppDatabase } from "../core/database";
-import { createWebSession, requireAdmin, setWebSessionCookie, type AuthenticatedRequest } from "../core/auth";
+import { createWebSession, requireAdmin, requireNonTemporarySession, setWebSessionCookie, type AuthenticatedRequest } from "../core/auth";
 import { loginRequestIdentifiers, writeAudit } from "../core/audit";
 import { LoginRateLimiter, type LoginRateLimitDecision } from "../core/login-rate-limit";
 import type { MobileDeviceTrustService } from "../services/mobile-device-trust";
@@ -94,9 +94,59 @@ export function createMobileTrustBootstrapRouter(database: AppDatabase, config: 
   return router;
 }
 
-// Android 기기 등록·challenge 발급·현재 웹 세션 서명 인증 API를 구성한다.
-export function createMobileTrustRouter(database: AppDatabase, trust: MobileDeviceTrustService): Router {
+// Android 기기 등록·challenge 발급·현재 웹 세션 서명 인증과 지문 본인 확인 API를 구성한다.
+export function createMobileTrustRouter(database: AppDatabase, trust: MobileDeviceTrustService, rateLimiter = new LoginRateLimiter(database)): Router {
   const router = Router();
+  router.get("/mobile/biometric", requireAdmin, (request: AuthenticatedRequest, response) => {
+    response.json(trust.biometricStatus(request.authUser!.id, request.authSession!.id));
+  });
+  // 등록 challenge·등록은 재인증 가드 대상이라 최근 비밀번호(+MFA) 확인 뒤에만 도달한다.
+  router.post("/mobile/biometric/enroll/challenge", requireAdmin, requireNonTemporarySession, (request: AuthenticatedRequest, response, next) => {
+    try {
+      response.json({ challenge: trust.createBiometricChallenge(request.authUser!.id, request.authSession!.id, "enroll") });
+    } catch (error) { next(error); }
+  });
+  router.post("/mobile/biometric/enroll", requireAdmin, requireNonTemporarySession, (request: AuthenticatedRequest, response) => {
+    const publicKey = typeof request.body?.publicKey === "string" ? request.body.publicKey : "";
+    const challenge = typeof request.body?.challenge === "string" ? request.body.challenge : "";
+    const signature = typeof request.body?.signature === "string" ? request.body.signature : "";
+    if (!trust.enrollBiometric(request.authUser!.id, request.authSession!.id, publicKey, challenge, signature)) {
+      return response.status(403).json({ error: "지문 본인 확인 등록 서명 검증에 실패했습니다." });
+    }
+    writeAudit(database, request.authUser!.id, "mobile.biometric.enroll", "web_session", request.authSession!.id, {});
+    response.status(201).json({ enrolled: true });
+  });
+  router.delete("/mobile/biometric", requireAdmin, requireNonTemporarySession, (request: AuthenticatedRequest, response) => {
+    if (!trust.removeBiometric(request.authUser!.id, request.authSession!.id)) return response.status(404).json({ error: "이 기기에 등록된 지문 본인 확인이 없습니다." });
+    writeAudit(database, request.authUser!.id, "mobile.biometric.remove", "web_session", request.authSession!.id, {});
+    response.status(204).end();
+  });
+  router.post("/mobile/biometric/reauth/challenge", requireAdmin, requireNonTemporarySession, (request: AuthenticatedRequest, response, next) => {
+    try {
+      response.json({ challenge: trust.createBiometricChallenge(request.authUser!.id, request.authSession!.id, "reauth") });
+    } catch (error) { next(error); }
+  });
+  // 비밀번호 재인증과 같은 계정 키로 시도 횟수를 제한해 두 경로를 번갈아 써도 한도를 우회하지 못하게 한다.
+  router.post("/mobile/biometric/reauth", requireAdmin, requireNonTemporarySession, (request: AuthenticatedRequest, response) => {
+    const clientAddress = trustClientAddress(request);
+    const limiterKey = `reauth-user:${request.authUser!.id}`;
+    const limit = rateLimiter.begin(clientAddress, limiterKey);
+    if (!limit.allowed) {
+      if (limit.shouldAudit) writeAudit(database, request.authUser!.id, "auth.reauthenticate.rate_limited", "web_session", request.authSession!.id, { retryAfterMs: limit.retryAfterMs, scope: limit.scope, method: "biometric" });
+      response.setHeader("Retry-After", String(Math.ceil(limit.retryAfterMs / 1000)));
+      return response.status(429).json({ error: "본인 확인 시도가 너무 많습니다. 잠시 후 다시 시도해주세요." });
+    }
+    const challenge = typeof request.body?.challenge === "string" ? request.body.challenge : "";
+    const signature = typeof request.body?.signature === "string" ? request.body.signature : "";
+    if (!trust.verifyBiometricReauth(request.authUser!.id, request.authSession!.id, challenge, signature)) {
+      const failure = rateLimiter.recordFailure(clientAddress, limiterKey);
+      writeAudit(database, request.authUser!.id, "auth.reauthenticate.failed", "web_session", request.authSession!.id, { ...failure, method: "biometric" });
+      return response.status(403).json({ error: "지문 본인 확인 서명 검증에 실패했습니다." });
+    }
+    rateLimiter.resetAccount(clientAddress, limiterKey);
+    writeAudit(database, request.authUser!.id, "auth.reauthenticate", "web_session", request.authSession!.id, { method: "biometric" });
+    response.json({ reauthenticated: true });
+  });
   router.get("/mobile/trust", requireAdmin, (request: AuthenticatedRequest, response) => {
     const deviceId = typeof request.query.deviceId === "string" ? request.query.deviceId : "";
     response.json(trust.status(request.authUser!.id, request.authSession!.id, deviceId));

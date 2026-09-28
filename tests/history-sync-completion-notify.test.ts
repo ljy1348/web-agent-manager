@@ -5,12 +5,12 @@ import { afterEach, describe, expect, it } from "vitest";
 import { openDatabase, type AppDatabase } from "../src/server/core/database";
 import type { AppConfig } from "../src/server/core/config";
 import { AgentAccountService } from "../src/server/services/agent-accounts";
-import { HistorySynchronizer, isOpenSourceDelegation } from "../src/server/services/history-sync";
+import { completionExcerpt, HistorySynchronizer, isOpenSourceDelegation } from "../src/server/services/history-sync";
 import { HistoryCache } from "../src/server/services/history-cache";
 import { ApprovalService } from "../src/server/services/approval";
 import { ClaudeAdapter } from "../src/server/providers/claude";
 import type { RealtimeHub } from "../src/server/services/realtime";
-import type { Notifier } from "../src/server/services/notifier";
+import type { NotificationPresentation, Notifier } from "../src/server/services/notifier";
 
 const temporaryDirs: string[] = [];
 
@@ -50,11 +50,11 @@ function buildSynchronizer(cwd: string, historyRoot = makeDir("wam-notify-histor
   const database = openDatabase(config);
   database.prepare("INSERT INTO projects(name, path, source) VALUES ('p', ?, 'manual')").run(cwd);
   const project = database.prepare("SELECT id FROM projects WHERE path = ?").get(cwd) as { id: number };
-  const sent: Array<{ eventId: string; eventType: string; text: string }> = [];
+  const sent: Array<{ eventId: string; eventType: string; text: string; presentation?: NotificationPresentation }> = [];
   const events: Array<{ type: string; payload: Record<string, unknown> }> = [];
   const realtime = { broadcast: (type: string, payload: Record<string, unknown>) => { events.push({ type, payload }); } } as unknown as RealtimeHub;
   const notifications: Notifier = {
-    notify: async (eventId, eventType, text) => { sent.push({ eventId, eventType, text }); },
+    notify: async (eventId, eventType, text, presentation) => { sent.push({ eventId, eventType, text, presentation }); },
   };
   const adapter = new ClaudeAdapter("", {});
   (adapter as { historyRoot: string }).historyRoot = historyRoot;
@@ -197,6 +197,25 @@ describe("히스토리 동기화 완료 알림 게이트", () => {
       { type: "task_completed", payload: { chatId, provider: "claude", title: expect.any(String) } },
     ]);
     database.close();
+  });
+
+  it("앱 푸시는 채팅 번호·바꾼 제목·공급자·응답 앞부분으로 만들고 채팅 ID를 싣는다(#128)", () => {
+    const cwd = makeDir("wam-notify-cwd-");
+    const { database, sync, historyRoot, projectId, sent } = buildSynchronizer(cwd);
+    const file = writeClaudeSession(historyRoot, "push-chat", cwd, true);
+    const chatId = insertChat(database, { projectId, sessionId: "push-chat", historyFile: file });
+    database.prepare("UPDATE chats SET title = '지문 본인 확인 작업', title_source = 'manual' WHERE id = ?").run(chatId);
+    sync.syncAll(true);
+    expect(sent[0].presentation).toEqual({ push: { title: `#${chatId} · 지문 본인 확인 작업`, body: "Claude · 완료", chatId } });
+    database.close();
+  });
+
+  it("응답 앞부분은 도구 호출·진행 설명을 건너뛴 마지막 본문을 한 줄로 120자에서 자른다", () => {
+    const message = (kind: string, content: string, role: "assistant" | "user" = "assistant") => ({ id: kind, role, kind, content, createdAt: "" });
+    const long = `첫 줄\n\n${"가".repeat(200)}`;
+    expect(completionExcerpt([message("text", long), message("tool_call", "도구"), message("progress_update", "진행")])).toBe(`첫 줄 ${"가".repeat(116)}…`);
+    expect(completionExcerpt([message("turn_end", "  짧은   답변 "), message("text", "질문", "user")])).toBe("짧은 답변");
+    expect(completionExcerpt([message("tool_result", "결과")])).toBe("");
   });
 
   it("부모가 보류 중 새 턴을 돌리면 이전 보류를 새 완료로 갈아 끼운다", () => {

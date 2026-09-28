@@ -13,6 +13,13 @@ export interface ResolvedMobileTrustDevice extends MobileTrustDeviceStatus {
   deviceId: string | null;
 }
 
+export interface MobileBiometricStatus {
+  deviceBound: boolean;
+  enrolled: boolean;
+}
+
+export type MobileBiometricPurpose = "enroll" | "reauth";
+
 export interface MobileTrustLoginIdentity {
   deviceId: string;
   userId: number;
@@ -178,10 +185,94 @@ export class MobileDeviceTrustService {
     this.database.transaction(() => {
       this.database.prepare("DELETE FROM mobile_trust_challenges WHERE device_id = ?").run(deviceId);
       this.database.prepare("DELETE FROM mobile_trust_login_challenges WHERE device_id = ?").run(deviceId);
+      this.database.prepare("DELETE FROM mobile_biometric_challenges WHERE device_id = ?").run(deviceId);
       this.database.prepare("UPDATE web_sessions SET mobile_trusted_device_id = NULL WHERE user_id = ? AND mobile_trusted_device_id = ?").run(userId, deviceId);
-      this.database.prepare("UPDATE mobile_trusted_devices SET active = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?").run(deviceId, userId);
+      // 재등록 시 예전 지문 키가 되살아나지 않도록 해제와 함께 지운다.
+      this.database.prepare("UPDATE mobile_trusted_devices SET active = 0, biometric_public_key = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?").run(deviceId, userId);
     })();
     return true;
+  }
+
+  // 현재 웹 세션이 기기 서명으로 묶인 활성 기기인지와 지문 키 등록 여부를 반환한다.
+  biometricStatus(userId: number, sessionId: number): MobileBiometricStatus {
+    const device = this.sessionDevice(userId, sessionId);
+    return { deviceBound: Boolean(device), enrolled: Boolean(device?.biometric_public_key) };
+  }
+
+  // 세션에 묶인 기기용 지문 등록·본인 확인 1회성 challenge를 발급한다.
+  createBiometricChallenge(userId: number, sessionId: number, purpose: MobileBiometricPurpose): string {
+    const device = this.sessionDevice(userId, sessionId);
+    if (!device) throw new Error("앱 기기 인증으로 연결된 세션에서만 지문을 사용할 수 있습니다.");
+    if (purpose === "reauth" && !device.biometric_public_key) throw new Error("이 기기에 지문 본인 확인이 등록되어 있지 않습니다.");
+    const challenge = createToken(32);
+    this.database.prepare(`
+      INSERT INTO mobile_biometric_challenges(web_session_id, device_id, purpose, challenge_hash, expires_at)
+      VALUES (?, ?, ?, ?, datetime('now', ?))
+      ON CONFLICT(web_session_id) DO UPDATE SET
+        device_id = excluded.device_id,
+        purpose = excluded.purpose,
+        challenge_hash = excluded.challenge_hash,
+        expires_at = excluded.expires_at,
+        created_at = CURRENT_TIMESTAMP
+    `).run(sessionId, device.id, purpose, hashToken(challenge), `+${CHALLENGE_TTL_SECONDS} seconds`);
+    return challenge;
+  }
+
+  // 기존 기기 키가 서명한 지문 공개키를 검증해 이 기기의 지문 본인 확인 키로 저장한다.
+  enrollBiometric(userId: number, sessionId: number, biometricPublicKey: string, challenge: string, signature: string): boolean {
+    let canonicalKey: string;
+    try {
+      canonicalKey = parseDevicePublicKey(biometricPublicKey).export({ format: "der", type: "spki" }).toString("base64");
+    } catch {
+      return false;
+    }
+    const device = this.consumeBiometricChallenge(userId, sessionId, "enroll", challenge);
+    if (!device || !verifySignature(device.public_key, biometricEnrollPayload(challenge, biometricPublicKey), signature)) return false;
+    this.database.prepare(`
+      UPDATE mobile_trusted_devices SET biometric_public_key = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?
+    `).run(canonicalKey, device.id, userId);
+    return true;
+  }
+
+  // 지문 키 서명을 검증하면 현재 웹 세션의 최근 본인 확인 시각을 갱신한다.
+  verifyBiometricReauth(userId: number, sessionId: number, challenge: string, signature: string): boolean {
+    const device = this.consumeBiometricChallenge(userId, sessionId, "reauth", challenge);
+    if (!device?.biometric_public_key || !verifySignature(device.biometric_public_key, biometricReauthPayload(challenge), signature)) return false;
+    this.database.transaction(() => {
+      this.database.prepare("UPDATE web_sessions SET reauthenticated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?").run(sessionId, userId);
+      this.database.prepare("UPDATE mobile_trusted_devices SET last_used_at = CURRENT_TIMESTAMP WHERE id = ?").run(device.id);
+    })();
+    return true;
+  }
+
+  // 세션에 묶인 기기의 지문 키를 지운다.
+  removeBiometric(userId: number, sessionId: number): boolean {
+    const device = this.sessionDevice(userId, sessionId);
+    if (!device?.biometric_public_key) return false;
+    this.database.prepare("UPDATE mobile_trusted_devices SET biometric_public_key = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?").run(device.id, userId);
+    return true;
+  }
+
+  // 용도가 일치하는 유효 challenge를 서명 검증 전에 먼저 폐기해 실패 시에도 재사용하지 못하게 한다.
+  private consumeBiometricChallenge(userId: number, sessionId: number, purpose: MobileBiometricPurpose, challenge: string): SessionDevice | undefined {
+    if (!challenge || challenge.length > 256) return undefined;
+    const row = this.database.prepare(`
+      SELECT challenge_hash, device_id FROM mobile_biometric_challenges
+      WHERE web_session_id = ? AND purpose = ? AND expires_at > datetime('now')
+    `).get(sessionId, purpose) as { challenge_hash: string; device_id: string } | undefined;
+    if (!row || !timingSafeEqualString(hashToken(challenge), row.challenge_hash)) return undefined;
+    this.database.prepare("DELETE FROM mobile_biometric_challenges WHERE web_session_id = ?").run(sessionId);
+    const device = this.sessionDevice(userId, sessionId);
+    return device?.id === row.device_id ? device : undefined;
+  }
+
+  // 현재 웹 세션을 기기 서명으로 인증한 활성 기기를 조회한다.
+  private sessionDevice(userId: number, sessionId: number): SessionDevice | undefined {
+    return this.database.prepare(`
+      SELECT d.id, d.public_key, d.biometric_public_key
+      FROM web_sessions s JOIN mobile_trusted_devices d ON d.id = s.mobile_trusted_device_id AND d.user_id = s.user_id AND d.active = 1
+      WHERE s.id = ? AND s.user_id = ? AND s.expires_at > datetime('now')
+    `).get(sessionId, userId) as SessionDevice | undefined;
   }
 
   // 사용자 소유의 활성 기기만 조회해 다른 계정의 식별자를 재사용하지 못하게 한다.
@@ -191,6 +282,28 @@ export class MobileDeviceTrustService {
       SELECT id FROM mobile_trusted_devices WHERE id = ? AND user_id = ? AND active = 1
     `).get(deviceId, userId) as { id: string } | undefined;
   }
+}
+
+type SessionDevice = { id: string; public_key: string; biometric_public_key: string | null };
+
+// 저장된 P-256 공개키로 base64 ECDSA 서명을 검증하며 형식 오류는 실패로 본다.
+function verifySignature(publicKey: string, payload: string, signature: string): boolean {
+  if (!signature || signature.length > 1024) return false;
+  try {
+    return crypto.verify("sha256", Buffer.from(payload, "utf8"), parseDevicePublicKey(publicKey), Buffer.from(signature, "base64"));
+  } catch {
+    return false;
+  }
+}
+
+// 기기 키가 지문 공개키를 보증하는 서명 문구. 용도 접두어로 다른 challenge 서명과 섞이지 않게 한다.
+function biometricEnrollPayload(challenge: string, biometricPublicKey: string): string {
+  return `wam-biometric-enroll-v1\n${challenge}\n${biometricPublicKey}`;
+}
+
+// 지문 키로 서명하는 본인 확인 문구.
+function biometricReauthPayload(challenge: string): string {
+  return `wam-biometric-reauth-v1\n${challenge}`;
 }
 
 // DER SPKI 입력이 Android Keystore와 맞는 P-256 EC 공개키인지 제한한다.

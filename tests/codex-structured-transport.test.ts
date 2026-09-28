@@ -7,6 +7,7 @@ import { openDatabase } from "../src/server/core/database";
 import { AgentAccountService } from "../src/server/services/agent-accounts";
 import {
   CodexStructuredPreDeliveryError,
+  codexModelId,
   CodexStructuredTransportService,
   type CodexStructuredTransportCallbacks,
 } from "../src/server/services/codex-structured-transport";
@@ -55,7 +56,7 @@ function appServerHarness(options?: { connectError?: Error; turnError?: Error; t
   return { connector, calls, notify: (value: CodexAppServerNotification) => notification?.(value), closed: () => closed };
 }
 
-function service(input: ReturnType<typeof fixture>, connector: CodexStructuredConnector, options?: { eligible?: boolean; enabled?: boolean; cohort?: string; max?: number }) {
+function service(input: ReturnType<typeof fixture>, connector: CodexStructuredConnector, options?: { eligible?: boolean; enabled?: boolean; cohort?: string; max?: number; appServerOnly?: boolean }) {
   const events: unknown[] = [];
   const busy: boolean[] = [];
   let historySignals = 0;
@@ -73,9 +74,99 @@ function service(input: ReturnType<typeof fixture>, connector: CodexStructuredCo
     readiness: { snapshot: () => ({ readiness: { candidateEligible: options?.eligible ?? true } }) },
     connector,
     now: () => new Date("2026-09-13T01:02:03.000Z"),
+    appServerOnly: options?.appServerOnly,
   });
   return { transport, events, busy, historySignals: () => historySignals };
 }
+
+describe("Codex app-server 전용 모드 (#143, Windows 노드)", () => {
+  it("코호트·할당량과 무관하게 기존 대화까지 배정하고 그 thread를 재개한다", async () => {
+    const input = fixture(); const fake = appServerHarness();
+    const external = input.chat("external", "stopped");
+    input.database.prepare("UPDATE chats SET provider_session_id='thread-from-codex-app', history_file='/x.jsonl' WHERE id=?").run(external);
+    const other = input.chat("other", "stopped");
+    const only = service(input, fake.connector, { enabled: false, max: 0, eligible: false, appServerOnly: true });
+    expect(only.transport.claimOrOwn(external)).toBe(true);
+    expect(only.transport.claimOrOwn(other)).toBe(true);
+    await only.transport.start(external);
+    expect(fake.calls.find((call) => call.method === "thread/resume")?.params?.threadId).toBe("thread-from-codex-app");
+    expect(input.database.prepare("SELECT status, provider_session_id AS sessionId FROM chats WHERE id=?").get(external)).toEqual({ status: "running", sessionId: "thread-from-codex-app" });
+  });
+
+  it("예전 TUI fallback 표시를 되돌리고, Codex가 아닌 채팅은 배정하지 않는다", () => {
+    const input = fixture(); const fake = appServerHarness();
+    const chat = input.chat("fell-back", "stopped");
+    input.database.prepare("INSERT INTO codex_structured_transports(chat_id,cohort,state,fallback_reason,assigned_at,updated_at) VALUES (?, 'old', 'fallback_tui', 'x', 'a', 'a')").run(chat);
+    const claude = Number(input.database.prepare("INSERT INTO chats(project_id,provider,tmux_name,status,title) VALUES (?, 'claude', 'c1', 'stopped', 'c')").run(input.projectId).lastInsertRowid);
+    const only = service(input, fake.connector, { appServerOnly: true });
+    expect(only.transport.claimOrOwn(chat)).toBe(true);
+    expect(only.transport.owns(chat)).toBe(true);
+    expect(only.transport.claimOrOwn(claude)).toBe(false);
+  });
+
+  it("연결 실패는 TUI로 되돌리지 않고 다시 시도할 수 있는 오류로 남긴다", async () => {
+    const input = fixture();
+    const chat = input.chat("broken", "stopped");
+    const failing = service(input, appServerHarness({ connectError: new Error("spawn codex ENOENT") }).connector, { appServerOnly: true });
+    expect(failing.transport.claimOrOwn(chat)).toBe(true);
+    const error = await failing.transport.start(chat).catch((value: unknown) => value);
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(CodexStructuredPreDeliveryError);
+    expect(String((error as Error).message)).toContain("Codex CLI 설치·로그인");
+    expect(failing.transport.state(chat)).toMatchObject({ transport: "app_server", state: "assigned" });
+    expect(input.database.prepare("SELECT status, last_error AS error FROM chats WHERE id=?").get(chat)).toMatchObject({ status: "stopped", error: expect.stringContaining("ENOENT") });
+    // 설치를 고친 뒤에는 같은 채팅으로 다시 연결된다.
+    const fixed = service(input, appServerHarness().connector, { appServerOnly: true });
+    await fixed.transport.start(chat);
+    expect(fixed.transport.state(chat).state).toBe("active");
+  });
+});
+
+describe("앱 서버 전용 전송 경로 (Windows 실측: Codex 앱 채팅 전송이 15초 뒤 실패)", () => {
+  it("아직 배정 안 된 외부 채팅도 전송 시 배정하고, 일반 모드는 기존 배정만 따른다", () => {
+    const input = fixture(); const fake = appServerHarness();
+    const external = input.chat("external-send", "stopped");
+    const only = service(input, fake.connector, { appServerOnly: true });
+    expect(only.transport.owns(external)).toBe(false);
+    expect(only.transport.ownsForSend(external)).toBe(true);
+    expect(only.transport.owns(external)).toBe(true);
+    const normal = input.chat("normal-send", "stopped");
+    const cohort = service(input, fake.connector, { enabled: false });
+    expect(cohort.transport.ownsForSend(normal)).toBe(false);
+  });
+
+  it("표시용 모델명에 붙은 effort는 떼고 모델 ID만 app-server에 넘긴다", () => {
+    expect(codexModelId("gpt-5.6-sol high")).toBe("gpt-5.6-sol");
+    expect(codexModelId("gpt-5.6-sol")).toBe("gpt-5.6-sol");
+    expect(codexModelId("  ")).toBeNull();
+    expect(codexModelId(null)).toBeNull();
+  });
+
+  it("전송 중 연결 실패는 TUI 재시도용 오류로 감싸지 않고 실제 원인을 알린다", async () => {
+    const input = fixture();
+    const chat = input.chat("send-broken", "stopped");
+    const failing = service(input, appServerHarness({ connectError: new Error("spawn codex ENOENT") }).connector, { appServerOnly: true });
+    expect(failing.transport.ownsForSend(chat)).toBe(true);
+    const error = await failing.transport.send(chat, "cmd-1", "안녕").catch((value: unknown) => value);
+    expect(error).not.toBeInstanceOf(CodexStructuredPreDeliveryError);
+    expect(String((error as Error).message)).toContain("Codex CLI 설치·로그인");
+  });
+});
+
+describe("app-server 턴 실패 안내 (#143)", () => {
+  it("실패한 턴의 사유를 채팅 오류로 남기고 다음 턴이 성공하면 지운다", async () => {
+    const input = fixture(); const fake = appServerHarness(); const chatId = input.chat("fails", "stopped");
+    const only = service(input, fake.connector, { appServerOnly: true });
+    only.transport.claimOrOwn(chatId);
+    await only.transport.start(chatId);
+    await only.transport.send(chatId, "c-1", "hi");
+    fake.notify({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: "turn-1", status: "failed", error: { message: "unexpected status 401 Unauthorized: Missing bearer" } } } });
+    expect((input.database.prepare("SELECT last_error AS error FROM chats WHERE id=?").get(chatId) as { error: string }).error).toBe("Codex 응답 실패: unexpected status 401 Unauthorized: Missing bearer");
+    await only.transport.send(chatId, "c-2", "again");
+    fake.notify({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } } });
+    expect(input.database.prepare("SELECT status, last_error AS error FROM chats WHERE id=?").get(chatId)).toEqual({ status: "running", error: null });
+  });
+});
 
 describe("Codex limited structured transport", () => {
   it("flag·cohort·quota·shadow gate가 모두 맞는 신규 채팅 하나만 원자 배정한다", () => {

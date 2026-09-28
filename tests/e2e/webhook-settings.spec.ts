@@ -37,6 +37,7 @@ test("signed webhook 설정과 테스트는 지연을 즉시 알리고 URL·secr
   await page.goto("/");
   await page.getByRole("button", { name: "더보기", exact: true }).click();
   await page.getByRole("dialog", { name: "더보기" }).getByRole("button", { name: /설정/ }).click();
+  await page.getByRole("navigation", { name: "설정 항목" }).getByRole("button", { name: /Webhook/ }).click();
   const card = page.locator(".webhook-settings-card");
   await expect(card.getByText("Signed outbound webhook", { exact: true })).toBeVisible();
 

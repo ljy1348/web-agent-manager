@@ -33,6 +33,7 @@ public final class UsageWidgetProvider extends AppWidgetProvider {
     // 수동 새로고침 버튼 방송을 비동기 API 갱신으로 처리한다.
     @Override
     public void onReceive(Context context, Intent intent) {
+        CrashReporter.install(context);
         super.onReceive(context, intent);
         if (ACTION_REFRESH.equals(intent.getAction())) refreshAsync(context, goAsync());
     }

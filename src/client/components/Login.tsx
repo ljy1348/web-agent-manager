@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import type { Json } from "../types";
+import { BrandMark, brandMarkSlotStyle } from "./BrandMark";
 
 // 로그인 폼을 렌더링하고 성공한 웹 세션을 상위 앱에 전달한다.
 export function Login({ onLogin }: { onLogin: (data: Json) => void }): React.ReactElement {
@@ -83,7 +84,7 @@ export function Login({ onLogin }: { onLogin: (data: Json) => void }): React.Rea
   if (checkingSetup) return <main className="login-shell"><div className="login-card"><h1>web-agent-manager</h1><p>초기 상태를 확인하고 있습니다.</p></div></main>;
   return <main className="login-shell">
     <form className="login-card" onSubmit={submit}>
-      <div className="brand-mark">W</div><h1>web-agent-manager</h1><p>{setupRequired ? "첫 관리자 계정을 설정합니다." : "Codex와 Claude를 한 곳에서 관리합니다."}</p>
+      <div className="brand-mark" style={brandMarkSlotStyle}><BrandMark /></div><h1>web-agent-manager</h1><p>{setupRequired ? "첫 관리자 계정을 설정합니다." : "Codex와 Claude를 한 곳에서 관리합니다."}</p>
       {!setupRequired && !mfaChallenge && <div className="login-mode" role="tablist" aria-label="로그인 방식">
         <button type="button" role="tab" aria-selected={mode === "password"} className={mode === "password" ? "active" : ""} onClick={() => { setMode("password"); setError(""); }}>계정 로그인</button>
         <button type="button" role="tab" aria-selected={mode === "one-time"} className={mode === "one-time" ? "active" : ""} onClick={() => { setMode("one-time"); setError(""); }}>일회용 코드</button>

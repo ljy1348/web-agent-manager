@@ -59,16 +59,21 @@ export function parseCookies(header: string | undefined): Record<string, string>
 }
 
 // 대상 경로가 허용된 루트 내부인지 실제 경로 기준으로 검증한다.
+// 실제 경로가 허용 루트(실제 경로) 안인지 판단한다. 파일시스템 루트("/", Windows의 "C:\\")는 이미 구분자로
+// 끝나므로 구분자를 덧붙이지 않는다 — 예전 비교("/"만 루트로 인정)는 Windows에서 모든 경로를 거부했다(#142).
+export function isInsideRoot(candidate: string, actualRoot: string, pathApi: typeof path = path): boolean {
+  // 드라이브 문자는 대소문자를 구분하지 않는다("c:\\"와 "C:\\").
+  if (pathApi.parse(actualRoot).root === actualRoot) return candidate.toLowerCase().startsWith(actualRoot.toLowerCase());
+  return candidate === actualRoot || candidate.startsWith(`${actualRoot}${pathApi.sep}`);
+}
+
 export function assertAllowedPath(target: string, allowedRoots: string[], mustExist = true): string {
   const resolved = path.resolve(target);
   const candidate = mustExist
     ? fs.realpathSync(resolved)
     : path.join(fs.realpathSync(path.dirname(resolved)), path.basename(resolved));
   const allowed = allowedRoots.some((root) => {
-    const actualRoot = fs.realpathSync(root);
-    // 루트("/")는 그 자체로 전체 파일시스템을 의미하므로 sep를 덧붙이면("//") 일반 경로와 절대 안 맞는다.
-    if (actualRoot === path.sep) return true;
-    return candidate === actualRoot || candidate.startsWith(`${actualRoot}${path.sep}`);
+    return isInsideRoot(candidate, fs.realpathSync(root));
   });
   if (!allowed) throw new Error("허용된 프로젝트 경로를 벗어났습니다.");
   return candidate;

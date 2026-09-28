@@ -7,7 +7,7 @@ import type { AddressInfo } from "node:net";
 import express from "express";
 import { afterEach, describe, expect, it } from "vitest";
 import type { AppConfig } from "../src/server/core/config";
-import { createSessionLoader, requireAuth, requireCsrf, type AuthenticatedRequest } from "../src/server/core/auth";
+import { createSessionLoader, requireAuth, requireCsrf, requiresRecentReauthentication, type AuthenticatedRequest } from "../src/server/core/auth";
 import { openDatabase, type AppDatabase } from "../src/server/core/database";
 import { DEFAULT_LOGIN_RATE_LIMIT_OPTIONS, LoginRateLimiter } from "../src/server/core/login-rate-limit";
 import { hashToken } from "../src/server/core/security";
@@ -207,5 +207,78 @@ describe("Android 앱 기기 서명 신뢰", () => {
     const trust = new MobileDeviceTrustService(database);
     const rsa = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 }).publicKey.export({ format: "der", type: "spki" }).toString("base64");
     expect(() => trust.enroll(userId, rsa)).toThrow("P-256");
+  });
+});
+
+// 기기 등록 후 현재 세션을 기기 서명으로 묶어 지문 테스트의 출발 상태를 만든다.
+function bindSessionToDevice(trust: MobileDeviceTrustService, userId: number, sessionId: number) {
+  const device = createDeviceKey();
+  const { deviceId } = trust.enroll(userId, device.publicKey, "Galaxy test");
+  const challenge = trust.createChallenge(userId, sessionId, deviceId);
+  expect(trust.activate(userId, sessionId, deviceId, challenge, device.sign(challenge))).toBe(true);
+  return { device, deviceId };
+}
+
+describe("Android 지문 본인 확인", () => {
+  it("기기 키가 보증한 지문 키만 등록하고, 지문 서명만 최근 본인 확인을 갱신한다", () => {
+    const { database, userId, sessionId } = createContext();
+    const trust = new MobileDeviceTrustService(database);
+    expect(trust.biometricStatus(userId, sessionId)).toEqual({ deviceBound: false, enrolled: false });
+    expect(() => trust.createBiometricChallenge(userId, sessionId, "enroll")).toThrow("앱 기기 인증");
+
+    const { device, deviceId } = bindSessionToDevice(trust, userId, sessionId);
+    const biometric = createDeviceKey();
+    expect(() => trust.createBiometricChallenge(userId, sessionId, "reauth")).toThrow("등록되어 있지 않습니다");
+
+    // 지문 키가 스스로 서명한 등록은 같은 기기라는 증명이 아니므로 거부하고 challenge도 소진한다.
+    let challenge = trust.createBiometricChallenge(userId, sessionId, "enroll");
+    const enrollPayload = (value: string) => `wam-biometric-enroll-v1\n${value}\n${biometric.publicKey}`;
+    expect(trust.enrollBiometric(userId, sessionId, biometric.publicKey, challenge, biometric.sign(enrollPayload(challenge)))).toBe(false);
+    expect(trust.enrollBiometric(userId, sessionId, biometric.publicKey, challenge, device.sign(enrollPayload(challenge)))).toBe(false);
+    challenge = trust.createBiometricChallenge(userId, sessionId, "enroll");
+    expect(trust.enrollBiometric(userId, sessionId, biometric.publicKey, challenge, device.sign(enrollPayload(challenge)))).toBe(true);
+    expect(trust.biometricStatus(userId, sessionId)).toEqual({ deviceBound: true, enrolled: true });
+
+    database.prepare("UPDATE web_sessions SET reauthenticated_at = datetime('now', '-1 day') WHERE id = ?").run(sessionId);
+    const reauthPayload = (value: string) => `wam-biometric-reauth-v1\n${value}`;
+    challenge = trust.createBiometricChallenge(userId, sessionId, "reauth");
+    expect(trust.verifyBiometricReauth(userId, sessionId, challenge, device.sign(reauthPayload(challenge)))).toBe(false);
+    challenge = trust.createBiometricChallenge(userId, sessionId, "reauth");
+    expect(trust.verifyBiometricReauth(userId, sessionId, challenge, biometric.sign(reauthPayload(challenge)))).toBe(true);
+    expect(trust.verifyBiometricReauth(userId, sessionId, challenge, biometric.sign(reauthPayload(challenge)))).toBe(false);
+    expect(database.prepare("SELECT reauthenticated_at > datetime('now', '-1 minute') AS recent FROM web_sessions WHERE id = ?").get(sessionId)).toEqual({ recent: 1 });
+
+    // 등록용 challenge로는 본인 확인을 통과할 수 없다.
+    challenge = trust.createBiometricChallenge(userId, sessionId, "enroll");
+    expect(trust.verifyBiometricReauth(userId, sessionId, challenge, biometric.sign(reauthPayload(challenge)))).toBe(false);
+
+    expect(trust.revoke(userId, deviceId)).toBe(true);
+    expect(database.prepare("SELECT biometric_public_key FROM mobile_trusted_devices WHERE id = ?").get(deviceId)).toEqual({ biometric_public_key: null });
+  });
+
+  it("HTTP 본인 확인은 실패를 403으로 알리고 등록 경로만 최근 재인증을 요구한다", async () => {
+    const { database, config, userId, sessionId, cookie, csrf } = createContext();
+    const trust = new MobileDeviceTrustService(database);
+    const { device } = bindSessionToDevice(trust, userId, sessionId);
+    const biometric = createDeviceKey();
+    const enrollChallenge = trust.createBiometricChallenge(userId, sessionId, "enroll");
+    expect(trust.enrollBiometric(userId, sessionId, biometric.publicKey, enrollChallenge, device.sign(`wam-biometric-enroll-v1\n${enrollChallenge}\n${biometric.publicKey}`))).toBe(true);
+    const baseUrl = await serve(database, config, trust);
+    const headers = { "content-type": "application/json", cookie, "x-csrf-token": csrf };
+
+    expect(await (await fetch(`${baseUrl}/api/mobile/biometric`, { headers })).json()).toEqual({ deviceBound: true, enrolled: true });
+    const { challenge } = await (await fetch(`${baseUrl}/api/mobile/biometric/reauth/challenge`, { method: "POST", headers })).json();
+    const rejected = await fetch(`${baseUrl}/api/mobile/biometric/reauth`, { method: "POST", headers, body: JSON.stringify({ challenge, signature: device.sign(`wam-biometric-reauth-v1\n${challenge}`) }) });
+    expect(rejected.status).toBe(403);
+    const next = (await (await fetch(`${baseUrl}/api/mobile/biometric/reauth/challenge`, { method: "POST", headers })).json()).challenge;
+    const accepted = await fetch(`${baseUrl}/api/mobile/biometric/reauth`, { method: "POST", headers, body: JSON.stringify({ challenge: next, signature: biometric.sign(`wam-biometric-reauth-v1\n${next}`) }) });
+    expect(await accepted.json()).toEqual({ reauthenticated: true });
+    expect(database.prepare("SELECT count(*) AS count FROM audit_logs WHERE action = 'auth.reauthenticate'").get()).toEqual({ count: 1 });
+
+    expect(requiresRecentReauthentication("POST", "/mobile/biometric/enroll/challenge")).toBe(true);
+    expect(requiresRecentReauthentication("POST", "/mobile/biometric/enroll")).toBe(true);
+    expect(requiresRecentReauthentication("DELETE", "/mobile/biometric")).toBe(true);
+    expect(requiresRecentReauthentication("POST", "/mobile/biometric/reauth/challenge")).toBe(false);
+    expect(requiresRecentReauthentication("POST", "/mobile/biometric/reauth")).toBe(false);
   });
 });

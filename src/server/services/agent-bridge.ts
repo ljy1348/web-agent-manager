@@ -9,6 +9,7 @@ import type { Provider } from "../../shared/types";
 import type { HistoryCache } from "./history-cache";
 import type { SessionManager } from "./session-manager";
 import { omitFixtureGroundTruth, omitFixtureListGroundTruth } from "../../shared/experiments";
+import { isNamedPipe } from "../core/agent-socket";
 
 const MAX_REQUEST_BYTES = 1024 * 1024;
 const MAX_CONTEXT_MESSAGES = 200;
@@ -106,8 +107,10 @@ export class AgentBridge {
   // 소유자 전용 권한의 Unix 소켓을 열고 오래된 소켓 파일을 정리한다.
   async start(): Promise<void> {
     const { socketPath } = this.dependencies;
-    fs.mkdirSync(path.dirname(socketPath), { recursive: true, mode: 0o700 });
-    const existing = fs.lstatSync(socketPath, { throwIfNoEntry: false });
+    // Windows 이름 있는 파이프는 파일이 아니라 폴더 생성·기존 파일 정리·권한 변경을 하지 않는다.
+    const pipe = isNamedPipe(socketPath);
+    if (!pipe) fs.mkdirSync(path.dirname(socketPath), { recursive: true, mode: 0o700 });
+    const existing = pipe ? undefined : fs.lstatSync(socketPath, { throwIfNoEntry: false });
     if (existing) {
       if (!existing.isSocket()) throw new Error(`에이전트 브리지 경로에 소켓이 아닌 파일이 있습니다: ${socketPath}`);
       fs.unlinkSync(socketPath);
@@ -121,7 +124,7 @@ export class AgentBridge {
         resolve();
       });
     });
-    fs.chmodSync(socketPath, 0o600);
+    if (!pipe) fs.chmodSync(socketPath, 0o600);
     this.startDelegationSettler();
   }
 
@@ -643,6 +646,7 @@ export class AgentBridge {
     const server = this.server;
     this.server = undefined;
     if (server) await new Promise<void>((resolve) => server.close(() => resolve()));
+    if (isNamedPipe(this.dependencies.socketPath)) return;
     const existing = fs.lstatSync(this.dependencies.socketPath, { throwIfNoEntry: false });
     if (existing?.isSocket()) fs.unlinkSync(this.dependencies.socketPath);
   }

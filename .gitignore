@@ -42,3 +42,4 @@ artifacts/*
 .agents/skills/web-agent-manager-delegate
 .claude/skills/web-agent-manager-session-context
 .claude/skills/web-agent-manager-delegate
+build-resources/

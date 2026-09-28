@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { ApprovalHint, HistoryMessage, HistorySyncContext, HistorySyncDecision, HistorySession, HistoryTokenUsage, ModelChoice, ModelOptions, ProviderAdapter, ProviderLaunch, ProviderLaunchProfile, TmuxIO } from "./provider";
+import type { ApprovalHint, HistoryMessage, HistorySyncContext, HistorySyncDecision, HistorySession, HistoryTokenEvent, HistoryTokenUsage, ModelChoice, ModelOptions, ProviderAdapter, ProviderLaunch, ProviderLaunchProfile, TmuxIO } from "./provider";
+import { upsertTokenEvent } from "./provider";
 import type { UsageRecord, UsageWindow } from "../../shared/types";
 import { extractContent, fallbackId } from "./history-utils";
 import { stripAnsi } from "../core/security";
@@ -98,15 +99,26 @@ function parseGrokTurnUsage(update: Record<string, unknown>): HistoryTokenUsage 
   return { inputTokens, cachedInputTokens, cacheCreationInputTokens, cacheReadInputTokens: 0, outputTokens, reasoningOutputTokens, totalTokens };
 }
 
+// turn_completed의 턴 ID(prompt_id)와 실제 완료 시각으로 토큰 기록용 과금 이벤트를 만든다.
+// 대화 기록에는 시각·안정 ID가 없어, 메시지 기준으로 기록하면 재동기화마다 시각이 "지금"으로 바뀌었다(#134).
+function grokTokenEvent(usage: HistoryTokenUsage, update: Record<string, unknown>, record: Record<string, unknown>): HistoryTokenEvent | null {
+  if (typeof update.prompt_id !== "string" || !update.prompt_id) return null;
+  const params = record.params && typeof record.params === "object" ? record.params as Record<string, unknown> : null;
+  const meta = params?._meta && typeof params._meta === "object" ? params._meta as Record<string, unknown> : null;
+  const millis = typeof meta?.agentTimestampMs === "number" ? meta.agentTimestampMs : typeof record.timestamp === "number" ? record.timestamp * 1000 : NaN;
+  if (!Number.isFinite(millis) || millis <= 0) return null;
+  return { ...usage, key: `grok:${update.prompt_id}`, occurredAt: new Date(millis).toISOString() };
+}
+
 // updates.jsonl의 turn_completed를 기록된 순서대로 읽는다. 대화 본문에는 usage가 없다.
-function readGrokTurnUsages(directory: string): HistoryTokenUsage[] {
+function readGrokTurnUsages(directory: string): Array<{ usage: HistoryTokenUsage; event: HistoryTokenEvent | null }> {
   let raw: string;
   try {
     raw = fs.readFileSync(path.join(directory, UPDATES_FILE), "utf8");
   } catch {
     return [];
   }
-  const usages: HistoryTokenUsage[] = [];
+  const usages: Array<{ usage: HistoryTokenUsage; event: HistoryTokenEvent | null }> = [];
   for (const line of raw.split("\n")) {
     // updates.jsonl에는 턴 중 도구 진행·사고 조각이 계속 쌓여(실측 410줄 중 turn_completed는 4줄)
     // 모든 줄을 JSON으로 풀면 파싱 비용이 대부분 버려진다. 필요한 줄만 먼저 걸러낸다.
@@ -116,7 +128,7 @@ function readGrokTurnUsages(directory: string): HistoryTokenUsage[] {
       const params = record.params && typeof record.params === "object" ? record.params as Record<string, unknown> : null;
       const update = params?.update && typeof params.update === "object" ? params.update as Record<string, unknown> : null;
       const tokenUsage = update ? parseGrokTurnUsage(update) : undefined;
-      if (tokenUsage) usages.push(tokenUsage);
+      if (tokenUsage && update) usages.push({ usage: tokenUsage, event: grokTokenEvent(tokenUsage, update, record) });
     } catch {
       continue;
     }
@@ -124,16 +136,23 @@ function readGrokTurnUsages(directory: string): HistoryTokenUsage[] {
   return usages;
 }
 
-// 턴 단위 usage를 그 턴의 마지막 내용 있는 assistant에만 붙인다. Codex token_count 연결과 같다.
+// 턴 단위 usage를 그 턴의 마지막 내용 있는 assistant에만 붙인다.
+// N번째 turn_completed는 prompt_index N의 턴이다(실제 52개 세션에서 확인). 사람 질문 순서로 짝지으면
+// 자동 프롬프트 턴이나 압축으로 잘린 앞부분 때문에 다른 턴의 사용량이 붙었다(#134).
 function attachGrokTurnUsages(messages: HistoryMessage[], usages: HistoryTokenUsage[]): void {
   const userIndexes: number[] = [];
+  const promptPosition = new Map<number, number>();
   for (let index = 0; index < messages.length; index += 1) {
-    if (messages[index].role === "user") userIndexes.push(index);
+    if (messages[index].role !== "user") continue;
+    const promptIndex = /^prompt-(\d+)$/.exec(messages[index].id)?.[1];
+    if (promptIndex !== undefined) promptPosition.set(Number(promptIndex), userIndexes.length);
+    userIndexes.push(index);
   }
   for (let turn = 0; turn < usages.length; turn += 1) {
-    const start = userIndexes[turn];
-    if (start === undefined) break;
-    const end = userIndexes[turn + 1] ?? messages.length;
+    const position = promptPosition.get(turn);
+    if (position === undefined) continue;
+    const start = userIndexes[position];
+    const end = userIndexes[position + 1] ?? messages.length;
     for (let index = end - 1; index > start; index -= 1) {
       if (messages[index].role !== "assistant") continue;
       messages[index] = { ...messages[index], tokenUsage: usages[turn] };
@@ -221,7 +240,10 @@ function parseGrokHistory(directory: string): HistorySession | null {
     const message = parseGrokMessage(record, line, index);
     if (message) messages.push(message);
   }
-  attachGrokTurnUsages(messages, readGrokTurnUsages(directory));
+  const turnUsages = readGrokTurnUsages(directory);
+  attachGrokTurnUsages(messages, turnUsages.map((item) => item.usage));
+  const tokenEvents: HistoryTokenEvent[] = [];
+  for (const item of turnUsages) if (item.event) upsertTokenEvent(tokenEvents, item.event);
   const createdAt = typeof summary?.created_at === "string" ? summary.created_at : new Date().toISOString();
   const updatedAt = typeof summary?.updated_at === "string" ? summary.updated_at : createdAt;
   const firstUser = messages.find((message) => message.role === "user");
@@ -238,6 +260,7 @@ function parseGrokHistory(directory: string): HistorySession | null {
     messages,
     model: typeof summary?.current_model_id === "string" ? summary.current_model_id : null,
     turnEndedAt: currentGrokTurnEndedAt(directory, messages.filter((message) => message.role === "user").length),
+    tokenEvents,
     displayTitle: generatedTitle || sessionSummary || null,
   };
 }

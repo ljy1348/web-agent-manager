@@ -54,8 +54,11 @@ export function createMobileRouter(database: AppDatabase, usage: UsageMonitor, m
   router.get("/mobile/widget", (_request, response) => {
     response.json(buildMobileWidgetSnapshot(database, usage.list(), metrics.snapshot(), adapters));
   });
-  router.get("/mobile/push", requireAdmin, (_request, response) => response.json(fcm.status()));
-  router.post("/mobile/push-token", requireAdmin, (request: AuthenticatedRequest, response, next) => {
+  router.get("/mobile/push", requireAdmin, (_request, response) => {
+    const direct = fcm.status();
+    response.json({ ...direct, deliveryMode: direct.enabled ? "direct" : "off" });
+  });
+  router.post("/mobile/push-token", requireAdmin, async (request: AuthenticatedRequest, response, next) => {
     try {
       const token = typeof request.body?.token === "string" ? request.body.token : "";
       const label = typeof request.body?.label === "string" ? request.body.label : undefined;
@@ -66,7 +69,7 @@ export function createMobileRouter(database: AppDatabase, usage: UsageMonitor, m
       next(error);
     }
   });
-  router.delete("/mobile/push-token", requireAdmin, (request: AuthenticatedRequest, response, next) => {
+  router.delete("/mobile/push-token", requireAdmin, async (request: AuthenticatedRequest, response, next) => {
     try {
       const token = typeof request.body?.token === "string" ? request.body.token : "";
       fcm.unregisterDevice(request.authUser!.id, token);
@@ -76,9 +79,13 @@ export function createMobileRouter(database: AppDatabase, usage: UsageMonitor, m
       next(error);
     }
   });
-  router.post("/mobile/push/test", requireAdmin, async (request: AuthenticatedRequest, response) => {
-    await fcm.notify(`fcm-test:${Date.now()}:${request.authUser!.id}`, "test", "Android 앱 FCM 알림 테스트입니다.");
-    response.json({ requested: true });
+  router.post("/mobile/push/test", requireAdmin, async (request: AuthenticatedRequest, response, next) => {
+    try {
+      const status = fcm.status();
+      if (!status.enabled || status.registeredDevices === 0) return response.status(409).json({ error: "FCM을 활성화하고 Android 기기를 등록해야 합니다." });
+      await fcm.notify(`fcm-test:${Date.now()}:${request.authUser!.id}`, "test", "Android 앱 FCM 알림 테스트입니다.");
+      response.json({ requested: true });
+    } catch (error) { next(error); }
   });
   return router;
 }

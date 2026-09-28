@@ -99,7 +99,7 @@ describe("TOTP MFA", () => {
 
     database.prepare("UPDATE web_sessions SET reauthenticated_at = datetime('now', '-20 minutes') WHERE token_hash = (SELECT token_hash FROM web_sessions ORDER BY id DESC LIMIT 1)").run();
     const completedHeaders = { cookie: completedCookie, "x-csrf-token": completedBody.csrfToken };
-    expect((await post(baseUrl, "/reauth", { currentPassword: "correct-password" }, completedHeaders)).status).toBe(401);
+    expect((await post(baseUrl, "/reauth", { currentPassword: "correct-password" }, completedHeaders)).status).toBe(403);
     expect((await post(baseUrl, "/reauth", { currentPassword: "correct-password", code: confirmed.recoveryCodes[0] }, completedHeaders)).status).toBe(200);
 
     const replayPassword = await post(baseUrl, "/login", { username: "mfa-admin", password: "correct-password" });

@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import type { AppConfig } from "../core/config";
 import { PROJECT_INSTRUCTION_FILES } from "../core/instruction-files";
 import type { AppDatabase } from "../core/database";
+import { exactTmuxTarget } from "./tmux-input";
 
 const runFile = promisify(execFile);
 
@@ -425,11 +426,15 @@ export class GitWorkspaceService {
     const project = this.project(projectId);
     const worktrees = await this.listWorktrees(project);
     const assigned = new Set(worktrees.filter((item) => item.assignedChatId).map((item) => item.path));
-    const chats = this.database.prepare("SELECT id, tmux_name FROM chats WHERE project_id = ? AND worktree_path IS NULL")
+    // tmux 창이 있을 수 있는 상태의 채팅만 본다. 멈춘 채팅까지 매번 tmux를 차례로 부르면 채팅 수에 비례해
+    // Git 상태 조회가 수 초씩 늦어진다(#124, 실측 144개·약 2.6초).
+    const chats = this.database.prepare(`SELECT id, tmux_name FROM chats WHERE project_id = ? AND worktree_path IS NULL
+      AND status IN ('starting', 'running', 'stopping', 'resuming')`)
       .all(projectId) as Array<{ id: number; tmux_name: string }>;
     for (const chat of chats) {
       try {
-        const tmux = await runFile("tmux", ["display-message", "-p", "-t", chat.tmux_name, "#{pane_current_path}"], { timeout: 2_000 });
+        // 이름만 주면 tmux가 접두어가 같은 다른 세션을 대신 고를 수 있어 정확 세션 대상(=이름:)을 쓴다.
+        const tmux = await runFile("tmux", ["display-message", "-p", "-t", exactTmuxTarget(chat.tmux_name), "#{pane_current_path}"], { timeout: 2_000 });
         const currentPath = path.resolve(tmux.stdout.trim() || project.path);
         const match = worktrees.filter((item) => !item.main && !assigned.has(item.path) && isInside(item.path, currentPath))
           .sort((a, b) => b.path.length - a.path.length)[0];

@@ -2,6 +2,8 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
+import { resolveCommand } from "../core/windows-command";
+import { findExecutable } from "../services/agent-integration";
 
 export type CodexAppServerRequestId = string | number;
 
@@ -69,11 +71,15 @@ export function codexAppServerClientVersion(rootDir = process.cwd()): string {
   return value;
 }
 
+// Windows에서는 codex.cmd·codex.exe를 찾아 실행하고, 스크립트형이면 cmd.exe로 감싼다(#143).
 function defaultSpawn(environment: Record<string, string>): CodexAppServerProcess {
-  return spawn("codex", ["app-server"], {
+  const resolved = resolveCommand(process.platform === "win32" ? findExecutable("codex") ?? "codex" : "codex", ["app-server"]);
+  return spawn(resolved.command, resolved.args, {
     cwd: process.cwd(),
     env: { ...process.env, ...environment },
     stdio: ["pipe", "pipe", "ignore"],
+    windowsVerbatimArguments: resolved.verbatim,
+    windowsHide: true,
   });
 }
 

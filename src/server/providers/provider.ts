@@ -31,6 +31,28 @@ export interface HistoryTokenUsage {
   totalTokens: number;
 }
 
+// 공급자의 실제 과금 단위(API 응답·모델 호출·턴) 토큰 사용량. 화면 메시지와 단위가 달라
+// 메시지에 붙인 usage로 집계하면 중복·누락이 생겨, 토큰 기록은 이 목록을 따로 쓴다(#134).
+export interface HistoryTokenEvent extends HistoryTokenUsage {
+  // 같은 과금 단위를 다시 읽어도 같은 값이 되는 키. 반드시 "{provider}:"로 시작한다.
+  key: string;
+  // 공급자가 기록한 실제 발생 시각(ISO).
+  occurredAt: string;
+  // 이 과금 단위의 모델. 없으면 세션 모델을 쓴다.
+  model?: string | null;
+}
+
+// 과금 단위 이벤트를 키 기준으로 누적한다. 같은 키가 다시 오면 시각은 처음 값, 수치·모델은 최신 값으로 둔다.
+// 같은 키는 연달아 기록되므로(Claude 응답의 분할 레코드) 전체 대신 최근 이벤트만 거슬러 찾는다.
+export function upsertTokenEvent(events: HistoryTokenEvent[], event: HistoryTokenEvent): void {
+  let index = -1;
+  for (let cursor = events.length - 1; cursor >= Math.max(0, events.length - 50); cursor -= 1) {
+    if (events[cursor].key === event.key) { index = cursor; break; }
+  }
+  if (index < 0) { events.push(event); return; }
+  events[index] = { ...event, occurredAt: events[index].occurredAt, model: event.model ?? events[index].model };
+}
+
 export interface HistoryMessage {
   id: string;
   role: "user" | "assistant" | "system" | "tool";
@@ -60,6 +82,8 @@ export interface HistorySession {
   // 것과는 다르지만, 아직 아무도 이름을 안 바꾼 채팅에 한해 이 값으로 자동 업그레이드하면 web-agent-manager
   // 자체 제목(첫 메시지 80자 절단)보다 훨씬 낫다.
   displayTitle?: string | null;
+  // 공급자가 과금 단위로 뽑은 토큰 사용량. 있으면 토큰 기록은 메시지 usage 대신 이 목록을 쓴다.
+  tokenEvents?: HistoryTokenEvent[];
 }
 
 export interface HistorySyncContext {

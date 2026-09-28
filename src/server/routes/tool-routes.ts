@@ -47,6 +47,9 @@ interface McpInput {
 
 const MCP_NAME_PATTERN = /^[A-Za-z0-9_-]{1,80}$/;
 const execFileAsync = promisify(execFile);
+// WAM이 Codex를 실행할 때 쓰는 CODEX_HOME. MCP 목록·추가·삭제가 같은 폴더를 봐야 화면에서 바꾼 MCP가
+// 실제 Codex 채팅에 적용된다(#146). createToolRouter가 설정하며, 기본값은 프로세스 HOME의 ~/.codex다.
+let codexHomeDir = path.join(os.homedir(), ".codex");
 const CLI_MCP_CACHE_MS = 60_000;
 const CLI_MCP_ERROR_CACHE_MS = 10_000;
 const cliMcpCache = new Map<string, { expiresAt: number; items?: ToolItem[]; promise?: Promise<ToolItem[]> }>();
@@ -360,7 +363,8 @@ async function listCliMcp(provider: Provider, cwd: string): Promise<ToolItem[]> 
   // 세 공급자 모두 id가 그대로 CLI 실행 파일 이름이다. 예전의 삼항식은 새로 추가된 공급자가 전부
   // codex로 떨어져 엉뚱한 CLI를 실행했다.
   const command = provider;
-  const promise = execFileAsync(command, ["mcp", "list"], { cwd, encoding: "utf8", timeout: 7000, windowsHide: true })
+  const env = provider === "codex" ? { ...process.env, CODEX_HOME: codexHomeDir } : process.env;
+  const promise = execFileAsync(command, ["mcp", "list"], { cwd, env, encoding: "utf8", timeout: 7000, windowsHide: true })
     .then(({ stdout }) => {
       const items = parseCliMcpOutput(provider, command, String(stdout));
       cliMcpCache.set(key, { expiresAt: Date.now() + CLI_MCP_CACHE_MS, items });
@@ -438,10 +442,12 @@ function listTomlMcpFile(provider: TomlMcpProvider, file: string, scope: ToolSco
 }
 
 // 사용자/프로젝트 설정을 함께 읽어 한 공급자의 MCP 목록을 만든다.
+// Codex는 WAM이 실행할 때 쓰는 CODEX_HOME(설치 계정 홈의 ~/.codex)의 설정을 읽어야 실제 적용되는 MCP가 보인다(#146).
 function listTomlMcp(provider: TomlMcpProvider, projectRoot: string): ToolItem[] {
   const dir = provider === "grok" ? ".grok" : ".codex";
+  const userConfig = provider === "grok" ? path.join(os.homedir(), dir, "config.toml") : path.join(codexHomeDir, "config.toml");
   return [
-    ...listTomlMcpFile(provider, path.join(os.homedir(), dir, "config.toml"), "user", `~/${dir}/config.toml`),
+    ...listTomlMcpFile(provider, userConfig, "user", `~/${dir}/config.toml`),
     ...listTomlMcpFile(provider, path.join(projectRoot, dir, "config.toml"), "project", `${dir}/config.toml`),
   ];
 }
@@ -682,7 +688,7 @@ export function readTomlMcpServers(text: string): TomlMcpServer[] {
 
 // 공급자 사용자 설정 파일 경로를 만들고 상위 디렉터리를 보장한다.
 function tomlConfigFile(provider: TomlMcpProvider): string {
-  const dir = path.join(os.homedir(), provider === "grok" ? ".grok" : ".codex");
+  const dir = provider === "grok" ? path.join(os.homedir(), ".grok") : codexHomeDir;
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   return path.join(dir, "config.toml");
 }
@@ -758,33 +764,54 @@ function toggleTomlMcp(provider: TomlMcpProvider, name: string, enabled: boolean
   fs.writeFileSync(file, `${without ? `${without}\n\n` : ""}${tomlServerBlock(server, provider)}\n`, { mode: 0o600 });
 }
 
-async function catalog(projectRoot: string): Promise<ToolItem[]> {
-  const configuredMcp = [
-    ...listClaudeMcp(projectRoot),
-    ...listTomlMcp("codex", projectRoot),
-    ...listTomlMcp("grok", projectRoot),
-  ];
-  // 일부 CLI(Grok의 JSON 목록)는 확장된 env 원문을 출력하므로 카탈로그 조회에는 vault를
-  // 절대 주입하지 않는다. 실제 자격증명은 채팅 CLI 시작 경로에만 전달한다.
-  const [claudeCliMcp, codexCliMcp, grokCliMcp] = await Promise.all([
-    listCliMcp("claude", projectRoot),
-    listCliMcp("codex", projectRoot),
-    listCliMcp("grok", projectRoot),
-  ]);
-  const discoveredMcp = [...claudeCliMcp, ...codexCliMcp, ...grokCliMcp];
-  return [
-    ...BUILTIN_COMMANDS,
-    ...BUNDLED_CLAUDE_SKILLS,
-    ...listMarkdownCommands("claude", path.join(projectRoot, ".claude", "commands"), "project", "Claude", projectRoot),
-    ...listMarkdownCommands("claude", path.join(os.homedir(), ".claude", "commands"), "user", "Claude", os.homedir()),
-    ...listMarkdownCommands("codex", path.join(os.homedir(), ".codex", "prompts"), "user", "Codex", os.homedir()),
-    ...listClaudeSkills(projectRoot),
-    ...mergeMcpItems(configuredMcp, discoveredMcp),
-    ...marketplaceItems(),
-  ];
+const TOOL_KINDS: ToolKind[] = ["commands", "skills", "marketplace", "mcp"];
+
+// ?kinds=commands,skills 같은 요청 종류를 해석한다. 값이 없거나 알 수 없는 값뿐이면 전체(null)다.
+export function parseCatalogKinds(value: unknown): Set<ToolKind> | null {
+  if (typeof value !== "string" || !value.trim()) return null;
+  const kinds = value.split(",").map((item) => item.trim()).filter((item): item is ToolKind => (TOOL_KINDS as string[]).includes(item));
+  return kinds.length ? new Set(kinds) : null;
 }
 
-export function createToolRouter(database: AppDatabase, vault?: CredentialVault): Router {
+// 요청한 종류의 도구만 만든다. MCP를 요청하지 않으면 CLI MCP 조회를 하지 않는다 — `claude mcp list`는
+// 등록된 MCP 서버마다 실제로 접속해 상태를 점검해 수 초가 걸리고, 채팅 명령어 자동완성은 MCP를 쓰지 않는다(#123).
+async function catalog(projectRoot: string, kinds: Set<ToolKind> | null = null): Promise<ToolItem[]> {
+  const wants = (kind: ToolKind): boolean => !kinds || kinds.has(kind);
+  let mcpItems: ToolItem[] = [];
+  if (wants("mcp")) {
+    const configuredMcp = [
+      ...listClaudeMcp(projectRoot),
+      ...listTomlMcp("codex", projectRoot),
+      ...listTomlMcp("grok", projectRoot),
+    ];
+    // 일부 CLI(Grok의 JSON 목록)는 확장된 env 원문을 출력하므로 카탈로그 조회에는 vault를
+    // 절대 주입하지 않는다. 실제 자격증명은 채팅 CLI 시작 경로에만 전달한다.
+    const [claudeCliMcp, codexCliMcp, grokCliMcp] = await Promise.all([
+      listCliMcp("claude", projectRoot),
+      listCliMcp("codex", projectRoot),
+      listCliMcp("grok", projectRoot),
+    ]);
+    mcpItems = mergeMcpItems(configuredMcp, [...claudeCliMcp, ...codexCliMcp, ...grokCliMcp]);
+  }
+  // 기존 전체 목록과 같은 순서를 유지하고, 요청하지 않은 종류의 목록은 읽지 않는다.
+  const items = [
+    ...(wants("commands") ? BUILTIN_COMMANDS : []),
+    ...(wants("skills") ? BUNDLED_CLAUDE_SKILLS : []),
+    ...(wants("commands") ? [
+      ...listMarkdownCommands("claude", path.join(projectRoot, ".claude", "commands"), "project", "Claude", projectRoot),
+      ...listMarkdownCommands("claude", path.join(os.homedir(), ".claude", "commands"), "user", "Claude", os.homedir()),
+      ...listMarkdownCommands("codex", path.join(os.homedir(), ".codex", "prompts"), "user", "Codex", os.homedir()),
+    ] : []),
+    ...(wants("skills") ? listClaudeSkills(projectRoot) : []),
+    ...mcpItems,
+    ...(wants("marketplace") ? marketplaceItems() : []),
+  ];
+  // 고정 목록(BUILTIN 등)에 다른 종류가 섞여 있어도 요청 종류만 남긴다.
+  return kinds ? items.filter((item) => kinds.has(item.kind)) : items;
+}
+
+export function createToolRouter(database: AppDatabase, vault?: CredentialVault, codexHome?: string): Router {
+  if (codexHome) codexHomeDir = codexHome;
   const credentialVault = vault;
   const router = Router();
   router.get("/tools/catalog", async (request: AuthenticatedRequest, response, next) => {
@@ -794,7 +821,7 @@ export function createToolRouter(database: AppDatabase, vault?: CredentialVault)
         ? database.prepare("SELECT path FROM projects WHERE id = ? AND active = 1").get(projectId) as { path: string } | undefined
         : undefined;
       const projectRoot = row ? resolveProjectPath(row.path, ".", true) : process.cwd();
-      response.json({ items: await catalog(projectRoot) });
+      response.json({ items: await catalog(projectRoot, parseCatalogKinds(request.query.kinds)) });
     } catch (error) {
       next(error);
     }

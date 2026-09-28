@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>web-agent-manager 서버 연결</title>
+    <style>
+      * { box-sizing: border-box; }
+      body { margin: 0; min-width: 320px; min-height: 100vh; display: grid; place-items: center; background: #f3f5f2; color: #1f2723; font: 14px system-ui, sans-serif; }
+      main { width: min(460px, calc(100vw - 32px)); padding: 28px; border: 1px solid #d9dfd9; border-radius: 8px; background: #fff; box-shadow: 0 12px 32px rgba(21,32,26,.09); }
+      h1 { margin: 0 0 6px; font-size: 24px; }
+      p { margin: 0 0 18px; color: #68746d; line-height: 1.5; }
+      label { display: grid; gap: 6px; margin: 12px 0; font-size: 12px; color: #526158; }
+      input { width: 100%; height: 42px; padding: 0 11px; border: 1px solid #c4cec6; border-radius: 7px; font: inherit; }
+      button { width: 100%; min-height: 42px; margin-top: 10px; border: 1px solid #23644c; border-radius: 7px; background: #23644c; color: #fff; font: 600 14px system-ui, sans-serif; cursor: pointer; }
+      button:disabled { opacity: .6; cursor: wait; }
+      small { display: block; color: #68746d; line-height: 1.5; overflow-wrap: anywhere; }
+      #warning { min-height: 0; margin: 4px 0 0; color: #9a6400; font-size: 12px; line-height: 1.5; }
+      #status { min-height: 20px; margin: 12px 0 0; color: #a7372f; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>web-agent-manager</h1>
+      <p>접속할 WAM 서버 주소를 입력하세요. 이 앱은 다른 컴퓨터(또는 WSL2)에서 실행 중인 WAM을 여는 창입니다. 채팅·터미널·파일은 그 서버에 있습니다.</p>
+      <form id="connect-form">
+        <label>WAM 서버 주소<input id="server-url" inputmode="url" autocomplete="url" placeholder="https://wam.example.com 또는 http://100.101.102.103:14003" required autofocus /></label>
+        <div id="warning" role="note"></div>
+        <button id="submit" type="submit">연결</button>
+        <div id="status" role="alert"></div>
+      </form>
+      <small>주소만 이 컴퓨터에 저장되고, 로그인은 연결한 서버 화면에서 합니다. 연결 서버는 메뉴의 <b>연결 → 연결 서버 변경</b>에서 바꿀 수 있습니다.</small>
+    </main>
+    <script>
+      const form = document.getElementById("connect-form");
+      const input = document.getElementById("server-url");
+      const submit = document.getElementById("submit");
+      const status = document.getElementById("status");
+      const warning = document.getElementById("warning");
+      const params = new URLSearchParams(location.search);
+      input.value = params.get("url") || "";
+      status.textContent = params.get("error") || "";
+
+      // 입력 주소가 암호화되지 않은 공개 주소면 경고한다. 판정은 메인 프로세스의 같은 규칙을 쓴다.
+      async function inspect() {
+        const value = input.value.trim();
+        if (!value) { warning.textContent = ""; return; }
+        try {
+          const result = await window.webAgentManagerDesktop.inspectServerUrl(value);
+          warning.textContent = result.insecure ? "⚠ 암호화되지 않은 HTTP 공개 주소입니다. 로그인 정보가 그대로 전송되니 HTTPS나 Tailscale 주소를 쓰세요." : "";
+        } catch { warning.textContent = ""; }
+      }
+      input.addEventListener("input", () => void inspect());
+      void inspect();
+
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        submit.disabled = true;
+        submit.textContent = "연결 확인 중…";
+        status.textContent = "";
+        try {
+          await window.webAgentManagerDesktop.connect(input.value);
+        } catch (error) {
+          status.textContent = String(error?.message || "연결하지 못했습니다.").replace(/^Error invoking remote method '[^']+': (?:Error: )?/, "");
+          submit.disabled = false;
+          submit.textContent = "연결";
+        }
+      });
+    </script>
+  </body>
+</html>

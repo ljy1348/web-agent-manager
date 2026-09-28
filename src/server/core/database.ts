@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS mobile_trusted_devices (
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   last_used_at TEXT,
+  biometric_public_key TEXT,
   UNIQUE(user_id, key_fingerprint)
 );
 
@@ -125,6 +126,16 @@ CREATE TABLE IF NOT EXISTS one_time_login_codes (
 CREATE TABLE IF NOT EXISTS mobile_trust_challenges (
   web_session_id INTEGER PRIMARY KEY REFERENCES web_sessions(id) ON DELETE CASCADE,
   device_id TEXT NOT NULL REFERENCES mobile_trusted_devices(id) ON DELETE CASCADE,
+  challenge_hash TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 앱 지문 등록·본인 확인 challenge는 웹 세션당 하나만 두고 용도(purpose)를 서명 문구와 함께 고정한다.
+CREATE TABLE IF NOT EXISTS mobile_biometric_challenges (
+  web_session_id INTEGER PRIMARY KEY REFERENCES web_sessions(id) ON DELETE CASCADE,
+  device_id TEXT NOT NULL REFERENCES mobile_trusted_devices(id) ON DELETE CASCADE,
+  purpose TEXT NOT NULL CHECK(purpose IN ('enroll', 'reauth')),
   challenge_hash TEXT NOT NULL,
   expires_at TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -373,6 +384,27 @@ CREATE TABLE IF NOT EXISTS remote_worker_hosts (
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- 다른 WAM 설치본을 연결할 때만 사용한다. 이 테이블이 비어 있으면 기존 단일 설치본 동작은 그대로다.
+CREATE TABLE IF NOT EXISTS federation_agent_tokens (
+  id TEXT PRIMARY KEY,
+  token_hash TEXT NOT NULL UNIQUE,
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  revoked_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS federation_nodes (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  base_url TEXT NOT NULL,
+  token_credential_id TEXT NOT NULL REFERENCES credential_vault_entries(id) ON DELETE RESTRICT,
+  -- 공급자 설정 동기화 모드(#136). follow만 메인 설정을 받는다. 기존 연결이 덮어써지지 않게 기본은 independent.
+  settings_mode TEXT NOT NULL DEFAULT 'independent' CHECK(settings_mode IN ('follow', 'independent')),
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS remote_worker_project_mappings (
   id TEXT PRIMARY KEY,
   project_id INTEGER NOT NULL UNIQUE REFERENCES projects(id) ON DELETE CASCADE,
@@ -465,6 +497,20 @@ CREATE TABLE IF NOT EXISTS fcm_deliveries (
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY(event_id, device_id)
+);
+
+-- 알림 본문은 보관하지 않는다. 연결된 중앙 WAM이 원격 이벤트를 읽어 푸시만 집계한다.
+CREATE TABLE IF NOT EXISTS push_event_journal (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id TEXT NOT NULL UNIQUE,
+  event_type TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS federation_push_cursors (
+  node_id TEXT PRIMARY KEY REFERENCES federation_nodes(id) ON DELETE CASCADE,
+  last_seq INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 -- rate_limit_options 화면에서 "재설정까지 대기"를 자동 선택한 채팅을 기록해둔다.
@@ -1286,6 +1332,7 @@ CREATE INDEX IF NOT EXISTS idx_approvals_chat ON approvals(chat_id, status);
 CREATE INDEX IF NOT EXISTS idx_context_snapshots_expiry ON context_snapshots(expires_at);
 CREATE INDEX IF NOT EXISTS idx_delegations_target ON delegations(target_chat_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_push_devices_user ON push_devices(user_id, active);
+CREATE INDEX IF NOT EXISTS idx_push_event_journal_created ON push_event_journal(created_at);
 CREATE INDEX IF NOT EXISTS idx_mobile_trusted_devices_user ON mobile_trusted_devices(user_id, active);
 CREATE INDEX IF NOT EXISTS idx_one_time_login_codes_expiry ON one_time_login_codes(expires_at);
 
@@ -1371,6 +1418,10 @@ export function openDatabase(config: AppConfig): AppDatabase {
     database.exec("ALTER TABLE web_sessions ADD COLUMN last_seen_at TEXT");
     database.exec("UPDATE web_sessions SET last_seen_at = created_at WHERE last_seen_at IS NULL");
   }
+  const mobileDeviceColumns = database.prepare("PRAGMA table_info(mobile_trusted_devices)").all() as Array<{ name: string }>;
+  if (!mobileDeviceColumns.some((column) => column.name === "biometric_public_key")) {
+    database.exec("ALTER TABLE mobile_trusted_devices ADD COLUMN biometric_public_key TEXT");
+  }
   if (!sessionColumns.some((column) => column.name === "reauthenticated_at")) {
     database.exec("ALTER TABLE web_sessions ADD COLUMN reauthenticated_at TEXT");
     database.exec("UPDATE web_sessions SET reauthenticated_at = created_at WHERE reauthenticated_at IS NULL");
@@ -1387,6 +1438,10 @@ export function openDatabase(config: AppConfig): AppDatabase {
   const remoteWorkerColumns = database.prepare("PRAGMA table_info(remote_worker_hosts)").all() as Array<{ name: string }>;
   if (!remoteWorkerColumns.some((column) => column.name === "workspace_root")) {
     database.exec("ALTER TABLE remote_worker_hosts ADD COLUMN workspace_root TEXT");
+  }
+  const federationNodeColumns = database.prepare("PRAGMA table_info(federation_nodes)").all() as Array<{ name: string }>;
+  if (!federationNodeColumns.some((column) => column.name === "settings_mode")) {
+    database.exec("ALTER TABLE federation_nodes ADD COLUMN settings_mode TEXT NOT NULL DEFAULT 'independent' CHECK(settings_mode IN ('follow', 'independent'))");
   }
   database.exec("CREATE INDEX IF NOT EXISTS idx_credential_vault_leases_expiry ON credential_vault_leases(expires_at)");
   database.exec("CREATE INDEX IF NOT EXISTS idx_credential_vault_mcp_project ON credential_vault_mcp_bindings(project_id, provider)");

@@ -4,6 +4,7 @@ import type { AppConfig } from "../core/config";
 import type { AuthUser } from "../../shared/types";
 import type { RealtimeHub } from "./realtime";
 import { findExecutable } from "./agent-integration";
+import { resolveCommand, resolvePtyCommand } from "../core/windows-command";
 import { CONFIG_DIR_ENV, defaultCodexHome, type AgentAccountService } from "./agent-accounts";
 
 export type CliAuthProvider = "codex" | "claude" | "grok" | "github";
@@ -68,14 +69,16 @@ const STATUS_COMMANDS: Record<CliAuthProvider, { executable: string; args: strin
 // env로 계정 슬롯의 설정 디렉터리를 지정하면 그 계정의 인증 여부만 확인한다.
 function commandSucceeds(command: string, args: string[], cwd: string, env?: Record<string, string>): Promise<boolean> {
   return new Promise((resolve) => {
-    execFile(command, args, { cwd, timeout: 15_000, maxBuffer: 256 * 1024, env: { ...process.env, ...env } }, (error) => resolve(!error));
+    const resolved = resolveCommand(command, args);
+    execFile(resolved.command, resolved.args, { cwd, timeout: 15_000, maxBuffer: 256 * 1024, env: { ...process.env, ...env }, windowsVerbatimArguments: resolved.verbatim, windowsHide: true }, (error) => resolve(!error));
   });
 }
 
 // 상태 명령의 출력만 읽어온다. 호출부가 미인증 문구만 확인하고 버리며, 응답·로그로는 내보내지 않는다.
 function commandOutput(command: string, args: string[], cwd: string, env?: Record<string, string>): Promise<string> {
   return new Promise((resolve) => {
-    execFile(command, args, { cwd, timeout: 15_000, maxBuffer: 256 * 1024, env: { ...process.env, ...env } }, (error, stdout, stderr) => {
+    const resolved = resolveCommand(command, args);
+    execFile(resolved.command, resolved.args, { cwd, timeout: 15_000, maxBuffer: 256 * 1024, env: { ...process.env, ...env }, windowsVerbatimArguments: resolved.verbatim, windowsHide: true }, (error, stdout, stderr) => {
       resolve(error && !stdout && !stderr ? "" : `${stdout ?? ""}\n${stderr ?? ""}`);
     });
   });
@@ -201,6 +204,16 @@ export class CliAuthManager {
 
   // 선택한 계정의 공식 로그인 명령을 새 PTY에서 시작한다. 계정 슬롯의 설정 디렉터리를 지정해 실행하므로
   // 그 계정 폴더에만 인증이 저장되고 다른 계정의 인증은 그대로 남는다.
+  // 로그인 터미널 밖에서 인증 파일이 바뀐 뒤(연결 컴퓨터 인증 동기화 #138) 기본 계정 상태를 다시 검사해 화면에 알린다.
+  async refreshDefault(provider: CliAuthProvider): Promise<void> {
+    const target = this.targets().find((item) => item.provider === provider && item.accountId === null);
+    if (!target) return;
+    const status = await this.inspectTarget(target);
+    this.statuses.set(authSessionKey(target.provider, target.accountId), status);
+    this.realtime.broadcast("cli_auth_changed", { provider: target.provider, accountId: null, exitCode: null });
+    if (status.authenticated) this.onAuthenticated?.(target.provider, null);
+  }
+
   start(provider: CliAuthProvider, accountId: number | null): void {
     const command = AUTH_COMMANDS[provider];
     if (!command) throw new Error("지원하지 않는 인증 공급자입니다.");
@@ -210,7 +223,9 @@ export class CliAuthManager {
     if (existing?.running) return;
     const executable = this.runtime.findExecutable(command.executable);
     if (!executable) throw new Error(`${command.executable} CLI가 설치되어 있지 않습니다.`);
-    const child = this.runtime.spawn(executable, command.args, {
+    // Windows의 codex.cmd 같은 스크립트형 CLI는 cmd.exe로 감싸야 로그인 터미널이 뜬다(#143).
+    const ptyCommand = resolvePtyCommand(executable, command.args);
+    const child = this.runtime.spawn(ptyCommand.file, ptyCommand.args as string[], {
       name: "xterm-256color",
       cols: 120,
       rows: 32,

@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import readline from "node:readline";
 import type { NextFunction, Request, RequestHandler, Response } from "express";
 import type { AuthenticatedRequest } from "./auth";
 import { readProductEnv } from "./config";
@@ -8,8 +9,8 @@ export type LogLevel = "debug" | "info" | "warn" | "error";
 
 const LEVEL_ORDER: LogLevel[] = ["debug", "info", "warn", "error"];
 // 디버그 레벨에서는 조회 화면 전체가 매분 쌓여 하루 수백 MB까지 커진다(실측: 8/9자 200MB).
-// 그 상태로 오래 운용하기 위해 보존 기간을 짧게 잡고, 필요하면 환경변수로 늘린다.
-const DEFAULT_KEEP_DAYS = 3;
+// 그 상태로 오래 운용하기 위해 보존 기간을 짧게 잡되, 모든 요청 기록(#106)의 공격 추적을 위해 7일로 둔다(#108).
+const DEFAULT_KEEP_DAYS = 7;
 // 정리를 서버 시작 때 한 번만 돌리면 오래 켜둔 서버에서는 계속 쌓인다. 주기적으로도 돌린다.
 const PRUNE_INTERVAL_MS = 6 * 60 * 60_000;
 const MAX_DETAIL_LENGTH = 4000;
@@ -147,18 +148,44 @@ export function initServerLogging(dataDir: string): void {
   write("info", "logger", `서버 로깅 시작 (level=${minLevel}, keepDays=${keepDays()}, dir=${logsDir})`);
 }
 
-// /api·/internal 요청의 메서드·경로·상태·소요시간·사용자를 기록하는 미들웨어를 만든다.
+// 프록시가 넘긴 원 클라이언트 헤더들. 신뢰 판정용이 아니라 로그 참고값으로만 쓴다.
+const CLIENT_HINT_HEADERS = ["cf-connecting-ip", "true-client-ip", "x-real-ip", "x-forwarded-for", "forwarded"];
+const MAX_HEADER_LOG_LENGTH = 200;
+// 감독 루프가 5초마다 부르는 헬스 체크는 하루 1.7만 줄을 차지해 기록하지 않는다(#107).
+const UNLOGGED_PATHS = new Set(["/health"]);
+
+// 상태 코드로 요청 로그 레벨을 정한다. 운영(info)에서도 모든 요청이 남도록 성공도 info다.
+export function requestLogLevel(status: number): LogLevel {
+  if (status >= 500) return "error";
+  if (status >= 400) return "warn";
+  return "info";
+}
+
+// 첫 번째로 존재하는 프록시 전달 헤더를 "헤더명=값" 원문으로 돌려준다(위조 가능한 참고값).
+export function forwardedClientHint(headers: Record<string, string | string[] | undefined>): string | undefined {
+  for (const name of CLIENT_HINT_HEADERS) {
+    const raw = headers[name];
+    const value = Array.isArray(raw) ? raw.join(", ") : raw;
+    if (value) return `${name}=${value}`.slice(0, MAX_HEADER_LOG_LENGTH);
+  }
+  return undefined;
+}
+
+// 헬스 체크를 뺀 모든 HTTP 요청의 메서드·경로·상태·소요시간·사용자·출처 참고값을 기록하는 미들웨어를 만든다.
 export function createRequestLogger(): RequestHandler {
   const requestLog = createLogger("http");
   return (request: Request, response: Response, next: NextFunction) => {
-    if (!request.path.startsWith("/api") && !request.path.startsWith("/internal")) return next();
+    if (UNLOGGED_PATHS.has(request.path)) return next();
     const startedAt = Date.now();
     response.on("finish", () => {
       const user = (request as AuthenticatedRequest).authUser?.username ?? "-";
-      const details = { method: request.method, path: request.originalUrl, status: response.statusCode, ms: Date.now() - startedAt, user, ip: request.ip };
-      if (response.statusCode >= 500) requestLog.error("요청 실패", details);
-      else if (response.statusCode >= 400) requestLog.warn("요청 거부", details);
-      else requestLog.debug("요청 처리", details);
+      const fwd = forwardedClientHint(request.headers);
+      const ua = request.headers["user-agent"]?.slice(0, MAX_HEADER_LOG_LENGTH);
+      const details = { method: request.method, path: request.originalUrl, status: response.statusCode, ms: Date.now() - startedAt, user, ip: request.ip, ...(fwd ? { fwd } : {}), ...(ua ? { ua } : {}) };
+      const level = requestLogLevel(response.statusCode);
+      if (level === "error") requestLog.error("요청 실패", details);
+      else if (level === "warn") requestLog.warn("요청 거부", details);
+      else requestLog.info("요청 처리", details);
     });
     next();
   };
@@ -185,5 +212,85 @@ export function createClientLogHandler(): RequestHandler {
       appendLine("client", `${at} ${level.toUpperCase().padEnd(5)} [${scope}] (${user}) ${message}`);
     }
     response.status(204).end();
+  };
+}
+
+export type LogKind = "server" | "client";
+
+export interface LogQuery {
+  kind: LogKind;
+  date: string;
+  minLevel: LogLevel;
+  search: string;
+  limit: number;
+}
+
+export interface LogReadResult {
+  kind: LogKind;
+  date: string;
+  dates: string[];
+  lines: string[];
+  matched: number;
+  truncated: boolean;
+}
+
+const LOG_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+const LOG_LINE_LEVEL = /^\d{4}-\d{2}-\d{2}T\S+ (DEBUG|INFO|WARN|ERROR)\b/;
+const DEFAULT_READ_LIMIT = 500;
+const MAX_READ_LIMIT = 2000;
+
+// 쿼리 문자열을 검증된 로그 조회 조건으로 바꾼다. 날짜 형식만 허용해 경로 조작을 막는다.
+export function parseLogQuery(query: Record<string, unknown>, today = new Date().toISOString().slice(0, 10)): LogQuery {
+  const text = (value: unknown): string => (typeof value === "string" ? value : "");
+  const kind: LogKind = text(query.kind) === "client" ? "client" : "server";
+  const date = LOG_DATE_PATTERN.test(text(query.date)) ? text(query.date) : today;
+  const level = text(query.level).toLowerCase();
+  const minLevel = (LEVEL_ORDER as string[]).includes(level) ? level as LogLevel : "debug";
+  const requested = Number.parseInt(text(query.limit), 10);
+  const limit = Number.isFinite(requested) && requested > 0 ? Math.min(requested, MAX_READ_LIMIT) : DEFAULT_READ_LIMIT;
+  return { kind, date, minLevel, search: text(query.q).slice(0, 200).toLowerCase(), limit };
+}
+
+// 디렉터리에 있는 해당 종류 로그의 날짜 목록을 최신순으로 돌려준다.
+export function listLogDates(directory: string, kind: LogKind): string[] {
+  try {
+    const pattern = new RegExp(`^${kind}-(\\d{4}-\\d{2}-\\d{2})\\.log$`);
+    return fs.readdirSync(directory).map((name) => name.match(pattern)?.[1]).filter((date): date is string => !!date).sort().reverse();
+  } catch {
+    return [];
+  }
+}
+
+// 날짜별 로그 파일을 스트림으로 읽어 레벨·검색 조건에 맞는 마지막 limit줄을 돌려준다.
+// 스택처럼 시각이 없는 줄은 앞 줄의 레벨을 이어받는다.
+export async function readLogLines(directory: string, query: LogQuery): Promise<LogReadResult> {
+  const dates = listLogDates(directory, query.kind);
+  const base = { kind: query.kind, date: query.date, dates };
+  const file = path.join(directory, `${query.kind}-${query.date}.log`);
+  if (!dates.includes(query.date)) return { ...base, lines: [], matched: 0, truncated: false };
+  const minIndex = LEVEL_ORDER.indexOf(query.minLevel);
+  const lines: string[] = [];
+  let matched = 0;
+  let currentLevel: LogLevel = "info";
+  const reader = readline.createInterface({ input: fs.createReadStream(file, { encoding: "utf8" }), crlfDelay: Infinity });
+  for await (const line of reader) {
+    const level = line.match(LOG_LINE_LEVEL)?.[1];
+    if (level) currentLevel = level.toLowerCase() as LogLevel;
+    if (LEVEL_ORDER.indexOf(currentLevel) < minIndex) continue;
+    if (query.search && !line.toLowerCase().includes(query.search)) continue;
+    matched += 1;
+    lines.push(line.length > MAX_DETAIL_LENGTH ? `${line.slice(0, MAX_DETAIL_LENGTH)}…` : line);
+    // 줄마다 앞을 지우면 느리므로 두 배까지 쌓였을 때 한 번에 잘라낸다.
+    if (lines.length >= query.limit * 2) lines.splice(0, lines.length - query.limit);
+  }
+  const tail = lines.slice(-query.limit);
+  return { ...base, lines: tail, matched, truncated: matched > tail.length };
+}
+
+// 관리자용 서버·클라이언트 로그 조회 핸들러를 만든다. 연결 컴퓨터 로그도 federation 중계로 같은 경로를 쓴다.
+export function createLogReadHandler(): RequestHandler {
+  return (request: Request, response: Response, next: NextFunction) => {
+    if (!logsDir) return response.status(503).json({ error: "로그 디렉터리가 준비되지 않았습니다." });
+    readLogLines(logsDir, parseLogQuery(request.query as Record<string, unknown>)).then((result) => response.json(result)).catch(next);
   };
 }

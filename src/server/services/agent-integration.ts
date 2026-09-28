@@ -1,9 +1,13 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
+import { agentSocketPath } from "../core/agent-socket";
+import { resolveCommand } from "../core/windows-command";
 import type { AppConfig } from "../core/config";
 import type { AppDatabase } from "../core/database";
 import { globalAgentSkillsInstalled, installGlobalAgentSkills, type AgentSkillProvider, type SkillInstallResult } from "./agent-skill-installer";
+import { defaultCodexHome } from "./agent-accounts";
 
 export type AgentIntegrationProvider = AgentSkillProvider;
 
@@ -15,7 +19,7 @@ interface CommandResult {
 
 export interface AgentIntegrationRuntime {
   findExecutable(command: string): string | null;
-  run(command: string, args: string[]): Promise<CommandResult>;
+  run(command: string, args: string[], env?: Record<string, string>): Promise<CommandResult>;
 }
 
 export interface AgentIntegrationStatus {
@@ -28,12 +32,19 @@ export interface AgentIntegrationStatus {
   ready: boolean;
 }
 
+// 이 플랫폼에서 실행할 수 있는 파일 이름 후보. Windows는 확장자 없는 파일을 실행할 수 없는데, npm·Volta 전역 설치는
+// 같은 폴더에 확장자 없는 셸 스크립트(codex)와 codex.cmd를 함께 두고 X_OK 검사는 존재 여부만 보므로,
+// 확장자 없는 후보를 먼저 보면 실행 불가 스크립트를 골라(spawn ENOENT) 로그인 상태가 "인증 필요"로 보였다(#155, Windows 실측).
+export function executableCandidates(command: string, platform: NodeJS.Platform = process.platform): string[] {
+  if (platform !== "win32" || /\.(exe|cmd|bat|com)$/i.test(command)) return [command];
+  return [".exe", ".cmd", ".bat"].map((extension) => `${command}${extension}`);
+}
+
 // PATH의 실행 파일을 셸 없이 찾아 공급자 CLI 설치 여부를 판정한다.
 export function findExecutable(command: string): string | null {
-  const extensions = process.platform === "win32" ? ["", ".exe", ".cmd", ".bat"] : [""];
   for (const directory of (process.env.PATH || "").split(path.delimiter).filter(Boolean)) {
-    for (const extension of extensions) {
-      const candidate = path.join(directory, `${command}${extension}`);
+    for (const name of executableCandidates(command)) {
+      const candidate = path.join(directory, name);
       try {
         fs.accessSync(candidate, fs.constants.X_OK);
         return candidate;
@@ -46,14 +57,17 @@ export function findExecutable(command: string): string | null {
 }
 
 // 공급자 CLI 명령을 이벤트 루프를 막지 않고 제한 시간·출력 길이 안에서 실행한다.
-function runCommand(command: string, args: string[]): Promise<CommandResult> {
+function runCommand(command: string, args: string[], env: Record<string, string> = {}): Promise<CommandResult> {
   return new Promise((resolve) => {
-    execFile(command, args, {
+    const resolved = resolveCommand(command, args);
+    execFile(resolved.command, resolved.args, {
+      windowsVerbatimArguments: resolved.verbatim,
+      windowsHide: true,
       cwd: process.cwd(),
       encoding: "utf8",
       timeout: 15_000,
       maxBuffer: 1024 * 1024,
-      env: process.env,
+      env: { ...process.env, ...env },
     }, (error, stdout, stderr) => {
       resolve({
         status: error ? typeof error.code === "number" ? error.code : null : 0,
@@ -125,6 +139,8 @@ export class AgentIntegrationManager {
     private readonly config: AppConfig,
     private readonly database: AppDatabase,
     private readonly runtime: AgentIntegrationRuntime = DEFAULT_RUNTIME,
+    // Claude·Grok CLI가 쓰는 프로세스 HOME. 테스트는 실제 홈을 건드리지 않도록 임시 폴더를 넘긴다(#148).
+    private readonly processHome: string = os.homedir(),
   ) {}
 
   // 저장되지 않은 공급자만 서버 생명주기에서 한 번 확인한다.
@@ -136,6 +152,16 @@ export class AgentIntegrationManager {
   // 각 공급자의 시작 시점 확인 결과를 반환하고 CLI를 다시 실행하지 않는다.
   async status(): Promise<{ integrations: AgentIntegrationStatus[] }> {
     await this.initialize();
+    // 설치 스크립트 등 서버 밖에서 연동을 마친 경우, 시작 때 기억한 "연결 필요"가 남지 않도록
+    // DB 성공 기록과 실제 파일을 가볍게 다시 확인해 맞춘다(CLI는 실행하지 않는다).
+    for (const provider of PROVIDERS) {
+      if (this.statuses.get(provider)?.ready) continue;
+      const saved = this.database.prepare("SELECT cli_path, version FROM agent_integration_status WHERE provider = ?")
+        .get(provider) as { cli_path: string; version: string | null } | undefined;
+      if (saved && this.savedLayoutValid(provider)) {
+        this.statuses.set(provider, { provider, cliInstalled: true, cliPath: saved.cli_path, version: saved.version, skillsInstalled: true, mcpInstalled: true, ready: true });
+      }
+    }
     return { integrations: PROVIDERS.map((provider) => this.statuses.get(provider) ?? emptyStatus(provider)) };
   }
 
@@ -145,7 +171,11 @@ export class AgentIntegrationManager {
       const saved = this.database.prepare(
         "SELECT cli_path, version FROM agent_integration_status WHERE provider = ?",
       ).get(provider) as { cli_path: string; version: string | null } | undefined;
-      if (saved) {
+      // 저장된 성공 기록은 예전 버전이 다른 홈에 설치한 것일 수 있다(#148). 파일만 보는 가벼운 확인으로
+      // 실제 위치에 스킬·Codex MCP가 있을 때만 믿고, 아니면 기록을 지우고 CLI로 다시 검사한다.
+      if (saved && !this.savedLayoutValid(provider)) {
+        this.database.prepare("DELETE FROM agent_integration_status WHERE provider = ?").run(provider);
+      } else if (saved) {
         this.statuses.set(provider, {
           provider,
           cliInstalled: true,
@@ -163,14 +193,36 @@ export class AgentIntegrationManager {
     }));
   }
 
+  private savedLayoutValid(provider: AgentIntegrationProvider): boolean {
+    if (!globalAgentSkillsInstalled(provider, this.skillHome(provider), this.config.rootDir)) return false;
+    if (provider !== "codex") return true;
+    try {
+      const config = fs.readFileSync(path.join(defaultCodexHome(this.config.homeDir), "config.toml"), "utf8");
+      return new RegExp(`^\\[mcp_servers\\.(?:"${MCP_SERVER_NAME}"|${MCP_SERVER_NAME})\\]`, "m").test(config);
+    } catch {
+      return false;
+    }
+  }
+
+  // WAM이 이 공급자 CLI를 실행할 때 쓰는 설정 홈. Claude·Grok은 프로세스 HOME, Codex는 설치 계정 홈의
+  // ~/.codex(CODEX_HOME)다 — 연동을 다른 홈에 설치하면 실제 채팅이 스킬·MCP를 못 본다(#148).
+  private skillHome(provider: AgentIntegrationProvider): string {
+    return provider === "codex" ? this.config.homeDir : this.processHome;
+  }
+
+  // 공급자 CLI 명령에 줄 환경. Codex는 채팅 실행과 같은 CODEX_HOME에 MCP를 확인·등록해야 한다.
+  private cliEnv(provider: AgentIntegrationProvider): Record<string, string> {
+    return provider === "codex" ? { CODEX_HOME: defaultCodexHome(this.config.homeDir) } : {};
+  }
+
   // 한 공급자의 설치 여부와 web-agent-manager 연동 완성 여부를 실제 CLI로 계산한다.
   private async inspectProvider(provider: AgentIntegrationProvider): Promise<AgentIntegrationStatus> {
     const executable = this.runtime.findExecutable(provider);
-    const skillsInstalled = globalAgentSkillsInstalled(provider, this.config.homeDir, this.config.rootDir);
+    const skillsInstalled = globalAgentSkillsInstalled(provider, this.skillHome(provider), this.config.rootDir);
     if (!executable) {
       return { provider, cliInstalled: false, cliPath: null, version: null, skillsInstalled, mcpInstalled: false, ready: false };
     }
-    const mcpResult = await this.runtime.run(executable, mcpCheckArgs(provider));
+    const mcpResult = await this.runtime.run(executable, mcpCheckArgs(provider), this.cliEnv(provider));
     // Grok에는 `mcp get`이 없어 `mcp list`로 확인하는데, 이 명령은 서버가 하나도 없어도 0으로 끝나므로
     // 종료 코드만 보면 항상 설치된 것처럼 보인다. 목록에서 이름이 정확히 일치하는지까지 확인한다.
     const mcpInstalled = mcpResult.status === 0
@@ -204,7 +256,7 @@ export class AgentIntegrationManager {
   async install(provider: AgentIntegrationProvider): Promise<{ integration: AgentIntegrationStatus; skills: SkillInstallResult }> {
     const executable = this.runtime.findExecutable(provider);
     if (!executable) throw new Error(`${provider} CLI가 설치되어 있지 않습니다.`);
-    const skills = installGlobalAgentSkills(provider, this.config.homeDir, this.config.rootDir);
+    const skills = installGlobalAgentSkills(provider, this.skillHome(provider), this.config.rootDir);
     if (skills.errors.length) throw new Error(skills.errors.join("\n"));
     const current = await this.inspectProvider(provider);
     if (current.ready) {
@@ -213,10 +265,10 @@ export class AgentIntegrationManager {
     }
     const launch = this.mcpLaunch();
     for (const serverName of [MCP_SERVER_NAME, LEGACY_MCP_SERVER_NAME]) {
-      await this.runtime.run(executable, mcpRemoveArgs(provider, serverName));
+      await this.runtime.run(executable, mcpRemoveArgs(provider, serverName), this.cliEnv(provider));
     }
-    const socketVariable = `WEB_AGENT_MANAGER_BRIDGE_SOCKET=${path.join(this.config.dataDir, "web-agent-manager-agent.sock")}`;
-    const result = await this.runtime.run(executable, mcpAddArgs(provider, socketVariable, launch));
+    const socketVariable = `WEB_AGENT_MANAGER_BRIDGE_SOCKET=${agentSocketPath(this.config.dataDir)}`;
+    const result = await this.runtime.run(executable, mcpAddArgs(provider, socketVariable, launch), this.cliEnv(provider));
     if (result.status !== 0) throw new Error((result.stderr || result.stdout || "MCP 설치에 실패했습니다.").trim());
     const integration = await this.inspectProvider(provider);
     this.statuses.set(provider, integration);

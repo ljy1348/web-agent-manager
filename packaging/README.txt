@@ -11,8 +11,25 @@ macOS
 2. setup.command를 실행합니다.
 3. macOS가 실행을 차단하면 파일을 우클릭한 뒤 열기를 선택합니다.
 
-Windows
-web-agent-manager는 tmux와 Unix socket이 필요하므로 WSL2에서 실행합니다.
+Windows 데스크톱 앱 (권장, 터미널 불필요)
+데스크톱 설치 파일(web-agent-manager Setup *.exe)을 실행해 설치한 뒤, 첫 화면에서
+"이 PC에서 WAM 실행"을 고르면 Node.js 설치 없이 서버가 앱 안에서 돕니다.
+포트와 다른 컴퓨터 접속 허용을 고르고 관리자 계정을 만들면 끝입니다. 창을 닫으면 트레이에 남습니다.
+
+Windows 네이티브 노드 (WSL 없이, 그 PC의 Claude 앱·Codex 앱 대화 관리)
+1. setup-windows-native.cmd를 실행합니다. Node.js 22가 없으면 winget 설치를 제안합니다.
+2. 포트와 접속 범위(이 PC만 / 사설망·Tailscale)를 고르고, 관리자 계정을 만듭니다.
+3. 로그온 자동 시작을 고를 수 있고, 설치가 끝나면 서버가 바로 시작됩니다.
+4. 이후에는 run-windows-native.cmd로 실행합니다. 설정을 바꾸려면
+   setup-windows-native.cmd -Reconfigure 를 실행합니다.
+5. 메인 WAM에 붙이려면 이 PC의 WAM에서 설정 → 운영 → 컴퓨터 연결 → 연결 토큰을 만든 뒤,
+   메인 WAM의 같은 화면에서 이 PC 주소와 토큰을 등록합니다.
+- 무인 설치: WEB_AGENT_MANAGER_ADMIN_USERNAME, WEB_AGENT_MANAGER_ADMIN_PASSWORD 환경변수를
+  미리 두면 관리자 입력을 묻지 않습니다.
+- 현재는 기존 대화 보기까지 지원합니다. 이 PC에서 대화를 이어서 작업하는 기능은 준비 중입니다.
+
+Windows (WSL2)
+tmux 기반 전체 기능을 쓰려면 WSL2에서 실행합니다.
 1. 관리자 PowerShell에서 wsl --install 을 실행하고 Ubuntu 초기 설정을 마칩니다.
 2. WSL Ubuntu에 Node.js 22 이상과 tmux를 설치합니다.
 3. setup-windows.cmd를 실행합니다.
@@ -40,6 +57,6 @@ Linux와 macOS 설치 파일은 production 서버와 웹 UI를 함께 포함합�
 시스템에 Node.js 22 이상과 tmux가 있어야 하며, 첫 실행 화면에서 관리자 계정을
 만들면 설치된 Claude·Codex 스킬과 MCP도 자동으로 확인합니다.
 
-Windows Electron 앱은 tmux와 Unix socket 제약 때문에 WSL2에서 setup-windows.cmd로
-실행한 서버에 연결하는 데스크톱 창입니다. 다른 주소의 서버를 열려면
-WEB_AGENT_MANAGER_SERVER_URL 환경변수를 설정할 수 있습니다.
+Windows Electron 앱은 서버를 포함하지 않고 다른 WAM에 접속하는 창입니다. 처음 실행하면
+서버 주소를 입력하고(WSL2 서버, Windows 네이티브 노드, 다른 컴퓨터의 WAM 모두 가능),
+메뉴의 연결 → 연결 서버 변경으로 바꿀 수 있습니다.

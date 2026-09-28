@@ -70,6 +70,39 @@ describe("ApprovalService.handleClaudeHook 중복 방지", () => {
     await Promise.all([first, second]);
   });
 
+  it("권한 요청 앱 푸시에 채팅 번호·제목·공급자를 실어 누르면 그 채팅으로 이동하게 한다 (#150)", async () => {
+    const database = createTestDatabase();
+    const chatId = createChat(database);
+    database.prepare("UPDATE chats SET title = '이력서 자동화' WHERE id = ?").run(chatId);
+    const calls: Array<{ eventType: string; presentation?: { push?: { title: string; body: string; chatId?: number } } }> = [];
+    const notifier: Notifier = { notify: async (_id, eventType, _text, presentation) => { calls.push({ eventType, presentation }); } };
+    const service = new ApprovalService(loadConfig(), database, new RealtimeHub(fakeHttpServer(), database), notifier);
+
+    service.createTerminalApproval(chatId, "codex", "Allow command? rm -f /tmp/x", "permission", true);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(calls[0].presentation?.push).toMatchObject({ title: `권한 요청 · #${chatId} · 이력서 자동화`, chatId });
+    expect(calls[0].presentation?.push?.body).toMatch(/^Codex · /);
+  });
+
+  it("위임 자식 채팅의 권한 요청 푸시는 승인 카드가 보이는 부모 채팅으로 이동시킨다 (#150)", async () => {
+    const database = createTestDatabase();
+    const parentId = createChat(database);
+    const projectId = (database.prepare("SELECT project_id FROM chats WHERE id = ?").get(parentId) as { project_id: number }).project_id;
+    const childId = Number(database.prepare("INSERT INTO chats(project_id, provider, tmux_name, status, title, origin) VALUES (?, 'codex', 'tmux-child', 'running', '하위', 'delegation')").run(projectId).lastInsertRowid);
+    database.prepare(`INSERT INTO delegations(id, idempotency_key, source_chat_id, target_chat_id, prompt, status, baseline_message_count)
+      VALUES ('d1', 'k1', ?, ?, '하위 작업', 'sent', 0)`).run(parentId, childId);
+    const calls: Array<{ presentation?: { push?: { body: string; chatId?: number } } }> = [];
+    const notifier: Notifier = { notify: async (_id, _eventType, _text, presentation) => { calls.push({ presentation }); } };
+    const service = new ApprovalService(loadConfig(), database, new RealtimeHub(fakeHttpServer(), database), notifier);
+
+    service.createTerminalApproval(childId, "codex", "Allow command?", "permission", true);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(calls[0].presentation?.push?.chatId).toBe(parentId);
+    expect(calls[0].presentation?.push?.body).toContain(`위임(부모 #${parentId})`);
+  });
+
   it("터미널 승인 알림에는 resume 요약 내용을 포함한다", async () => {
     const database = createTestDatabase();
     const chatId = createChat(database);

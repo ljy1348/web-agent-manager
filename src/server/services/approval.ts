@@ -5,6 +5,7 @@ import type { AuthUser, Provider } from "../../shared/types";
 import type { RealtimeHub } from "./realtime";
 import type { Notifier } from "./notifier";
 import type { CodexStructuredApprovalDecision, CodexStructuredApprovalRequest } from "../providers/codex-structured-session";
+import { PROVIDER_LABELS } from "../core/provider-labels";
 
 interface ClaudeHookRequest {
   session_id?: string;
@@ -299,10 +300,21 @@ export class ApprovalService {
     // payload에는 도구 이름과 인자(경로 등)가 그대로 들어간다. 임시 세션은 HTTP 승인 목록도 빈
     // 배열로 받으므로 이 채널도 같이 닫는다. approval_resolved는 id·decision·chatId뿐이라 제외하지 않는다.
     this.realtime.broadcast("approval_requested", { id, chatId, provider, requestType, payload }, { skipTemporary: true });
+    // 앱 푸시는 누르면 그 채팅으로 가도록 채팅 번호를 싣고, 작업 완료 푸시와 같은 "#번호 · 제목" 형식을 쓴다(#150).
+    const chatTitle = (this.database.prepare("SELECT title FROM chats WHERE id = ?").get(chatId) as { title: string | null } | undefined)?.title;
+    // 위임 자식 채팅은 채팅 목록에 없어 앱이 바로 열지 못하므로, 승인 카드가 함께 보이는 부모 채팅으로 이동시킨다.
+    const delegationSource = (this.database.prepare(`SELECT source_chat_id AS sourceChatId FROM delegations
+      WHERE target_chat_id = ? ORDER BY created_at DESC LIMIT 1`).get(chatId) as { sourceChatId: number } | undefined)?.sourceChatId;
+    const push = {
+      title: `권한 요청 · #${chatId} · ${chatTitle || "제목 없음"}`,
+      body: `${PROVIDER_LABELS[provider] ?? provider}${delegationSource ? ` · 위임(부모 #${delegationSource})` : ""} · ${detail || "승인이 필요합니다."}`,
+      chatId: delegationSource ?? chatId,
+    };
     void this.notifications.notify(
       `approval:${id}`,
       "approval_requested",
       `권한 승인이 필요합니다.\n공급자: ${provider}\n채팅 ID: ${chatId}${detail ? `\n요청: ${detail}` : ""}\n${this.config.publicUrl}/?chat=${chatId}`,
+      { push },
     );
   }
 

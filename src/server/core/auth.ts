@@ -10,6 +10,7 @@ export interface AuthenticatedRequest extends Request {
   networkOriginTrusted?: boolean;
   appTrusted?: boolean;
   trustedNetwork?: boolean;
+  federationAuthenticated?: boolean;
 }
 
 // 요청 Cookie의 세션 토큰을 검증해 사용자 정보를 주입한다.
@@ -113,6 +114,7 @@ export function requireNonTemporarySession(request: AuthenticatedRequest, respon
 
 // 변경 요청의 CSRF 토큰이 로그인 세션과 일치하는지 확인한다.
 export function requireCsrf(request: AuthenticatedRequest, response: Response, next: NextFunction): void {
+  if (request.federationAuthenticated) return next();
   if (["GET", "HEAD", "OPTIONS"].includes(request.method)) return next();
   if (!request.authSession || request.headers["x-csrf-token"] !== request.authSession.csrfToken) {
     response.status(403).json({ error: "CSRF 검증에 실패했습니다." });
@@ -123,6 +125,7 @@ export function requireCsrf(request: AuthenticatedRequest, response: Response, n
 
 export function createRecentReauthenticationGuard(database: AppDatabase, windowMinutes = 15) {
   return (request: AuthenticatedRequest, response: Response, next: NextFunction): void => {
+    if (request.federationAuthenticated) return next();
     if (!request.authSession) {
       response.status(401).json({ error: "로그인이 필요합니다." });
       return;
@@ -137,10 +140,13 @@ export function createRecentReauthenticationGuard(database: AppDatabase, windowM
 }
 
 export function requiresRecentReauthentication(method: string, requestPath: string): boolean {
+  const remotePath = requestPath.replace(/^\/federation\/nodes\/[^/]+\/api(?=\/)/, "");
+  if (remotePath !== requestPath) return requiresRecentReauthentication(method, remotePath);
   if (method === "GET" && /^\/admin\/full-backups\/[^/]+\/download$/.test(requestPath)) return true;
   if (method === "DELETE") return true;
   if (!["POST", "PUT", "PATCH"].includes(method)) return false;
   return [
+    /^\/mobile\/biometric\/enroll(?:\/challenge)?$/,
     /^\/providers\/(?:codex|claude|grok)\/(?:update|rollouts(?:\/[^/]+\/(?:halt|promote))?)$/,
     /^\/providers\/(?:codex|claude|grok)\/updates\/[^/]+\/rollback$/,
     /^\/system\/processes\/\d+\/kill$/,
@@ -156,6 +162,13 @@ export function requiresRecentReauthentication(method: string, requestPath: stri
     /^\/tasks\/[^/]+\/preview-captures$/,
     /^\/tasks\/[^/]+\/visual-(?:baseline|checks)$/,
     /^\/remote-workers(?:\/|$)/,
+    /^\/federation\/(?:agent-tokens|nodes)(?:\/[^/]+)?$/,
+    /^\/federation\/nodes\/[^/]+\/provider-settings\/sync$/,
+    /^\/provider-settings\/(?:apply|backups\/[^/]+\/restore)$/,
+    /^\/projects\/\d+\/transfer$/,
+    /^\/project-transfer\/uploads(?:\/|$)/,
+    /^\/federation\/nodes\/[^/]+\/credentials\/[^/]+\/sync$/,
+    /^\/credential-sync\//,
     /^\/projects\/\d+\/remote-worker-mapping$/,
     /^\/tasks\/[^/]+\/remote-dispatches(?:\/[^/]+\/refresh)?$/,
     /^\/admin\/webhook-settings$/,

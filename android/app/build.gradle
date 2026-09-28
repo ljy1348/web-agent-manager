@@ -6,7 +6,6 @@ plugins {
 if (file("google-services.json").exists()) {
     apply plugin: "com.google.gms.google-services"
 }
-
 android {
     namespace "com.webagentmanager.android"
     compileSdk 36
@@ -15,8 +14,8 @@ android {
         applicationId "com.webagentmanager.android"
         minSdk 23
         targetSdk 36
-        versionCode 12
-        versionName "0.7.0"
+        versionCode 15
+        versionName "0.7.2"
     }
 
     buildTypes {

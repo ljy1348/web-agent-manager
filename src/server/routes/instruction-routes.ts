@@ -10,14 +10,21 @@ import type { GitWorkspaceService } from "../services/git-workspaces";
 import { PROJECT_INSTRUCTION_FILES } from "../core/instruction-files";
 
 const projectInstructions = PROJECT_INSTRUCTION_FILES;
-const globalInstructions: Record<string, string> = {
-  "codex/AGENTS.md": path.join(os.homedir(), ".codex", "AGENTS.md"),
-  "codex/AGENTS.override.md": path.join(os.homedir(), ".codex", "AGENTS.override.md"),
-  "claude/CLAUDE.md": path.join(os.homedir(), ".claude", "CLAUDE.md"),
-};
+
+// 전역 지침 파일 위치. Codex는 WAM이 실행할 때 쓰는 CODEX_HOME(설치 계정 홈의 ~/.codex)이어야 한다 —
+// 프로세스 HOME 기준으로 두면 화면에서 고친 전역 지침을 WAM의 Codex가 읽지 않았다(#146).
+export interface GlobalInstructionDirs { claudeHome: string; codexHome: string }
+
+function globalInstructionFiles(dirs: GlobalInstructionDirs): Record<string, string> {
+  return {
+    "codex/AGENTS.md": path.join(dirs.codexHome, "AGENTS.md"),
+    "codex/AGENTS.override.md": path.join(dirs.codexHome, "AGENTS.override.md"),
+    "claude/CLAUDE.md": path.join(dirs.claudeHome, "CLAUDE.md"),
+  };
+}
 
 // 허용 목록의 지침 파일 경로만 실제 경로로 변환한다.
-function resolveInstruction(database: AppDatabase, workspaces: GitWorkspaceService | undefined, scope: string, name: string, projectId?: number, chatId?: number | null): string {
+function resolveInstruction(globalInstructions: Record<string, string>, database: AppDatabase, workspaces: GitWorkspaceService | undefined, scope: string, name: string, projectId?: number, chatId?: number | null): string {
   if (scope === "global") {
     const target = globalInstructions[name];
     if (!target) throw new Error("허용되지 않은 전역 지침 파일입니다.");
@@ -41,12 +48,13 @@ function ensureClaudeImportsAgents(agentsFile: string, claudeFile: string, impor
 }
 
 // scope에 맞는 AGENTS.md와 CLAUDE.md 경로, Claude import 경로를 계산한다.
-function resolveInstructionPair(database: AppDatabase, workspaces: GitWorkspaceService | undefined, scope: string, projectId?: number, chatId?: number | null): { agentsFile: string; claudeFile: string; importPath: string } {
-  if (scope === "global") return {
-    agentsFile: globalInstructions["codex/AGENTS.md"],
-    claudeFile: globalInstructions["claude/CLAUDE.md"],
-    importPath: "../.codex/AGENTS.md",
-  };
+function resolveInstructionPair(globalInstructions: Record<string, string>, database: AppDatabase, workspaces: GitWorkspaceService | undefined, scope: string, projectId?: number, chatId?: number | null): { agentsFile: string; claudeFile: string; importPath: string } {
+  if (scope === "global") {
+    const agentsFile = globalInstructions["codex/AGENTS.md"];
+    const claudeFile = globalInstructions["claude/CLAUDE.md"];
+    // 두 홈이 달라도(예: /root/.claude와 /home/ubuntu/.codex) 실제 Codex 지침을 가리키도록 상대 경로를 계산한다.
+    return { agentsFile, claudeFile, importPath: path.relative(path.dirname(claudeFile), agentsFile).split(path.sep).join("/") };
+  }
   if (!projectId) throw new Error("프로젝트가 필요합니다.");
   const root = chatWorkspacePath(database, workspaces, projectId, chatId);
   return {
@@ -57,15 +65,16 @@ function resolveInstructionPair(database: AppDatabase, workspaces: GitWorkspaceS
 }
 
 // 프로젝트와 전역 AGENTS.md·CLAUDE.md 읽기·쓰기 API를 구성한다.
-export function createInstructionRouter(database: AppDatabase, workspaces?: GitWorkspaceService): Router {
+export function createInstructionRouter(database: AppDatabase, workspaces?: GitWorkspaceService, dirs: GlobalInstructionDirs = { claudeHome: path.join(os.homedir(), ".claude"), codexHome: path.join(os.homedir(), ".codex") }): Router {
   const router = Router();
+  const globalInstructions = globalInstructionFiles(dirs);
   // 권한 정책: 지침 조회는 로그인 사용자에게 허용하고, 영구 지침 변경은 관리자만 허용한다.
   router.get("/instructions", (request, response, next) => {
     try {
       const scope = String(request.query.scope ?? "project");
       const name = String(request.query.name ?? "");
       const projectId = Number(request.query.projectId) || undefined;
-      const target = resolveInstruction(database, workspaces, scope, name, projectId, Number(request.query.chatId) || null);
+      const target = resolveInstruction(globalInstructions, database, workspaces, scope, name, projectId, Number(request.query.chatId) || null);
       response.json({ scope, name, exists: fs.existsSync(target), content: fs.existsSync(target) ? fs.readFileSync(target, "utf8") : "" });
     } catch (error) {
       next(error);
@@ -78,7 +87,7 @@ export function createInstructionRouter(database: AppDatabase, workspaces?: GitW
       const projectId = Number(request.body?.projectId) || undefined;
       const content = typeof request.body?.content === "string" ? request.body.content : "";
       if (Buffer.byteLength(content) > 512 * 1024) throw new Error("지침 파일은 512KiB를 초과할 수 없습니다.");
-      const target = resolveInstruction(database, workspaces, scope, name, projectId, Number(request.query.chatId) || null);
+      const target = resolveInstruction(globalInstructions, database, workspaces, scope, name, projectId, Number(request.query.chatId) || null);
       writeFileAtomic(target, content);
       writeAudit(database, request.authUser!.id, "instruction.write", "instruction", `${scope}:${name}`, { projectId, bytes: Buffer.byteLength(content) });
       response.json({ saved: true });
@@ -90,7 +99,7 @@ export function createInstructionRouter(database: AppDatabase, workspaces?: GitW
     try {
       const scope = String(request.body?.scope ?? "project");
       const projectId = Number(request.body?.projectId) || undefined;
-      const pair = resolveInstructionPair(database, workspaces, scope, projectId, Number(request.body?.chatId) || null);
+      const pair = resolveInstructionPair(globalInstructions, database, workspaces, scope, projectId, Number(request.body?.chatId) || null);
       const result = ensureClaudeImportsAgents(pair.agentsFile, pair.claudeFile, pair.importPath);
       writeAudit(database, request.authUser!.id, "instruction.unify", "instruction", scope, { projectId, changed: result.changed });
       response.json({ saved: result.changed, scope, name: scope === "global" ? "claude/CLAUDE.md" : "CLAUDE.md", content: result.content });

@@ -53,7 +53,8 @@ function installAgentSkills(destinationRoots: string[], rootDir: string): SkillI
           (sameTarget ? result.skipped : result.errors).push(sameTarget ? destination : `${destination}: 기존 항목을 덮어쓰지 않았습니다.`);
           continue;
         }
-        fs.symlinkSync(source, destination, "dir");
+        // Windows 폴더 심볼릭 링크는 관리자·개발자 모드가 필요해 EPERM이 난다. 권한 없이 되는 디렉터리 정션을 쓴다(#154).
+        fs.symlinkSync(source, destination, process.platform === "win32" ? "junction" : "dir");
         result.installed.push(destination);
       } catch (error) {
         result.errors.push(`${destination}: ${error instanceof Error ? error.message : String(error)}`);

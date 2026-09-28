@@ -1,9 +1,10 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { ApprovalHint, HistoryMessage, HistorySyncContext, HistorySyncDecision, HistorySession, HistoryTokenUsage, ModelChoice, ModelOptions, ProviderAdapter, ProviderLaunch, ProviderLaunchProfile, TmuxIO } from "./provider";
+import type { ApprovalHint, HistoryMessage, HistorySyncContext, HistorySyncDecision, HistorySession, HistoryTokenEvent, HistoryTokenUsage, ModelChoice, ModelOptions, ProviderAdapter, ProviderLaunch, ProviderLaunchProfile, TmuxIO } from "./provider";
 import type { UsageRecord, UsageWindow } from "../../shared/types";
-import { extractContent, fallbackId } from "./history-utils";
+import { attachTurnTokenUsage, extractContent, fallbackId } from "./history-utils";
+import { upsertTokenEvent } from "./provider";
 import { stripAnsi } from "../core/security";
 import { isExpiredResetTime } from "./usage-utils";
 import { isCodexResetCreditsScreenReady, parseCodexResetCreditsScreen } from "./codex-rate-limits";
@@ -139,18 +140,6 @@ function parseCodexTokenUsage(record: Record<string, unknown>): HistoryTokenUsag
   return { inputTokens, cachedInputTokens, cacheCreationInputTokens, cacheReadInputTokens: 0, outputTokens, reasoningOutputTokens, totalTokens };
 }
 
-// token_count 바로 앞의 현재 턴 assistant 메시지에 해당 모델 호출량을 연결한다.
-function attachCodexTokenUsage(messages: HistoryMessage[], tokenUsage: HistoryTokenUsage): void {
-  let latestUser = -1;
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    if (messages[index].role === "user") { latestUser = index; break; }
-  }
-  for (let index = messages.length - 1; index > latestUser; index -= 1) {
-    if (messages[index].role !== "assistant") continue;
-    messages[index] = { ...messages[index], tokenUsage };
-    return;
-  }
-}
 
 interface CodexHistoryState {
   sessionId: string;
@@ -159,6 +148,23 @@ interface CodexHistoryState {
   model: string | null;
   turnEndedAt: string | null;
   messages: HistoryMessage[];
+  tokenEvents: HistoryTokenEvent[];
+  // 마지막으로 센 token_count의 세션 누적 토큰. 모델 호출 없이 반복된 token_count를 거른다.
+  lastCumulativeTokens: number | null;
+}
+
+// token_count의 세션 누적 토큰(total_token_usage.total_tokens)을 꺼낸다.
+function codexCumulativeTokens(record: Record<string, unknown>): number | null {
+  const payload = record.payload && typeof record.payload === "object" ? record.payload as Record<string, unknown> : null;
+  const info = payload?.info && typeof payload.info === "object" ? payload.info as Record<string, unknown> : null;
+  const total = info?.total_token_usage && typeof info.total_token_usage === "object" ? (info.total_token_usage as Record<string, unknown>).total_tokens : null;
+  return typeof total === "number" && Number.isFinite(total) ? total : null;
+}
+
+// 이전 결과의 마지막 이벤트 키("codex:{누적}")에서 누적값을 복원해 증분 파싱이 반복을 이어서 거르게 한다.
+function lastCodexCumulative(events: HistoryTokenEvent[] | undefined): number | null {
+  const value = Number(events?.at(-1)?.key.split(":")[1]);
+  return Number.isFinite(value) ? value : null;
 }
 
 // Codex JSONL 레코드 하나를 누적 세션 상태에 반영한다.
@@ -186,7 +192,17 @@ function applyCodexHistoryRecord(state: CodexHistoryState, record: Record<string
     if (message.role === "user") state.turnEndedAt = null;
   }
   const tokenUsage = parseCodexTokenUsage(record);
-  if (tokenUsage) attachCodexTokenUsage(state.messages, tokenUsage);
+  if (!tokenUsage) return;
+  // token_count는 모델 호출마다 생기지만 한도 정보만 갱신될 때도 같은 값으로 반복된다. 누적이 늘지 않았으면 새 호출이 아니다.
+  const cumulative = codexCumulativeTokens(record);
+  if (cumulative !== null && cumulative === state.lastCumulativeTokens) return;
+  state.lastCumulativeTokens = cumulative;
+  attachTurnTokenUsage(state.messages, tokenUsage);
+  // 도구 단계마다 호출이 여러 번이라 화면 메시지에 붙인 usage는 뒤 호출이 앞 호출을 덮는다. 기록은 호출마다 남긴다(#134).
+  if (typeof record.timestamp === "string") {
+    const key = cumulative !== null ? `codex:${cumulative}` : `codex:t${record.timestamp}`;
+    upsertTokenEvent(state.tokenEvents, { ...tokenUsage, key, occurredAt: record.timestamp, model: state.model });
+  }
 }
 
 // Codex 세션 JSONL을 프로젝트 메타데이터와 메시지로 해석한다.
@@ -204,6 +220,8 @@ function parseCodexHistory(file: string): HistorySession | null {
     model: null,
     turnEndedAt: null,
     messages: [],
+    tokenEvents: [],
+    lastCumulativeTokens: null,
   };
   for (const line of lines) {
     try {
@@ -227,6 +245,7 @@ function parseCodexHistory(file: string): HistorySession | null {
     messages: state.messages,
     model: state.model,
     turnEndedAt: state.turnEndedAt,
+    tokenEvents: state.tokenEvents,
   };
 }
 
@@ -239,6 +258,8 @@ function appendCodexHistory(file: string, previous: HistorySession, lines: strin
     model: previous.model ?? null,
     turnEndedAt: previous.turnEndedAt ?? null,
     messages: [...previous.messages],
+    tokenEvents: [...(previous.tokenEvents ?? [])],
+    lastCumulativeTokens: lastCodexCumulative(previous.tokenEvents),
   };
   try {
     for (const line of lines) applyCodexHistoryRecord(state, JSON.parse(line) as Record<string, unknown>, line);
@@ -254,6 +275,7 @@ function appendCodexHistory(file: string, previous: HistorySession, lines: strin
     messages: state.messages,
     model: state.model,
     turnEndedAt: state.turnEndedAt,
+    tokenEvents: state.tokenEvents,
   };
 }
 

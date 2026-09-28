@@ -176,7 +176,7 @@ async function main(): Promise<void> {
       return activeProcess as any;
     };
     const connect = (): Promise<CodexAppServerClient> => CodexAppServerClient.connect({
-      clientVersion: "0.7.0",
+      clientVersion: "0.7.2",
       requestTimeoutMs: Math.max(1_000, timeoutMs - 1_000),
       spawnProcess,
       onNotification,

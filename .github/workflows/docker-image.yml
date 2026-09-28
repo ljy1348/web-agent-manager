@@ -28,7 +28,14 @@ jobs:
       - id: image
         name: 이미지 이름 정규화
         shell: bash
-        run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/web-agent-manager-app" >> "$GITHUB_OUTPUT"
+        # 공개 저장소의 패키지와 이름이 겹치면 쓰기가 거부되고, 권한을 열면 공개 이미지를 덮어쓰므로
+        # 비공개 저장소에서는 -private 이름으로 따로 게시한다(#120).
+        env:
+          REPOSITORY_PRIVATE: ${{ github.event.repository.private }}
+        run: |
+          suffix=""
+          if [ "$REPOSITORY_PRIVATE" = "true" ]; then suffix="-private"; fi
+          echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/web-agent-manager-app${suffix}" >> "$GITHUB_OUTPUT"
       - id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:

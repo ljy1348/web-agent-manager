@@ -39,6 +39,7 @@ test("원격 worker 등록과 probe는 지연을 즉시 알리고 secret을 다�
   await page.goto("/");
   await page.getByRole("button", { name: "더보기", exact: true }).click();
   await page.getByRole("dialog", { name: "더보기" }).getByRole("button", { name: /설정/ }).click();
+  await page.getByRole("navigation", { name: "설정 항목" }).getByRole("button", { name: /원격 worker/ }).click();
   await expect(page.getByText("원격 worker · SSH host", { exact: true })).toBeVisible();
 
   await page.getByLabel("Worker 이름", { exact: true }).fill("QA worker");

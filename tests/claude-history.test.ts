@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ClaudeAdapter, ensureClaudeOnboardingComplete, ensureClaudeWorkspaceTrusted } from "../src/server/providers/claude";
 import type { TmuxIO } from "../src/server/providers/provider";
 import { USAGE_KEEPALIVE_PROMPT } from "../src/shared/usage-keepalive";
+import { splitMessageContent } from "../src/client/message-display";
 
 // ~/.claude/sessions/<pid>.json을 임시 디렉터리로 흉내내기 위해 os.homedir()을 잠깐 바꿔치기한다.
 function withFakeClaudeSessionsDir(entries: Record<string, unknown>[]): void {
@@ -36,6 +37,48 @@ afterEach(() => {
 });
 
 describe("Claude 세션 기록 파싱", () => {
+  it("Opus 5.5의 분리된 진행 설명을 기본 표시하고 빈 블록·서명은 표시하지 않는다", () => {
+    const file = writeFixture();
+    const records = [
+      { uuid: "empty", type: "assistant", message: { model: "claude-opus-5-5", content: [{ type: "thinking", thinking: "", signature: "opaque-signature" }] } },
+      { uuid: "progress", type: "assistant", timestamp: "2026-09-26T14:30:24.735Z", message: { id: "same-response", model: "claude-opus-5-5", stop_reason: "end_turn", usage: { input_tokens: 10, output_tokens: 2 }, content: [{ type: "thinking", thinking: "메모리에 저장해둔 확인 절차에 따라 먼저 기록을 확인하겠습니다.", signature: "opaque-signature" }] } },
+      // 실제 CLI는 같은 API 응답의 분할 레코드마다 같은 usage를 붙인다(#134).
+      { uuid: "tool", type: "assistant", timestamp: "2026-09-26T14:30:25.000Z", message: { id: "same-response", model: "claude-opus-5-5", stop_reason: "tool_use", usage: { input_tokens: 10, output_tokens: 2 }, content: [{ type: "tool_use", name: "Bash", input: { command: "pwd" } }] } },
+      { uuid: "redacted", type: "assistant", message: { model: "claude-opus-5-5", content: [{ type: "redacted_thinking", data: "opaque-redacted-data" }] } },
+    ];
+    fs.appendFileSync(file, `\n${records.map((record) => JSON.stringify(record)).join("\n")}`);
+    const adapter = new ClaudeAdapter("", {});
+    const session = adapter.parseHistoryFile(file)!;
+    const progress = session.messages.find((message) => message.id === "progress")!;
+    expect(progress).toMatchObject({ role: "assistant", kind: "progress_update", createdAt: "2026-09-26T14:30:24.735Z" });
+    // 분할 레코드의 usage는 한 번만 더하고(12), 숨겨지는 도구 호출 대신 보이는 진행 설명에 턴 합계로 표시한다.
+    expect(progress.tokenUsage?.totalTokens).toBe(12);
+    expect(session.messages.find((message) => message.id === "tool")?.tokenUsage).toBeUndefined();
+    expect(session.tokenEvents?.map((event) => event.key)).toEqual(["claude:same-response"]);
+    expect(splitMessageContent(progress)).toMatchObject({ primary: "메모리에 저장해둔 확인 절차에 따라 먼저 기록을 확인하겠습니다.", details: [] });
+    expect(session.messages.some((message) => message.id === "empty" || message.id === "redacted")).toBe(false);
+    expect(JSON.stringify(session.messages)).not.toContain("opaque-");
+    expect(adapter.evaluateHistorySync({ session, last: progress, newMessages: [progress], isTurnEnd: false })).toEqual({ markBusy: true, clearBusy: false, notifyCompletion: false });
+  });
+
+  it("Opus 5.5 진행 설명과 도구가 한 레코드에 있으면 순서를 유지하고 본문을 숨기지 않는다", () => {
+    const file = writeFixture();
+    fs.appendFileSync(file, `\n${JSON.stringify({ uuid: "combined", type: "assistant", message: { model: "claude-opus-5-5", stop_reason: "tool_use", content: [
+      { type: "thinking", thinking: "파일 위치를 찾았습니다. 다음으로 내용을 확인하겠습니다.", signature: "opaque" },
+      { type: "text", text: "확인 중입니다." },
+      { type: "tool_use", name: "Read", input: { file_path: "/tmp/example.txt" } },
+    ] } })}`);
+    const message = new ClaudeAdapter("", {}).parseHistoryFile(file)!.messages.at(-1)!;
+    expect(message.kind).toBe("tool_call");
+    expect(splitMessageContent(message)).toMatchObject({ primary: "파일 위치를 찾았습니다. 다음으로 내용을 확인하겠습니다.\n확인 중입니다.", details: ['[도구: Read]\n{\n  "file_path": "/tmp/example.txt"\n}'] });
+  });
+
+  it.each(["claude-opus-5", "claude-sonnet-5", undefined])("다른 모델(%s)의 thinking은 기존처럼 제외한다", (model) => {
+    const file = writeFixture();
+    fs.appendFileSync(file, `\n${JSON.stringify({ type: "assistant", message: { model, content: [{ type: "thinking", thinking: "표시 대상이 아닌 블록", signature: "opaque" }] } })}`);
+    expect(new ClaudeAdapter("", {}).parseHistoryFile(file)?.messages).toHaveLength(4);
+  });
+
   it("상태 조회 전용 실행은 인증과 내장 명령만 남기는 경량 모드를 사용한다", () => {
     const adapter = new ClaudeAdapter("/tmp/settings.json", { WAM_HOOK: "enabled" });
     expect(adapter.createMonitorLaunch("/tmp")).toEqual({ command: "claude", args: ["--safe-mode", "--ax-screen-reader"] });

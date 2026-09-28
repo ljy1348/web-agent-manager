@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from "react";
 import { ChevronDown, GitBranch, Link2, Plus, X } from "lucide-react";
 import { api } from "../api";
 import type { Json } from "../types";
+import "./git-branch-control.css";
 
 interface GitBranchControlProps {
   projectId: number;
@@ -111,19 +112,23 @@ export function GitBranchControl({ projectId, chat, canManage, variant = "bar", 
       <span className="git-branch-error">{error}</span>
     </section>;
   }
+  const branchName = workspace.branch || "detached HEAD";
+  // 모바일에서는 접두어(feat/ 등)를 숨겨 좁은 칩에 이름 뒷부분이 보이게 한다(#132).
+  const prefixEnd = branchName.lastIndexOf("/") + 1;
   const summary = <>
       <GitBranch size={16} aria-hidden="true" />
-      <code>{workspace.branch || "detached HEAD"}</code>
+      <code>{prefixEnd > 0 && <span className="git-branch-prefix">{branchName.slice(0, prefixEnd)}</span>}{branchName.slice(prefixEnd)}</code>
       <span className="git-workspace-badge">{workspace.mode === "worktree" ? "전용" : "공유"}</span>
       {canManage && <ChevronDown className={editing ? "open" : ""} size={14} aria-hidden="true" />}
     </>;
   return <section className={`git-branch-control ${variant}`} aria-label="Git 브랜치 작업공간">
     {canManage
-      ? <button type="button" className="git-branch-trigger" title={workspace.path} aria-label="Git 작업공간 변경" aria-expanded={editing} onClick={() => setEditing((value) => !value)}>{summary}</button>
-      : <div className="git-branch-trigger readonly" title={workspace.path}>{summary}</div>}
+      ? <button type="button" className="git-branch-trigger" title={`${branchName} · ${workspace.path}`} aria-label="Git 작업공간 변경" aria-expanded={editing} onClick={() => setEditing((value) => !value)}>{summary}</button>
+      : <div className="git-branch-trigger readonly" title={`${branchName} · ${workspace.path}`}>{summary}</div>}
     {error && !editing && <span className="git-branch-error">{error}</span>}
     {canManage && editing && <div className="git-branch-editor">
       <div className="git-branch-editor-head"><strong>Git 작업공간</strong><code>{workspace.path}</code><button type="button" className="icon-button" title="작업공간 메뉴 닫기" aria-label="작업공간 메뉴 닫기" onClick={() => setEditing(false)}><X size={14} /></button></div>
+      <div className="git-branch-current">현재 브랜치 <code>{branchName}</code><span>{workspace.mode === "worktree" ? "전용 worktree" : "공유 작업공간"}</span></div>
       <div className="git-branch-switch">
         <select aria-label="Git 브랜치 선택" value={branch} disabled={busy || !workspace.canSwitch} onChange={(event) => setBranch(event.target.value)}>
           {(workspace.branches || []).map((item: Json) => <option key={`${item.remote ? "remote" : "local"}:${item.name}`} value={item.name}>{item.name}{item.remote ? " (원격)" : ""}</option>)}

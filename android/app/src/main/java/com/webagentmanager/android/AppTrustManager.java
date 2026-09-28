@@ -185,8 +185,8 @@ public final class AppTrustManager {
         return false;
     }
 
-    // 서버의 임의 challenge를 설치 단위 Keystore 개인키로 서명한다.
-    private static String signChallenge(String challenge) throws Exception {
+    // 서버의 임의 challenge를 설치 단위 Keystore 개인키로 서명한다. 지문 키 등록 증명(BiometricBridge)도 이 서명을 쓴다.
+    static String signChallenge(String challenge) throws Exception {
         KeyStore keyStore = KeyStore.getInstance(KEYSTORE);
         keyStore.load(null);
         PrivateKey privateKey = (PrivateKey) keyStore.getKey(KEY_ALIAS, null);

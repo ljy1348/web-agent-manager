@@ -23,7 +23,11 @@ final class AuthenticatedApiClient {
 
     // 현재 WebView 로그인 세션의 서버 주소·쿠키·CSRF 값을 확인한다.
     static Session current(Context context) throws Exception {
-        String baseUrl = ServerConfig.getBaseUrl(context);
+        return current(context, ServerConfig.getBaseUrl(context));
+    }
+
+    // 서버 변경 전 등록했던 푸시 토큰은 옛 서버의 쿠키로 해제해야 한다.
+    static Session current(Context context, String baseUrl) throws Exception {
         String cookies = CookieManager.getInstance().getCookie(baseUrl);
         if (baseUrl.isEmpty() || cookies == null || cookies.isEmpty()) throw new IllegalStateException("앱 로그인이 필요합니다.");
         HttpURLConnection connection = open(baseUrl + "/api/auth/me", cookies, "GET");

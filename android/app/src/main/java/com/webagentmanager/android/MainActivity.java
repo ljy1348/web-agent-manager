@@ -51,6 +51,8 @@ public final class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
+        CrashReporter.install(this);
+        CrashReporter.showPendingIfAny(this);
         getWindow().setStatusBarColor(Color.rgb(17, 24, 39));
         getWindow().setNavigationBarColor(Color.rgb(17, 24, 39));
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) getWindow().setDecorFitsSystemWindows(false);
@@ -64,10 +66,48 @@ public final class MainActivity extends Activity {
         // onCreate가 다시 불렸다는 것은 파일 선택기 대기 등으로 백그라운드에 있는 동안 시스템이
         // 메모리 회수로 프로세스를 죽였다가 재생성했다는 뜻이다. 이때 저장된 WebView 상태를
         // 복원해 로그인 화면이 아니라 원래 보던 채팅 화면으로 돌아가게 한다.
-        if (state != null && webView.restoreState(state) != null) return;
+        if (state != null && webView.restoreState(state) != null) {
+            openChatFromIntent(getIntent());
+            return;
+        }
         String baseUrl = ServerConfig.getBaseUrl(this);
         if (baseUrl.isEmpty()) showServerDialog(true);
-        else webView.loadUrl(baseUrl);
+        else if (!openChatFromIntent(getIntent())) webView.loadUrl(baseUrl);
+    }
+
+    // singleTask라 실행 중에 알림을 누르면 새 화면 대신 여기로 intent가 온다.
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        openChatFromIntent(intent, true);
+    }
+
+    // 알림 intent의 chatId(숫자만 허용)로 설정 서버의 해당 채팅을 연다. 한 번 쓴 extra는 지워 재생성 때 다시 이동하지 않는다.
+    private boolean openChatFromIntent(Intent intent) {
+        return openChatFromIntent(intent, false);
+    }
+
+    // inPlace면(앱이 이미 떠 있을 때) 페이지를 다시 불러오지 않고 웹 앱의 채팅 열기 함수만 호출한다. 전체 새로고침은
+    // 로딩 로고가 한 번 떠서 앱이 재시작되는 것처럼 보였다(#151). 함수가 없거나(옛 서버) 다른 화면이면 기존처럼 새로 불러온다.
+    private boolean openChatFromIntent(Intent intent, boolean inPlace) {
+        if (intent == null || webView == null) return false;
+        String chatId = intent.getStringExtra(NotificationHelper.EXTRA_CHAT_ID);
+        intent.removeExtra(NotificationHelper.EXTRA_CHAT_ID);
+        String baseUrl = ServerConfig.getBaseUrl(this);
+        if (chatId == null || !chatId.matches("\\d{1,12}") || baseUrl.isEmpty()) return false;
+        String root = baseUrl.replaceAll("/+$", "");
+        String fallbackUrl = root + "/?chat=" + chatId;
+        String current = webView.getUrl();
+        if (!inPlace || current == null || !current.startsWith(root)) {
+            webView.loadUrl(fallbackUrl);
+            return true;
+        }
+        String script = "(function(){try{var f=window.__webAgentManagerOpenChat__;if(typeof f==='function'){f(" + chatId + ");return 'ok';}}catch(e){}return 'missing';})();";
+        webView.evaluateJavascript(script, (result) -> {
+            if (!"\"ok\"".equals(result)) webView.loadUrl(fallbackUrl);
+        });
+        return true;
     }
 
     // 화면 회전 등으로 액티비티가 재생성되거나 시스템이 프로세스를 회수하기 전에 WebView의
@@ -122,6 +162,7 @@ public final class MainActivity extends Activity {
         settings.setMediaPlaybackRequiresUserGesture(true);
         settings.setBuiltInZoomControls(false);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) settings.setSafeBrowsingEnabled(true);
+        webView.addJavascriptInterface(new BiometricBridge(this, webView), BiometricBridge.JS_NAME);
         webView.setWebViewClient(new WebViewClient() {
             // 설정 서버 밖의 링크는 시스템 브라우저로 보내 WebView 권한 경계를 유지한다.
             @Override
@@ -146,6 +187,7 @@ public final class MainActivity extends Activity {
                 }));
                 UsageWidgetProvider.requestRefresh(MainActivity.this);
                 PushRegistration.sync(MainActivity.this);
+                CrashReporter.flush(MainActivity.this);
                 requestNotificationPermissionIfNeeded();
             }
         });
@@ -251,7 +293,10 @@ public final class MainActivity extends Activity {
         dialog.setOnShowListener(ignored -> {
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
                 try {
-                    ServerConfig.setBaseUrl(this, input.getText().toString());
+                    String nextBaseUrl = ServerConfig.normalize(input.getText().toString());
+                    if (nextBaseUrl == null) throw new IllegalArgumentException("HTTPS 주소 또는 사설망 HTTP 주소를 입력해주세요.");
+                    PushRegistration.onServerChanging(this, nextBaseUrl);
+                    ServerConfig.setBaseUrl(this, nextBaseUrl);
                     AppTrustManager.prepareServerConnection(this);
                     dialog.dismiss();
                     webView.loadUrl(ServerConfig.getBaseUrl(this));

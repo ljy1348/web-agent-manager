@@ -27,14 +27,14 @@ function stubDatabase(projectPath: string): AppDatabase {
 }
 
 // 인증 사용자를 주입한 테스트용 지침 API를 띄운다.
-async function startInstructionApi(projectPath: string): Promise<string> {
+async function startInstructionApi(projectPath: string, dirs?: { claudeHome: string; codexHome: string }): Promise<string> {
   const app = express();
   app.use(express.json());
   app.use((request: AuthenticatedRequest, _response, next) => {
     request.authUser = { id: 1, username: "admin", role: "admin" };
     next();
   });
-  app.use(createInstructionRouter(stubDatabase(projectPath)));
+  app.use(createInstructionRouter(stubDatabase(projectPath), undefined, dirs));
   app.use((error: unknown, _request: express.Request, response: express.Response, _next: express.NextFunction) => {
     response.status(400).json({ error: error instanceof Error ? error.message : "오류" });
   });
@@ -46,6 +46,28 @@ async function startInstructionApi(projectPath: string): Promise<string> {
   const { port } = server.address() as AddressInfo;
   return `http://127.0.0.1:${port}`;
 }
+
+describe("전역 지침 경로 (#146)", () => {
+  it("전역 Codex 지침은 WAM의 CODEX_HOME에서 읽고 쓰며, 공통 지침 import도 그 파일을 가리킨다", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "web-agent-manager-global-"));
+    const claudeHome = path.join(root, "process-home", ".claude");
+    const codexHome = path.join(root, "install-home", ".codex");
+    fs.mkdirSync(claudeHome, { recursive: true });
+    const baseUrl = await startInstructionApi(root, { claudeHome, codexHome });
+
+    const saved = await fetch(`${baseUrl}/instructions`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ scope: "global", name: "codex/AGENTS.md", content: "공통 규칙" }) });
+    expect(saved.status).toBe(200);
+    expect(fs.readFileSync(path.join(codexHome, "AGENTS.md"), "utf8")).toBe("공통 규칙");
+    const read = await (await fetch(`${baseUrl}/instructions?scope=global&name=codex/AGENTS.md`)).json();
+    expect(read).toMatchObject({ exists: true, content: "공통 규칙" });
+
+    await fetch(`${baseUrl}/instructions/unify`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ scope: "global" }) });
+    const claude = fs.readFileSync(path.join(claudeHome, "CLAUDE.md"), "utf8");
+    const importLine = claude.split("\n")[0];
+    expect(importLine).toBe("@../../install-home/.codex/AGENTS.md");
+    expect(path.resolve(claudeHome, importLine.slice(1))).toBe(path.join(codexHome, "AGENTS.md"));
+  });
+});
 
 describe("지침 파일 통합 API", () => {
   it("프로젝트 CLAUDE.md가 AGENTS.md를 import하도록 생성하고 반복 호출은 중복하지 않는다", async () => {

@@ -73,7 +73,7 @@ function isUnverifiedProxyRequest(request: AuthenticatedRequest, trustProxyConfi
 // 파일 탭의 민감 경로 정책과 같은 기준을 쓰되, 여기서는 조회가 아니라 파괴적 동작 자체를 막는다.
 export function requireTrustedNetwork(request: AuthenticatedRequest, response: Response, next: NextFunction): void {
   if (request.trustedNetwork !== true) {
-    response.status(403).json({ error: "되돌릴 수 없는 작업은 내부망에서만 할 수 있습니다." });
+    response.status(403).json({ error: "되돌릴 수 없는 작업은 내부망에서만 할 수 있습니다.", networkRestricted: true });
     return;
   }
   next();

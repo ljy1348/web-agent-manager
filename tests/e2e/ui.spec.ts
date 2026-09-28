@@ -158,6 +158,7 @@ test("설정에서 세션 폐기와 비밀번호 변경을 즉시 피드백과 �
   await expect(page.getByText("Pixel 테스트", { exact: true })).toHaveCount(0);
   expect(revokeRequests).toEqual([{ csrf: "security-csrf" }]);
 
+  await page.getByRole("navigation", { name: "설정 항목" }).getByRole("button", { name: /2단계 인증/ }).click();
   await page.getByLabel("MFA 현재 비밀번호", { exact: true }).fill("current-password");
   await page.getByRole("button", { name: "TOTP 등록 시작", exact: true }).click();
   await expect(page.getByText("JBSWY3DPEHPK3PXP", { exact: true })).toBeVisible();
@@ -166,12 +167,16 @@ test("설정에서 세션 폐기와 비밀번호 변경을 즉시 피드백과 �
   await expect(page.getByText("AAAA-BBBB-CCCC", { exact: false })).toBeVisible();
   expect(mfaSetupRequests).toEqual([{ currentPassword: "current-password" }]);
 
+  await page.getByRole("navigation", { name: "설정 항목" }).getByRole("button", { name: /로그인 보안/ }).click();
+  // 부가 폼은 접혀 있어 제목을 눌러 펼친다(#131).
+  await page.locator(".settings-disclosure summary strong", { hasText: "중요 작업 본인 확인" }).click();
   await page.getByLabel("재인증 비밀번호", { exact: true }).fill("current-password");
   await page.getByLabel("재인증 MFA 코드 (사용 중인 경우)", { exact: true }).fill("654321");
   await page.getByRole("button", { name: "중요 작업 본인 확인", exact: true }).click();
   await expect(page.getByText("본인 확인을 완료했습니다.", { exact: false })).toBeVisible();
   expect(reauthRequests).toEqual([{ currentPassword: "current-password", code: "654321" }]);
 
+  await page.locator(".settings-disclosure summary strong", { hasText: "비밀번호 변경" }).click();
   await page.getByLabel("현재 비밀번호", { exact: true }).fill("current-password");
   await page.getByLabel("새 비밀번호", { exact: true }).fill("new-password-123");
   await page.getByLabel("새 비밀번호 확인", { exact: true }).fill("different-password");
@@ -231,6 +236,7 @@ test("전체 백업은 지연 중 즉시 진행 상태를 보이고 중복 요�
   await page.goto("/");
   await page.getByRole("button", { name: "더보기", exact: true }).click();
   await page.getByRole("dialog", { name: "더보기" }).getByRole("button", { name: /설정/ }).click();
+  await page.getByRole("navigation", { name: "설정 항목" }).getByRole("button", { name: /전체 암호화 백업/ }).click();
   await expect(page.getByText("전체 암호화 백업", { exact: true })).toBeVisible();
   await page.getByLabel("백업 passphrase", { exact: true }).fill("ui backup passphrase 123");
   await page.getByLabel("passphrase 확인", { exact: true }).fill("ui backup passphrase 123");
@@ -1449,7 +1455,7 @@ test("CLI 인증은 페이지 레이아웃 밖의 독립 팝업으로 열린다"
   await expect(settingsEntry).toContainText("CLI 로그인 필요");
   await settingsEntry.click();
   await expect(page.getByRole("heading", { name: "설정", exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "CLI 인증 관리" })).toBeVisible();
+  await expect(page.getByRole("navigation", { name: "설정 항목" }).getByRole("button", { name: /CLI 계정·인증/ })).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 
   allAuthenticated = true;
@@ -1682,6 +1688,7 @@ test("채팅의 프로젝트 파일 링크는 파일 탭 미리보기로 이동�
   const rootEntries = [
     { name: "docs", directory: true, size: 0, modifiedAt: "2026-07-31T00:00:00.000Z" },
     { name: "README.md", directory: false, size: 30, modifiedAt: "2026-07-31T00:00:00.000Z" },
+    { name: "diagram.html", directory: false, size: 120, modifiedAt: "2026-07-31T00:00:00.000Z" },
     { name: "archive.zip", directory: false, size: 1024, modifiedAt: "2026-07-31T00:00:00.000Z" },
     ...["approval-service.test.ts", "attachments.test.ts", "auth-routes.test.ts", "chat-attachments.test.ts", "claude-history.test.ts", "codex-history.test.ts", "file-routes.test.ts", "history-sync-title.test.ts", "rate-limit-resume-tick.test.ts"].map((name, index) => ({
       name, directory: false, size: 1400 + index * 731, modifiedAt: "2026-07-30T12:34:00.000Z",
@@ -1717,9 +1724,16 @@ test("채팅의 프로젝트 파일 링크는 파일 탭 미리보기로 이동�
       return;
     }
     if (pathname === "/api/projects/1/files/preview") {
-      await route.fulfill({ json: url.searchParams.get("path") === "archive.zip"
+      const requestedPath = url.searchParams.get("path");
+      await route.fulfill({ json: requestedPath === "archive.zip"
         ? { previewable: true, kind: "archive", size: 1024 }
-        : { previewable: true, kind: "markdown", content: "# 프로젝트 안내\n\n파일 링크로 연 미리보기입니다.", size: 30, truncated: false } });
+        : requestedPath === "diagram.html"
+          ? { previewable: true, kind: "html", size: 120 }
+          : { previewable: true, kind: "markdown", content: "# 프로젝트 안내\n\n파일 링크로 연 미리보기입니다.", size: 30, truncated: false } });
+      return;
+    }
+    if (pathname === "/api/projects/1/files/content/diagram.html") {
+      await route.fulfill({ contentType: "text/html; charset=utf-8", body: "<h1>구조도 미리보기</h1>" });
       return;
     }
     await route.fulfill({ json: {} });
@@ -1736,6 +1750,23 @@ test("채팅의 프로젝트 파일 링크는 파일 탭 미리보기로 이동�
   await expect(page.locator(".file-preview").getByRole("link", { name: "README.md 다운로드" })).toHaveAttribute("href", "/api/projects/1/files/download?path=README.md&chatId=1");
   fs.mkdirSync("artifacts", { recursive: true });
   await page.screenshot({ path: "artifacts/ui-file-markdown-preview.png", fullPage: true });
+  await page.getByRole("button", { name: "전체화면 보기" }).click();
+  await expect(page.locator(".file-preview")).toHaveClass(/is-fullscreen/);
+  const desktopFullScreen = await page.locator(".file-preview").boundingBox();
+  expect(desktopFullScreen?.width).toBeGreaterThanOrEqual(1439);
+  expect(desktopFullScreen?.height).toBeGreaterThanOrEqual(999);
+  await page.keyboard.press("Escape");
+  await expect(page.locator(".file-preview")).not.toHaveClass(/is-fullscreen/);
+  await page.getByRole("button", { name: "파일 미리보기: diagram.html" }).click();
+  await expect(page.locator(".file-preview-frame")).toHaveAttribute("sandbox", "");
+  await expect(page.frameLocator(".file-preview-frame").getByRole("heading", { name: "구조도 미리보기" })).toBeVisible();
+  await page.getByRole("button", { name: "전체화면 보기" }).click();
+  await expect(page.locator(".file-preview")).toHaveClass(/is-fullscreen/);
+  const htmlFullScreen = await page.locator(".file-preview-frame").boundingBox();
+  expect(htmlFullScreen?.width).toBeGreaterThan(1300);
+  expect(htmlFullScreen?.height).toBeGreaterThan(850);
+  await page.getByRole("button", { name: "전체화면 종료" }).click();
+  await expect(page.locator(".file-preview")).not.toHaveClass(/is-fullscreen/);
   await page.getByRole("button", { name: "파일 미리보기: archive.zip" }).click();
   await expect(page.locator(".file-preview")).toContainText("압축파일입니다.");
   await page.getByRole("button", { name: "폴더 열기: docs" }).click();
@@ -1764,8 +1795,13 @@ test("채팅의 프로젝트 파일 링크는 파일 탭 미리보기로 이동�
   const previewBox = await mobilePreview.boundingBox();
   expect(previewBox?.y).toBeLessThanOrEqual(1);
   expect(previewBox?.height).toBeGreaterThan(700);
-  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   await page.screenshot({ path: "artifacts/ui-file-preview-mobile.png", fullPage: true });
+  await page.getByRole("button", { name: "전체화면 보기" }).click();
+  await expect(mobilePreview).toHaveClass(/is-fullscreen/);
+  const mobileFullScreen = await mobilePreview.boundingBox();
+  expect(mobileFullScreen?.y).toBeLessThanOrEqual(1);
+  expect(mobileFullScreen?.height).toBeGreaterThanOrEqual(843);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   await page.getByRole("button", { name: "미리보기 닫기" }).click();
 });
 

@@ -1,9 +1,10 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { ApprovalHint, HistoryMessage, HistorySyncContext, HistorySyncDecision, HistorySession, HistoryTokenUsage, ModelChoice, ModelOptions, ProviderAdapter, ProviderLaunch, ProviderLaunchProfile, TmuxIO } from "./provider";
+import type { ApprovalHint, HistoryMessage, HistorySyncContext, HistorySyncDecision, HistorySession, HistoryTokenEvent, HistoryTokenUsage, ModelChoice, ModelOptions, ProviderAdapter, ProviderLaunch, ProviderLaunchProfile, TmuxIO } from "./provider";
+import { upsertTokenEvent } from "./provider";
 import type { UsageRecord, UsageWindow } from "../../shared/types";
-import { extractContent, fallbackId } from "./history-utils";
+import { attachTurnTokenUsage, extractContent, fallbackId } from "./history-utils";
 import { stripAnsi } from "../core/security";
 import { isExpiredResetTime } from "./usage-utils";
 import { USAGE_KEEPALIVE_PROMPT } from "../../shared/usage-keepalive";
@@ -85,14 +86,31 @@ function parseClaudeTokenUsage(value: unknown): HistoryTokenUsage | undefined {
   return { inputTokens, cachedInputTokens: 0, cacheCreationInputTokens, cacheReadInputTokens, outputTokens, reasoningOutputTokens: 0, totalTokens };
 }
 
+// Opus 5.5는 도구 사이의 공개 진행 설명을 thinking 블록에 반환한다. 이 모델의 thinking 문자열은
+// 표시용 요약이며 내부 추론은 signature에 담긴다. CLI가 이미 기록한 표시 문자열만 보존한다.
+// https://platform.claude.com/docs/en/models/opus-5-5/migration-guide
+// 다른 모델의 thinking 처리와 공통 파서(Codex·Grok)는 기존대로 유지한다.
+function extractClaudeContent(value: unknown, model: unknown): string {
+  if (model !== "claude-opus-5-5" || !Array.isArray(value)) return extractContent(value);
+  return extractContent(value.map((item) => {
+    if (!item || typeof item !== "object") return item;
+    const block = item as Record<string, unknown>;
+    if (block.type !== "thinking") return item;
+    return typeof block.thinking === "string" && block.thinking.trim()
+      ? { type: "text", text: block.thinking }
+      : null;
+  }));
+}
+
 // Claude JSONL 레코드에서 대화 메시지를 공통 형태로 변환한다.
 function parseClaudeMessage(record: Record<string, unknown>, line: string): HistoryMessage | null {
   const type = String(record.type ?? "");
   if (!['user', 'assistant', 'system'].includes(type)) return null;
   const message = record.message && typeof record.message === "object" ? record.message as Record<string, unknown> : {};
   const rawContent = message.content ?? record.content;
-  const content = extractContent(rawContent);
+  const content = type === "assistant" ? extractClaudeContent(rawContent, message.model) : extractContent(rawContent);
   if (!content) return null;
+  const isProgressUpdate = type === "assistant" && !extractContent(rawContent);
   const isToolResult = type === "user" && isToolResultOnly(rawContent);
   const isTaskNotif = type === "user" && !isToolResult && isTaskNotification(content);
   const isLocalCmd = type === "user" && !isToolResult && !isTaskNotif && isLocalCommand(content);
@@ -107,14 +125,15 @@ function parseClaudeMessage(record: Record<string, unknown>, line: string): Hist
   const stopReason = typeof message.stop_reason === "string" ? message.stop_reason : "";
   const hasToolUse = type === "assistant" && hasToolUseBlock(rawContent);
   const isToolCallStep = type === "assistant" && (stopReason === "tool_use" || hasToolUse);
-  const isTurnEndStep = type === "assistant" && stopReason === "end_turn" && !hasToolUse;
+  const isTurnEndStep = type === "assistant" && stopReason === "end_turn" && !hasToolUse && !isProgressUpdate;
   return {
     id: String(record.uuid ?? record.messageId ?? message.id ?? fallbackId(line)),
     role,
-    kind: isToolResult ? "tool_result" : isTaskNotif ? "task_notification" : isLocalCmd ? "local_command" : isCompactSummary ? "compact_summary" : isToolCallStep ? "tool_call" : isTurnEndStep ? "turn_end" : String(record.subtype ?? "text"),
+    kind: isToolResult ? "tool_result" : isTaskNotif ? "task_notification" : isLocalCmd ? "local_command" : isCompactSummary ? "compact_summary" : isProgressUpdate ? "progress_update" : isToolCallStep ? "tool_call" : isTurnEndStep ? "turn_end" : String(record.subtype ?? "text"),
     content,
     createdAt: String(record.timestamp ?? new Date().toISOString()),
-    tokenUsage: type === "assistant" ? parseClaudeTokenUsage(message.usage) : undefined,
+    // 분리 기록된 진행 블록은 같은 API 응답의 본문·도구 레코드와 usage를 공유하므로 중복 집계하지 않는다.
+    tokenUsage: type === "assistant" && !isProgressUpdate ? parseClaudeTokenUsage(message.usage) : undefined,
   };
 }
 
@@ -124,18 +143,33 @@ interface ClaudeHistoryState {
   model: string | null;
   aiTitle: string | null;
   messages: HistoryMessage[];
+  tokenEvents: HistoryTokenEvent[];
 }
+
+// CLI가 API 호출 없이 만든 가짜 assistant 메시지의 모델 값. 세션·토큰 모델로 쓰지 않는다(#134).
+const SYNTHETIC_MODEL = "<synthetic>";
 
 // Claude JSONL 레코드 하나를 누적 세션 상태에 반영한다.
 function applyClaudeHistoryRecord(state: ClaudeHistoryState, record: Record<string, unknown>, line: string): void {
   state.sessionId = String(record.sessionId ?? state.sessionId);
   state.cwd = String(record.cwd ?? state.cwd);
   const messageObject = record.message && typeof record.message === "object" ? record.message as Record<string, unknown> : null;
-  const modelId = record.type === "assistant" && messageObject && typeof messageObject.model === "string" ? messageObject.model : null;
+  const rawModelId = record.type === "assistant" && messageObject && typeof messageObject.model === "string" ? messageObject.model : null;
+  const modelId = rawModelId && rawModelId !== SYNTHETIC_MODEL ? rawModelId : null;
   if (modelId) state.model = formatModelId(modelId);
+  // CLI는 API 응답 하나를 블록마다 여러 줄로 나눠 같은 usage를 붙인다. 줄이 아니라 API 응답 id로 한 번만 센다(#134).
+  const usage = record.type === "assistant" ? parseClaudeTokenUsage(messageObject?.usage) : undefined;
+  let usageAlreadyCounted = false;
+  if (usage && typeof record.timestamp === "string") {
+    const responseId = typeof messageObject?.id === "string" && messageObject.id ? messageObject.id : String(record.uuid ?? fallbackId(line));
+    usageAlreadyCounted = state.tokenEvents.slice(-50).some((event) => event.key === `claude:${responseId}`);
+    upsertTokenEvent(state.tokenEvents, { ...usage, key: `claude:${responseId}`, occurredAt: record.timestamp, model: modelId ? formatModelId(modelId) : null });
+  }
   if (typeof record.aiTitle === "string" && record.aiTitle.trim()) state.aiTitle = record.aiTitle.trim();
   const message = parseClaudeMessage(record, line);
-  if (message) state.messages.push(message);
+  if (message) state.messages.push({ ...message, tokenUsage: undefined });
+  // 화면에는 턴 전체 사용량을 최신 답변에 표시한다. 같은 API 응답의 분할 레코드는 다시 더하지 않는다.
+  if (usage && record.type === "assistant") attachTurnTokenUsage(state.messages, usageAlreadyCounted ? null : usage);
 }
 
 // Claude Code는 실행(했던) 세션마다 ~/.claude/sessions/<pid>.json에 표시 이름을 남긴다 — claude --resume
@@ -189,6 +223,7 @@ function parseClaudeHistory(file: string): HistorySession | null {
     model: null,
     aiTitle: null,
     messages: [],
+    tokenEvents: [],
   };
   for (const line of lines) {
     try {
@@ -217,6 +252,7 @@ function parseClaudeHistory(file: string): HistorySession | null {
     messages: state.messages,
     model: state.model,
     displayTitle,
+    tokenEvents: state.tokenEvents,
   };
 }
 
@@ -228,6 +264,7 @@ function appendClaudeHistory(file: string, previous: HistorySession, lines: stri
     model: previous.model ?? null,
     aiTitle: null,
     messages: [...previous.messages],
+    tokenEvents: [...(previous.tokenEvents ?? [])],
   };
   try {
     for (const line of lines) applyClaudeHistoryRecord(state, JSON.parse(line) as Record<string, unknown>, line);
@@ -243,6 +280,7 @@ function appendClaudeHistory(file: string, previous: HistorySession, lines: stri
     messages: state.messages,
     model: state.model,
     displayTitle: renamedTitle ?? state.aiTitle ?? previous.displayTitle ?? null,
+    tokenEvents: state.tokenEvents,
   };
 }
 
@@ -632,7 +670,7 @@ export class ClaudeAdapter implements ProviderAdapter {
   // Claude JSONL의 stop_reason=end_turn assistant만 실제 완료로 보아 중간 조각 알림을 막는다.
   evaluateHistorySync(context: HistorySyncContext): HistorySyncDecision {
     const markBusy = context.newMessages.some((message) => message.role === "user" && message.kind !== "tool_result")
-      || context.newMessages.some((message) => message.role === "assistant" && message.kind === "tool_call");
+      || context.newMessages.some((message) => message.role === "assistant" && (message.kind === "tool_call" || message.kind === "progress_update"));
     const notifyCompletion = context.newMessages.some((message) => message.role === "assistant" && message.kind === "turn_end");
     const lastTurnEnded = context.last?.role === "assistant" && context.last.kind === "turn_end";
     return { markBusy, clearBusy: notifyCompletion || lastTurnEnded || context.isTurnEnd, notifyCompletion };

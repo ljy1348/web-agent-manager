@@ -1,5 +1,7 @@
 export interface NotificationPresentation {
   title?: string;
+  // Android 앱 푸시(FCM)에만 쓰는 제목·본문·이동할 채팅. Slack·ntfy는 기존 title·text를 그대로 쓴다.
+  push?: { title: string; body: string; chatId?: number };
 }
 
 // 운영 알림을 보낼 수 있는 채널의 공통 계약(Slack, ntfy 등). 이벤트 ID 기준 중복 전송 방지는

@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
-  Download, File, FileArchive, FilePlus2, FileText, Film, FolderOpen, Image, Link2, Music, Pencil, Trash2, Upload, X,
+  Download, File, FileArchive, FilePlus2, FileText, Film, FolderOpen, Image, Link2, Maximize2, Minimize2, Music, Pencil, Trash2, Upload, X,
 } from "lucide-react";
 import { api } from "../../api";
 import { isImagePath, MessageBody } from "../../lib/attachments";
@@ -125,6 +125,7 @@ export function FilesView({ project, chat, target, onNavigate, providers, projec
   const [directory, setDirectory] = useState("");
   const [entries, setEntries] = useState<Json[]>([]);
   const [preview, setPreview] = useState<Json | null>(null);
+  const [previewFullscreen, setPreviewFullscreen] = useState(false);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [listError, setListError] = useState("");
   const [uploadCount, setUploadCount] = useState(0);
@@ -144,7 +145,7 @@ export function FilesView({ project, chat, target, onNavigate, providers, projec
       setDirectory(nextPath);
       setEntries(nextEntries);
       setListError("");
-      if (clearPreview) setPreview(null);
+      if (clearPreview) { setPreview(null); setPreviewFullscreen(false); }
       return nextEntries;
     } catch (error) {
       setListError(error instanceof Error ? error.message : "파일 목록을 불러오지 못했습니다.");
@@ -162,6 +163,7 @@ export function FilesView({ project, chat, target, onNavigate, providers, projec
   // 기다린 뒤 별도로 설정하므로, 여기서는 직접 클릭 등 줄 지정 없는 진입을 기본값(null)으로 되돌린다.
   async function previewFile(filePath: string): Promise<void> {
     if (!project) return;
+    setPreviewFullscreen(false);
     setDraft(null);
     setEditStatus("");
     setPreviewTargetLine(null);
@@ -200,6 +202,7 @@ export function FilesView({ project, chat, target, onNavigate, providers, projec
   useEffect(() => {
     setDraft(null);
     setEditStatus("");
+    setPreviewFullscreen(false);
     if (!project) {
       setDirectory("");
       setEntries([]);
@@ -210,6 +213,21 @@ export function FilesView({ project, chat, target, onNavigate, providers, projec
     if (targetPath !== null) void revealPath(targetPath, target?.line ?? undefined);
     else void loadDirectory("");
   }, [project?.id, chat?.id, target?.requestId]);
+
+  // 화면을 가득 채운 미리보기에서 배경 스크롤을 막고 Escape로 원래 크기로 돌아간다.
+  useEffect(() => {
+    if (!previewFullscreen) return;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") setPreviewFullscreen(false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [previewFullscreen]);
 
   // 선택한 파일들을 현재 디렉터리에 업로드한 뒤 목록을 갱신한다.
   async function upload(): Promise<void> {
@@ -250,7 +268,7 @@ export function FilesView({ project, chat, target, onNavigate, providers, projec
     if (!window.confirm(message)) return;
     try {
       await api(`/projects/${project.id}/files?path=${encodeURIComponent(entryPath)}${chatQuery}`, { method: "DELETE" });
-      if (preview?.path === entryPath) { setDraft(null); setPreview(null); }
+      if (preview?.path === entryPath) { setDraft(null); setPreview(null); setPreviewFullscreen(false); }
       await loadDirectory(directory, false);
     } catch (error) {
       window.alert(error instanceof Error ? error.message : "삭제하지 못했습니다.");
@@ -300,11 +318,12 @@ export function FilesView({ project, chat, target, onNavigate, providers, projec
     })}
       {!entries.length && <p className="file-list-empty">이 폴더는 비어 있습니다.</p>}
     </div>
-    {preview && project && <aside className="file-preview" role="dialog" aria-modal="true" aria-label={`${preview.path} 미리보기`}><div className="git-box-head"><h3>{draft === null ? "미리보기" : "편집"}</h3><div className="file-preview-head-actions">
+    {preview && project && <aside className={`file-preview${previewFullscreen ? " is-fullscreen" : ""}`} role="dialog" aria-modal="true" aria-label={`${preview.path} 미리보기`}><div className="git-box-head"><h3>{draft === null ? "미리보기" : "편집"}</h3><div className="file-preview-head-actions">
       <a title="다운로드" aria-label={`${preview.path} 다운로드`} href={projectFileDownloadUrl(project.id, preview.path, chat?.id)}><Download /></a>
       {draft === null && isEditable(preview) && <button type="button" title="편집" aria-label={`${preview.path} 편집`} onClick={() => { setDraft(preview.content || ""); setEditStatus(""); }}><Pencil /></button>}
+      <button type="button" title={previewFullscreen ? "전체화면 종료" : "전체화면 보기"} aria-label={previewFullscreen ? "전체화면 종료" : "전체화면 보기"} aria-pressed={previewFullscreen} onClick={() => setPreviewFullscreen((current) => !current)}>{previewFullscreen ? <Minimize2 /> : <Maximize2 />}</button>
       <button type="button" className="danger" title="삭제" aria-label={`${preview.path} 삭제`} onClick={() => void deleteEntry(preview.path, false)}><Trash2 /></button>
-      <button type="button" title="미리보기 닫기" aria-label="미리보기 닫기" onClick={() => { if (!confirmDiscard()) return; setDraft(null); setPreview(null); onNavigate?.(directory); }}><X /></button>
+      <button type="button" title="미리보기 닫기" aria-label="미리보기 닫기" onClick={() => { if (!confirmDiscard()) return; setDraft(null); setPreview(null); setPreviewFullscreen(false); onNavigate?.(directory); }}><X /></button>
     </div></div>
       {preview && <strong>{preview.path}</strong>}
       {previewLoading ? <p className="muted">불러오는 중...</p> : draft !== null ? <>

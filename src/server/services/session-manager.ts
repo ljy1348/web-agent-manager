@@ -24,6 +24,7 @@ import { promptCharacterCount } from "../../shared/chat-prompt";
 import { PromptDeliveryUnknownError } from "./prompt-delivery";
 import { CodexStructuredPreDeliveryError, type CodexStructuredTransportService } from "./codex-structured-transport";
 import { projectProfileLaunch } from "./project-profile-launch";
+import { directTerminalExists, getDirectTerminal, killDirectTerminal, spawnDirectTerminal, usesDirectTerminals } from "./direct-terminal";
 
 // 가로 열 수를 바꾸면 이미 찍힌 tmux 스크롤백이 새 폭으로 다시 감기지 않아 한글·긴 줄이 깨질 수 있다.
 // 따라서 256열은 고정하고, 줄바꿈에 영향을 주지 않는 세로 행 수만 웹 패널 높이에 맞춰 동기화한다.
@@ -140,6 +141,9 @@ function exactTmuxTarget(name: string): string {
 
 // tmux가 지정 세션을 보유하고 있는지 확인한다. prefix 매칭으로 다른 채팅을 건드리지 않게 정확 이름을 쓴다.
 function tmuxExists(name: string): boolean {
+  // 직접 PTY 모드(Windows 노드, #144)는 tmux가 없으므로 등록부만 본다.
+  if (directTerminalExists(name)) return true;
+  if (usesDirectTerminals()) return false;
   return spawnSync("tmux", ["has-session", "-t", exactTmuxTarget(name)], { stdio: "ignore" }).status === 0;
 }
 
@@ -191,7 +195,7 @@ export class SessionManager {
     private readonly accounts: AgentAccountService,
     private readonly providerRollouts?: Pick<ProviderRolloutService, "assignNewChat" | "resolveLaunch" | "observeChatStatus">,
     private readonly credentialVault?: Pick<CredentialVault, "withMcpEnvironment">,
-    private readonly structuredTransport?: Pick<CodexStructuredTransportService, "claimOrOwn" | "owns" | "start" | "send" | "interrupt" | "stop" | "close" | "state">,
+    private readonly structuredTransport?: Pick<CodexStructuredTransportService, "claimOrOwn" | "owns" | "ownsForSend" | "start" | "send" | "interrupt" | "stop" | "close" | "state">,
   ) {
     this.adapters = new Map(adapters.map((adapter) => [adapter.id, adapter]));
     approvals.setTerminalDecisionHandler((chatId, decision, requestType) => this.applyTerminalApproval(chatId, decision, requestType));
@@ -284,6 +288,15 @@ export class SessionManager {
         // MCP/CLI가 위임 시 부모 채팅을 알 수 있게 채팅 번호를 상속한다.
         WEB_AGENT_MANAGER_CHAT_ID: String(chat.id),
       };
+      if (usesDirectTerminals()) {
+        // tmux 없이 CLI를 PTY로 직접 띄운다. 이어지는 attach()가 같은 PTY를 터미널로 쓴다.
+        try {
+          spawnDirectTerminal(chat.tmux_name, launch.command, launch.args, { cwd: chat.workspace_path, env: launchEnv, cols: DEFAULT_COLS, rows: DEFAULT_ROWS });
+          return { status: 0, stderr: "" };
+        } catch (error) {
+          return { status: 1, stderr: error instanceof Error ? error.message : String(error) };
+        }
+      }
       const args = ["new-session", "-d", "-s", chat.tmux_name, "-x", String(DEFAULT_COLS), "-y", String(DEFAULT_ROWS), "-c", chat.workspace_path];
       for (const [key, value] of Object.entries(launchEnv)) args.push("-e", `${key}=${value}`);
       args.push("--", launch.command, ...launch.args);
@@ -301,7 +314,7 @@ export class SessionManager {
     // tmux 상태바(맨 아래 "[세션명:창이름*]" 줄)는 절대 행 번호로 그려지는데, 웹에서는 이미 그 정보를
     // 채팅 헤더로 따로 보여주고 있어 불필요하다. 꺼두지 않으면 클라이언트가 이 상태바의 절대 위치
     // 갱신을 자기 뷰포트 기준으로 잘못 해석해 맨 아래 줄이 계속 새로 쌓이는 것처럼 보이는 문제가 있었다.
-    spawnSync("tmux", ["set-option", "-t", exactTmuxTarget(chat.tmux_name), "status", "off"]);
+    if (!usesDirectTerminals()) spawnSync("tmux", ["set-option", "-t", exactTmuxTarget(chat.tmux_name), "status", "off"]);
     this.attach(this.getChat(chatId));
   }
 
@@ -567,7 +580,7 @@ export class SessionManager {
   private async sendPromptNow(chatId: number, text: string, user: AuthUser | null, options: PromptDispatchOptions = {}): Promise<string> {
     let chat = this.getChat(chatId);
     let adapter = this.getAdapter(chat.provider);
-    if (this.structuredTransport?.owns(chatId)) {
+    if (this.structuredTransport?.ownsForSend(chatId)) {
       const prepared = prepareChatPrompt(chatId, chat.project_path, chat.workspace_path, text);
       try {
         const delivered = await this.structuredTransport.send(chatId, options.commandId ?? crypto.randomUUID(), prepared.terminalText);
@@ -948,6 +961,7 @@ export class SessionManager {
     if (!terminal) return;
     const snapshot = terminal.screen?.ansiSnapshot();
     if (snapshot) this.realtime.terminal(chatId, snapshot);
+    if (usesDirectTerminals()) return;
     const clients = spawnSync("tmux", ["list-clients", "-t", exactTmuxTarget(terminal.tmuxName), "-F", "#{client_pid} #{client_tty}"], { encoding: "utf8" });
     const ownClient = clients.status === 0
       ? clients.stdout.split("\n").find((line) => line.startsWith(`${terminal.pty.pid} `))
@@ -1027,7 +1041,8 @@ export class SessionManager {
     }
     const deadline = Date.now() + 3_000;
     while (tmuxExists(chat.tmux_name) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 100));
-    if (tmuxExists(chat.tmux_name)) spawnSync("tmux", ["kill-session", "-t", exactTmuxTarget(chat.tmux_name)], { stdio: "ignore" });
+    if (usesDirectTerminals()) killDirectTerminal(chat.tmux_name);
+    else if (tmuxExists(chat.tmux_name)) spawnSync("tmux", ["kill-session", "-t", exactTmuxTarget(chat.tmux_name)], { stdio: "ignore" });
     const managed = this.terminals.get(chatId);
     if (managed?.busyPollTimer) clearInterval(managed.busyPollTimer);
     if (managed?.stateScanTimer) clearTimeout(managed.stateScanTimer);
@@ -1096,7 +1111,13 @@ export class SessionManager {
   // tmux 세션에 PTY 클라이언트를 붙이고 출력을 실시간으로 중계한다.
   private attach(chat: ChatWithProject): void {
     if (this.terminals.has(chat.id)) return;
-    const child = pty.spawn("tmux", ["attach-session", "-t", exactTmuxTarget(chat.tmux_name)], {
+    // 직접 PTY 모드에서는 start()가 띄운 CLI 프로세스의 PTY를 그대로 쓴다(tmux attach 클라이언트가 없다).
+    const direct = usesDirectTerminals() ? getDirectTerminal(chat.tmux_name) : undefined;
+    if (usesDirectTerminals() && !direct) {
+      this.setStatus(chat.id, "stopped", null);
+      return;
+    }
+    const child = direct ?? pty.spawn("tmux", ["attach-session", "-t", exactTmuxTarget(chat.tmux_name)], {
       name: "xterm-256color",
       cols: DEFAULT_COLS,
       rows: DEFAULT_ROWS,

@@ -250,3 +250,26 @@ describe("GitWorkspaceService", () => {
     await expect(service.switchBranch(projectId, { chatId: chatIds[0], branch: "main", mode: "shared" })).rejects.toThrow("미커밋 변경사항");
   });
 });
+
+// Git 상태 조회가 멈춘 채팅까지 tmux를 차례로 부르면 채팅 수에 비례해 느려지고, 이름만 주면
+// tmux가 접두어가 같은 다른 세션을 고를 수 있다. 실행 중 채팅만 정확 대상으로 조회해야 한다(#124).
+describe("GitWorkspaceService tmux 연결 동기화", () => {
+  it("멈춘 채팅은 조회하지 않고 실행 중 채팅만 =이름: 대상으로 조회한다", async () => {
+    const harness = createHarness();
+    const running = Number(harness.database.prepare(`
+      INSERT INTO chats(project_id, provider, tmux_name, status, title) VALUES (?, 'codex', 'test_chat_live', 'running', '실행 중')
+    `).run(harness.projectId).lastInsertRowid);
+    const fakeBin = path.join(harness.root, "fake-bin");
+    const marker = path.join(harness.root, "tmux-calls.log");
+    fs.mkdirSync(fakeBin);
+    fs.writeFileSync(path.join(fakeBin, "tmux"), `#!/bin/sh\necho "$*" >> "${marker}"\necho "${harness.repo}"\n`, { mode: 0o755 });
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${fakeBin}${path.delimiter}${originalPath}`;
+    cleanups.push(() => { process.env.PATH = originalPath; });
+
+    await harness.service.describe(harness.projectId, running);
+
+    const calls = fs.readFileSync(marker, "utf8").trim().split("\n");
+    expect(calls).toEqual(["display-message -p -t =test_chat_live: #{pane_current_path}"]);
+  });
+});

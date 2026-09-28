@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- API 23~25용 아이콘: 벡터 그라데이션 미지원이라 단색 배경에 육각 군집을 그린다. -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="48dp" android:height="48dp" android:viewportWidth="108" android:viewportHeight="108">
-    <path android:fillColor="#111827" android:pathData="M0,0h108v108h-108z" />
-    <path android:fillColor="#7C6FF2" android:pathData="M18,27h72v54h-72z" />
-    <path android:fillColor="#B8FF63" android:pathData="M28,45h11l6,17 8,-25 8,25 6,-17h13v7h-8l-11,29 -8,-25 -8,25 -11,-29h-6z" />
+    <path android:fillColor="#1E1B4B" android:pathData="M22,4h64a18,18 0,0 1,18 18v64a18,18 0,0 1,-18 18h-64a18,18 0,0 1,-18 -18v-64a18,18 0,0 1,18 -18z" />
+    <path android:fillColor="#B8FF63" android:pathData="M54,22l16,9.3v18.7l-16,9.3l-16,-9.3v-18.7z" />
+    <path android:fillColor="#7C6FF2" android:pathData="M36,54l16,9.3v18.7l-16,9.3l-16,-9.3v-18.7z" />
+    <path android:fillColor="#A89CFF" android:pathData="M72,54l16,9.3v18.7l-16,9.3l-16,-9.3v-18.7z" />
 </vector>

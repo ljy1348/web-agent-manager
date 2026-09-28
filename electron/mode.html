@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>web-agent-manager 시작 방식</title>
+    <style>
+      * { box-sizing: border-box; }
+      body { margin: 0; min-width: 320px; min-height: 100vh; display: grid; place-items: center; background: #f3f5f2; color: #1f2723; font: 14px system-ui, sans-serif; }
+      main { width: min(560px, calc(100vw - 32px)); display: grid; gap: 14px; padding: 24px 0; }
+      h1 { margin: 0; font-size: 24px; }
+      p { margin: 0; color: #68746d; line-height: 1.5; }
+      section { padding: 22px; border: 1px solid #d9dfd9; border-radius: 8px; background: #fff; box-shadow: 0 12px 32px rgba(21,32,26,.07); }
+      h2 { margin: 0 0 6px; font-size: 17px; }
+      label { display: grid; gap: 6px; margin: 12px 0 0; font-size: 12px; color: #526158; }
+      label.check { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #1f2723; }
+      input[type=number], select { width: 100%; height: 40px; padding: 0 11px; border: 1px solid #c4cec6; border-radius: 7px; font: inherit; background: #fff; }
+      button { width: 100%; min-height: 42px; margin-top: 14px; border: 1px solid #23644c; border-radius: 7px; background: #23644c; color: #fff; font: 600 14px system-ui, sans-serif; cursor: pointer; }
+      button.secondary { background: #fff; color: #23644c; }
+      button:disabled { opacity: .6; cursor: wait; }
+      small { display: block; margin-top: 8px; color: #68746d; line-height: 1.5; }
+      #network-fields[hidden] { display: none; }
+      #status { min-height: 20px; color: #a7372f; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div>
+        <h1>web-agent-manager</h1>
+        <p>이 컴퓨터를 어떻게 쓸지 고르세요. 나중에 메뉴의 <b>WAM → 시작 방식 변경</b>에서 바꿀 수 있습니다.</p>
+      </div>
+      <section>
+        <h2>이 PC에서 WAM 실행</h2>
+        <p>이 PC의 Claude Code·Codex 대화를 WAM으로 관리합니다. Node.js를 따로 설치할 필요가 없습니다.</p>
+        <form id="local-form">
+          <label>포트<input id="port" type="number" min="1024" max="65535" value="4317" required /></label>
+          <label class="check"><input id="allow-network" type="checkbox" checked /> 다른 컴퓨터(메인 WAM)에서 접속 허용</label>
+          <div id="network-fields">
+            <label>메인 WAM이 이 PC에 접속할 주소<select id="address"></select></label>
+            <small>Tailscale 주소(100.x)를 권장합니다. 처음 시작할 때 Windows 방화벽 창이 뜨면 "개인 네트워크"에 허용하세요.</small>
+          </div>
+          <button id="local-submit" type="submit">이 PC에서 시작</button>
+        </form>
+      </section>
+      <section>
+        <h2>다른 WAM에 접속</h2>
+        <p>다른 컴퓨터(또는 WSL2)에서 실행 중인 WAM을 여는 창으로 씁니다.</p>
+        <button id="remote" class="secondary" type="button">접속할 서버 주소 입력</button>
+      </section>
+      <div id="status" role="alert"></div>
+    </main>
+    <script>
+      const status = document.getElementById("status");
+      const allowNetwork = document.getElementById("allow-network");
+      const networkFields = document.getElementById("network-fields");
+      const address = document.getElementById("address");
+      const localSubmit = document.getElementById("local-submit");
+      const clean = (error) => String(error?.message || error || "").replace(/^Error invoking remote method '[^']+': (?:Error: )?/, "");
+
+      // 이 PC의 Tailscale·사설망 주소 후보를 채운다. 없으면 외부 접속을 끈다.
+      window.webAgentManagerDesktop.localDefaults().then((defaults) => {
+        document.getElementById("port").value = defaults.port;
+        for (const item of defaults.addresses) address.add(new Option(item.startsWith("100.") ? `${item} (Tailscale)` : item, item));
+        if (!defaults.addresses.length) {
+          allowNetwork.checked = false;
+          address.add(new Option("사용 가능한 Tailscale·사설망 주소 없음", ""));
+        }
+        networkFields.hidden = !allowNetwork.checked;
+      }).catch((error) => { status.textContent = clean(error); });
+      allowNetwork.addEventListener("change", () => { networkFields.hidden = !allowNetwork.checked; });
+
+      document.getElementById("local-form").addEventListener("submit", async (event) => {
+        event.preventDefault();
+        localSubmit.disabled = true;
+        localSubmit.textContent = "서버 시작 중…";
+        status.textContent = "";
+        try {
+          await window.webAgentManagerDesktop.chooseLocal({ port: Number(document.getElementById("port").value), allowNetwork: allowNetwork.checked, address: address.value });
+        } catch (error) {
+          status.textContent = clean(error);
+          localSubmit.disabled = false;
+          localSubmit.textContent = "이 PC에서 시작";
+        }
+      });
+      document.getElementById("remote").addEventListener("click", async () => {
+        try { await window.webAgentManagerDesktop.chooseRemote(); } catch (error) { status.textContent = clean(error); }
+      });
+    </script>
+  </body>
+</html>
